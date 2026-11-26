@@ -52,9 +52,16 @@ fn parse_number(name: &str, value: &str, min: f32, max: f32) -> Result<f32, Stri
     Ok(n)
 }
 
+/// Is `host` (no port) exactly `localhost` or an IPv4 loopback address?
+/// Prefix matching would treat `localhost.evil.com` or `127.evil.com` as local
+/// and send the visit to a remote server in cleartext.
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Turn whatever the user typed (or passed on the command line) into a URL:
 /// a full http/https/file/data URL, an existing file path, or a bare host such
-/// as `example.com/page` (which gets `https://`, or `http://` for localhost).
+/// as `example.com/page` (which gets `https://`, or `http://` for loopback).
 fn url_from_input(input: &str, cwd: &Path) -> Result<Url, String> {
     let s = input.trim();
     if s.is_empty() {
@@ -70,17 +77,18 @@ fn url_from_input(input: &str, cwd: &Path) -> Result<Url, String> {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         return Url::from_file_path(&path).map_err(|_| format!("bad path {}", path.display()));
     }
-    // A bare host: must look like one (a dot or localhost, an optional numeric
+    // A bare host: must look like one (a dot or loopback, an optional numeric
     // port, no credentials), so `mailto:a@b.c` is rejected instead of being
     // misread as https://b.c with a username.
     let authority = s.split(['/', '?', '#']).next().unwrap_or("");
-    let port_ok = authority.rsplit_once(':').is_none_or(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
-    let looks_like_host = !authority.contains('@')
-        && !authority.contains(' ')
-        && (authority.contains('.') || authority.starts_with("localhost"))
-        && port_ok;
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    let port_ok = port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    let local = is_loopback_host(host);
+    let looks_like_host = !authority.contains('@') && !authority.contains(' ') && (authority.contains('.') || local) && port_ok;
     if looks_like_host {
-        let local = authority.starts_with("localhost") || authority.starts_with("127.");
         let scheme = if local { "http" } else { "https" };
         return Url::parse(&format!("{scheme}://{s}")).map_err(|e| format!("{s}: {e}"));
     }
@@ -118,7 +126,7 @@ fn main() {
 }
 
 /// Headless mode: render the whole page to a PNG (handy for testing).
-/// With `--chrome` semantics intentionally absent: this is the page only.
+/// This is the page only, without the toolbar.
 fn screenshot_to_png(url: &Url, fonts: &Fonts, width: f32, scale: f32, out: &Path) {
     let t0 = std::time::Instant::now();
     let mut page = Page::load(url);
@@ -325,9 +333,12 @@ impl App {
         l.map(|l| l.href.clone())
     }
 
-    /// Enter pressed in the address bar.
+    /// Enter pressed in the address bar. Going to the page you're already on is
+    /// a reload, not a new history entry.
     fn commit_address(&mut self) {
-        match url_from_input(self.bar.text(), &self.cwd) {
+        let typed = self.bar.submit_text().to_string();
+        match url_from_input(&typed, &self.cwd) {
+            Ok(url) if url == self.page.url => self.reload(),
             Ok(url) => self.open(url, true),
             Err(e) => self.bar.error = Some(e),
         }
@@ -552,6 +563,7 @@ mod tests {
         assert_eq!(go("  http://example.com  "), Ok(u("http://example.com/")));
         assert_eq!(go("example.com/path"), Ok(u("https://example.com/path")));
         assert_eq!(go("localhost:8080/x"), Ok(u("http://localhost:8080/x")));
+        assert_eq!(go("LOCALHOST"), Ok(u("http://localhost/")));
         assert_eq!(go("127.0.0.1:3000"), Ok(u("http://127.0.0.1:3000/")));
         assert_eq!(go("data:text/html,hi"), Ok(u("data:text/html,hi")));
         let file = go("page.html").unwrap();
@@ -560,9 +572,27 @@ mod tests {
         assert_eq!(go(file.as_str()), Ok(file));
 
         // things that are not addresses must not be navigated anywhere surprising
-        for bad in ["", "   ", "javascript:alert(1)", "mailto:a@b.c", "user:pw@evil.com", "ftp://x.com/y", "nosuchfile", "two words.com", "host:notaport.com"] {
+        for bad in ["", "   ", "javascript:alert(1)", "mailto:a@b.c", "user:pw@evil.com", "ftp://x.com/y", "nosuchfile", "two words.com", "host:notaport.com", "localhostfoo"] {
             assert!(go(bad).is_err(), "{bad:?} -> {:?}", go(bad));
         }
+    }
+
+    #[test]
+    fn look_alike_local_hosts_get_https_not_cleartext_http() {
+        // These used to match a `starts_with("localhost")` / `starts_with("127.")` check
+        // and be sent over plain HTTP to a remote server.
+        let dir = std::env::temp_dir();
+        for (typed, expected) in [
+            ("localhost.evil.com/login", "https://localhost.evil.com/login"),
+            ("localhostevil.com", "https://localhostevil.com/"),
+            ("127.0.0.1.evil.com", "https://127.0.0.1.evil.com/"),
+            ("127.evil.com", "https://127.evil.com/"),
+            ("localhost-login.com", "https://localhost-login.com/"),
+        ] {
+            assert_eq!(url_from_input(typed, &dir), Ok(u(expected)), "{typed}");
+        }
+        assert!(is_loopback_host("localhost") && is_loopback_host("127.0.0.1") && is_loopback_host("127.1.2.3"));
+        assert!(!is_loopback_host("localhost.evil.com") && !is_loopback_host("127.evil.com") && !is_loopback_host("128.0.0.1"));
     }
 
     #[test]
@@ -582,6 +612,9 @@ mod tests {
         for external in ["mailto:a@b.c", "javascript:void(0)", "tel:123", "data:text/html,hi", "file:///etc/passwd", "ftp://x.test/y"] {
             assert!(matches!(resolve_link(&page, external), Link::External(_)), "{external}");
         }
+        // control characters hidden inside a scheme can't smuggle a javascript: link through
+        assert!(matches!(resolve_link(&page, "java\nscript:alert(1)"), Link::External(_)));
+        assert!(matches!(resolve_link(&page, "  JaVaScRiPt:alert(1)"), Link::External(_)));
         // local pages can link to local files, with percent-encoding handled by the URL parser
         let local = u("file:///site/pages/index.html");
         assert_eq!(resolve_link(&local, "a%20b.html?x=1#top"), Link::Navigate(u("file:///site/pages/a%20b.html?x=1#top")));

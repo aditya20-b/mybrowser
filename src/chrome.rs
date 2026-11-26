@@ -8,7 +8,7 @@ pub const HEIGHT: f32 = 44.0;
 const BUTTON: f32 = 30.0;
 const PADDING: f32 = 8.0;
 const GAP: f32 = 6.0;
-/// Longest address we accept, so pasting a megabyte can't stall painting.
+/// Longest address we edit or draw, so pasting a megabyte can't stall painting.
 pub const MAX_ADDRESS_CHARS: usize = 2048;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -75,6 +75,11 @@ pub fn hit_test(x: f32, y: f32, width: f32) -> Option<Hit> {
 #[derive(Debug, Default)]
 pub struct AddressBar {
     text: String,
+    /// The full address last passed to `show`. `text` may be a clipped copy of
+    /// it, so pressing Enter without editing must navigate to this, not to the
+    /// clipped text.
+    original: String,
+    edited: bool,
     caret: usize,
     select_all: bool,
     focused: bool,
@@ -91,11 +96,20 @@ impl AddressBar {
 
     /// Display `url` and leave editing mode (after navigation or Escape).
     pub fn show(&mut self, url: &str) {
+        self.original = url.to_string();
         self.text = url.chars().take(MAX_ADDRESS_CHARS).collect();
+        self.edited = false;
         self.caret = self.len();
         self.select_all = false;
         self.focused = false;
         self.error = None;
+    }
+
+    /// What Enter should navigate to: the exact address that was shown if the
+    /// user hasn't changed it (even if it was too long to display in full),
+    /// otherwise what they typed.
+    pub fn submit_text(&self) -> &str {
+        if self.edited { &self.text } else { &self.original }
     }
 
     /// Start editing with the whole address selected, like Cmd+L.
@@ -142,20 +156,28 @@ impl AddressBar {
             self.text.clear();
             self.caret = 0;
             self.select_all = false;
+            self.edited = true;
         }
     }
 
-    /// Type or paste text. Control characters (newlines, tabs, escapes) are dropped.
+    /// Type or paste text. Control characters (newlines, tabs, escapes) are
+    /// dropped; if nothing is left (an empty or newline-only paste), the field
+    /// is left exactly as it was, selection included.
     pub fn insert(&mut self, s: &str) {
+        let chars: Vec<char> = s.chars().filter(|c| !c.is_control()).collect();
+        if chars.is_empty() {
+            return;
+        }
         self.error = None;
         self.drop_selection();
-        for c in s.chars().filter(|c| !c.is_control()) {
+        for c in chars {
             if self.len() >= MAX_ADDRESS_CHARS {
                 break;
             }
             let at = self.byte_index(self.caret);
             self.text.insert(at, c);
             self.caret += 1;
+            self.edited = true;
         }
     }
 
@@ -168,6 +190,7 @@ impl AddressBar {
             let at = self.byte_index(self.caret - 1);
             self.text.remove(at);
             self.caret -= 1;
+            self.edited = true;
         }
     }
 
@@ -179,6 +202,7 @@ impl AddressBar {
         if self.caret < self.len() {
             let at = self.byte_index(self.caret);
             self.text.remove(at);
+            self.edited = true;
         }
     }
 
@@ -330,6 +354,60 @@ mod tests {
     }
 
     #[test]
+    fn pasting_nothing_leaves_the_address_and_selection_alone() {
+        // Cmd+L then Cmd+V with an empty (or newline-only) clipboard used to wipe the URL
+        for paste in ["", "\n", "\r\n\t", "\u{1b}"] {
+            let mut bar = AddressBar::new("https://example.com/");
+            bar.focus();
+            bar.insert(paste);
+            assert_eq!(bar.text(), "https://example.com/", "{paste:?}");
+            assert!(bar.is_all_selected(), "{paste:?}");
+            assert_eq!(bar.submit_text(), "https://example.com/", "{paste:?}");
+        }
+    }
+
+    #[test]
+    fn enter_on_an_unedited_long_address_navigates_to_the_full_address() {
+        // a >2048 character URL is clipped for display, but must not be navigated to clipped.
+        // (assert! rather than assert_eq! so a failure doesn't print 2 KB strings)
+        let long = format!("https://example.com/?q={}", "a".repeat(MAX_ADDRESS_CHARS + 500));
+        let mut bar = AddressBar::new(&long);
+        assert_eq!(bar.len(), MAX_ADDRESS_CHARS);
+        bar.focus();
+        assert!(bar.submit_text() == long, "focusing is not an edit");
+        bar.click_again();
+        bar.left();
+        assert!(bar.submit_text() == long, "moving the caret is not an edit");
+        // a real edit (the field is full, so remove a character) switches to what was typed
+        bar.end();
+        bar.backspace();
+        assert!(bar.submit_text() != long);
+        assert_eq!(bar.submit_text().chars().count(), MAX_ADDRESS_CHARS - 1);
+        // and show() resets it
+        bar.show("https://other.test/");
+        assert_eq!(bar.submit_text(), "https://other.test/");
+    }
+
+    #[test]
+    fn every_kind_of_edit_counts_as_an_edit() {
+        for edit in 0..4 {
+            let mut bar = AddressBar::new("abc");
+            bar.focus();
+            bar.click_again();
+            match edit {
+                0 => bar.insert("d"),
+                1 => bar.backspace(),
+                2 => {
+                    bar.left();
+                    bar.delete()
+                }
+                _ => bar.clear(),
+            }
+            assert_ne!(bar.submit_text(), "abc", "edit kind {edit}");
+        }
+    }
+
+    #[test]
     fn selection_behaviour_for_arrows_delete_and_select_all() {
         let mut bar = AddressBar::new("hello");
         bar.focus();
@@ -365,6 +443,43 @@ mod tests {
     }
 
     #[test]
+    fn random_operation_sequences_keep_the_invariants() {
+        // a tiny deterministic PRNG so the test is reproducible
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let long = "x".repeat(900);
+        let pieces = ["a", "é", "日本", "🎉", "\u{200D}", "\n", "", long.as_str(), "→"];
+        let mut bar = AddressBar::new("https://example.com/");
+        for _ in 0..20_000 {
+            match next(14) {
+                0 => bar.insert(pieces[next(pieces.len() as u64) as usize]),
+                1 => bar.backspace(),
+                2 => bar.delete(),
+                3 => bar.left(),
+                4 => bar.right(),
+                5 => bar.home(),
+                6 => bar.end(),
+                7 => bar.select_all(),
+                8 => bar.focus(),
+                9 => bar.click_again(),
+                10 => bar.clear(),
+                11 => bar.show(pieces[next(pieces.len() as u64) as usize]),
+                12 => bar.error = Some("e".into()),
+                _ => {
+                    let _ = bar.submit_text();
+                }
+            }
+            assert!(bar.caret() <= bar.len(), "caret {} > len {}", bar.caret(), bar.len());
+            assert!(bar.len() <= MAX_ADDRESS_CHARS);
+        }
+    }
+
+    #[test]
     fn hit_testing() {
         let w = 900.0;
         let centre = |r: Rect| (r.x + r.w / 2.0, r.y + r.h / 2.0);
@@ -382,5 +497,9 @@ mod tests {
         // a tiny window gives a zero-width field instead of a negative one
         assert_eq!(address_rect(10.0).w, 0.0);
         assert_eq!(hit_test(150.0, 20.0, 10.0), None);
+        // nonsense coordinates never panic
+        for v in [f32::NAN, f32::INFINITY, -1.0, 1e30] {
+            let _ = hit_test(v, v, v);
+        }
     }
 }

@@ -48,17 +48,49 @@ pub fn is_text_like(kind: ControlKind) -> bool {
     matches!(kind, ControlKind::Text | ControlKind::Password | ControlKind::Textarea)
 }
 
+/// Is the control disabled, by its own attribute or by an enclosing
+/// `<fieldset disabled>`? (Controls inside that fieldset's `<legend>` are exempt.)
 pub fn is_disabled(dom: &Dom, id: NodeId) -> bool {
-    dom.attr(id, "disabled").is_some()
+    if dom.attr(id, "disabled").is_some() {
+        return true;
+    }
+    let mut in_legend = false;
+    let mut cur = dom.nodes[id].parent;
+    while let Some(p) = cur {
+        match dom.tag(p) {
+            Some("legend") => in_legend = true,
+            Some("fieldset") if dom.attr(p, "disabled").is_some() && !in_legend => return true,
+            Some("fieldset") => in_legend = false,
+            _ => {}
+        }
+        cur = dom.nodes[p].parent;
+    }
+    false
+}
+
+/// Does `id` or any ancestor carry the `hidden` attribute (so it isn't rendered)?
+fn is_hidden_by_attribute(dom: &Dom, id: NodeId) -> bool {
+    let mut cur = Some(id);
+    while let Some(n) = cur {
+        if dom.attr(n, "hidden").is_some() {
+            return true;
+        }
+        cur = dom.nodes[n].parent;
+    }
+    false
 }
 
 /// Can the user focus this control (click into it, Tab to it)?
 pub fn is_focusable(dom: &Dom, id: NodeId) -> bool {
-    kind_of(dom, id).is_some_and(|k| k != ControlKind::Hidden) && !is_disabled(dom, id)
+    kind_of(dom, id).is_some_and(|k| k != ControlKind::Hidden) && !is_disabled(dom, id) && !is_hidden_by_attribute(dom, id)
 }
 
-/// The `<form>` element enclosing `id`.
+/// The `<form>` that owns control `id`: the one named by its `form="id"`
+/// attribute if there is one, else the enclosing `<form>`.
 pub fn form_of(dom: &Dom, id: NodeId) -> Option<NodeId> {
+    if let Some(wanted) = dom.attr(id, "form").map(str::trim).filter(|w| !w.is_empty()) {
+        return (0..dom.nodes.len()).find(|&n| dom.tag(n) == Some("form") && dom.attr(n, "id") == Some(wanted));
+    }
     let mut cur = dom.nodes[id].parent;
     while let Some(p) = cur {
         if dom.tag(p) == Some("form") {
@@ -69,17 +101,10 @@ pub fn form_of(dom: &Dom, id: NodeId) -> Option<NodeId> {
     None
 }
 
-/// Every control inside `form`, in document order.
+/// Every control owned by `form`, in document order (including ones outside
+/// the element that point at it with `form="id"`).
 pub fn controls_in(dom: &Dom, form: NodeId) -> Vec<NodeId> {
-    let mut out = vec![];
-    let mut stack: Vec<NodeId> = dom.nodes[form].children.iter().rev().copied().collect();
-    while let Some(n) = stack.pop() {
-        if kind_of(dom, n).is_some() {
-            out.push(n);
-        }
-        stack.extend(dom.nodes[n].children.iter().rev());
-    }
-    out
+    (0..dom.nodes.len()).filter(|&n| kind_of(dom, n).is_some() && form_of(dom, n) == Some(form)).collect()
 }
 
 /// The `(value, label)` of each `<option>` in a `<select>`.
@@ -96,6 +121,13 @@ pub fn options(dom: &Dom, select: NodeId) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// The most characters a text control accepts: its `maxlength`, capped.
+fn max_chars(dom: &Dom, id: NodeId) -> usize {
+    dom.attr(id, "maxlength")
+        .and_then(|m| m.trim().parse::<usize>().ok())
+        .map_or(MAX_VALUE_CHARS, |m| m.min(MAX_VALUE_CHARS))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -172,18 +204,24 @@ impl FormState {
         self.checked.get(&id).copied().unwrap_or_else(|| dom.attr(id, "checked").is_some())
     }
 
+    /// Can the user change this text control's value? Not if it is disabled or `readonly`.
+    fn is_editable(dom: &Dom, id: NodeId) -> bool {
+        kind_of(dom, id).is_some_and(is_text_like) && !is_disabled(dom, id) && dom.attr(id, "readonly").is_none()
+    }
+
     /// Type (or paste) text into a text control. Control characters are dropped,
-    /// except that a textarea keeps newlines.
+    /// except that a textarea keeps newlines. Honours `readonly` and `maxlength`.
     pub fn type_text(&mut self, dom: &Dom, id: NodeId, text: &str) {
         let Some(kind) = kind_of(dom, id).filter(|k| is_text_like(*k)) else { return };
-        if is_disabled(dom, id) {
+        if !Self::is_editable(dom, id) {
             return;
         }
+        let limit = max_chars(dom, id);
         let mut value = self.value(dom, id);
         let mut count = value.chars().count();
         for c in text.chars() {
             let ok = !c.is_control() || (c == '\n' && kind == ControlKind::Textarea);
-            if ok && count < MAX_VALUE_CHARS {
+            if ok && count < limit {
                 value.push(c);
                 count += 1;
             }
@@ -192,7 +230,7 @@ impl FormState {
     }
 
     pub fn backspace(&mut self, dom: &Dom, id: NodeId) {
-        if !kind_of(dom, id).is_some_and(is_text_like) || is_disabled(dom, id) {
+        if !Self::is_editable(dom, id) {
             return;
         }
         let mut value = self.value(dom, id);
@@ -201,7 +239,7 @@ impl FormState {
     }
 
     /// Click a checkbox or radio button. Checking a radio unchecks the others
-    /// in its group (same form, same name).
+    /// in its group (same owning form, or none, and same name).
     pub fn toggle(&mut self, dom: &Dom, id: NodeId) {
         if is_disabled(dom, id) {
             return;
@@ -212,9 +250,14 @@ impl FormState {
                 self.checked.insert(id, !now);
             }
             Some(ControlKind::Radio) => {
-                if let (Some(name), Some(form)) = (dom.attr(id, "name"), form_of(dom, id)) {
-                    for other in controls_in(dom, form) {
-                        if other != id && kind_of(dom, other) == Some(ControlKind::Radio) && dom.attr(other, "name") == Some(name) {
+                if let Some(name) = dom.attr(id, "name").filter(|n| !n.is_empty()) {
+                    let owner = form_of(dom, id);
+                    for other in 0..dom.nodes.len() {
+                        if other != id
+                            && kind_of(dom, other) == Some(ControlKind::Radio)
+                            && dom.attr(other, "name") == Some(name)
+                            && form_of(dom, other) == owner
+                        {
                             self.checked.insert(other, false);
                         }
                     }
@@ -254,8 +297,9 @@ impl FormState {
     }
 
     /// Build the request for submitting `form`. `submitter` is the button that was
-    /// clicked: only its name and value are sent. Returns None if the action can't
-    /// be resolved against `base`.
+    /// clicked: only its name and value are sent, and its `formaction` and
+    /// `formmethod` override the form's. Returns None if the action can't be
+    /// resolved against `base`, or the form is `method=dialog` (which only closes a dialog).
     pub fn submit(&self, dom: &Dom, form: NodeId, submitter: Option<NodeId>, base: &Url) -> Option<Submission> {
         let mut pairs: Vec<(String, String)> = vec![];
         for id in controls_in(dom, form) {
@@ -264,8 +308,13 @@ impl FormState {
             }
             let Some(name) = dom.attr(id, "name").filter(|n| !n.is_empty()) else { continue };
             match kind_of(dom, id)? {
-                ControlKind::Hidden | ControlKind::Text | ControlKind::Password | ControlKind::Textarea => {
+                ControlKind::Hidden | ControlKind::Text | ControlKind::Password => {
                     pairs.push((name.to_string(), self.value(dom, id)));
+                }
+                ControlKind::Textarea => {
+                    // browsers submit line breaks in a textarea as CRLF
+                    let value = self.value(dom, id).replace("\r\n", "\n").replace('\n', "\r\n");
+                    pairs.push((name.to_string(), value));
                 }
                 ControlKind::Checkbox | ControlKind::Radio => {
                     if self.is_checked(dom, id) {
@@ -281,11 +330,15 @@ impl FormState {
                 ControlKind::Button => {}
             }
         }
-        let method = match dom.attr(form, "method").map(|m| m.trim().to_ascii_lowercase()).as_deref() {
+        // the submitting button may override the form's action and method
+        let from_button = |attr: &str| submitter.and_then(|s| dom.attr(s, attr)).map(str::trim).filter(|v| !v.is_empty());
+        let method_attr = from_button("formmethod").or_else(|| dom.attr(form, "method")).map(|m| m.trim().to_ascii_lowercase());
+        let method = match method_attr.as_deref() {
             Some("post") => Method::Post,
+            Some("dialog") => return None,
             _ => Method::Get,
         };
-        let action = dom.attr(form, "action").map(str::trim).unwrap_or("");
+        let action = from_button("formaction").or_else(|| dom.attr(form, "action").map(str::trim)).unwrap_or("");
         let mut url = if action.is_empty() { base.clone() } else { base.join(action).ok()? };
         url.set_fragment(None);
         Some(match method {
@@ -371,6 +424,24 @@ mod tests {
     }
 
     #[test]
+    fn readonly_and_maxlength_are_honoured() {
+        // a readonly field used to accept typing, and maxlength was ignored
+        let dom = html::parse("<form><input name=ro readonly value=fixed><input name=ml maxlength=3 value=ab><input name=bad maxlength=junk><textarea name=ta maxlength=4>xy</textarea></form>");
+        let (ro, ml, bad, ta) = (by_name(&dom, "ro"), by_name(&dom, "ml"), by_name(&dom, "bad"), by_name(&dom, "ta"));
+        let mut st = FormState::default();
+        st.type_text(&dom, ro, "XYZ");
+        st.backspace(&dom, ro);
+        assert_eq!(st.value(&dom, ro), "fixed");
+        assert!(is_focusable(&dom, ro), "readonly fields can still be focused and selected");
+        st.type_text(&dom, ml, "cdef");
+        assert_eq!(st.value(&dom, ml), "abc");
+        st.type_text(&dom, ta, "123456");
+        assert_eq!(st.value(&dom, ta), "xy12");
+        st.type_text(&dom, bad, "still works");
+        assert_eq!(st.value(&dom, bad), "still works", "an invalid maxlength is ignored");
+    }
+
+    #[test]
     fn disabled_controls_ignore_input_and_are_not_submitted() {
         let dom = html::parse("<form><input name=a value=1 disabled><input name=b value=2></form>");
         let (a, form) = (by_name(&dom, "a"), find(&dom, "form", 0));
@@ -380,6 +451,36 @@ mod tests {
         assert!(!is_focusable(&dom, a));
         let sub = st.submit(&dom, form, None, &base()).unwrap();
         assert_eq!(sub.url.query(), Some("b=2"));
+    }
+
+    #[test]
+    fn a_disabled_fieldset_disables_everything_inside_except_its_legend() {
+        let dom = html::parse(
+            "<form><fieldset disabled><legend><input name=in_legend value=L></legend><input name=a value=1>\
+             <div><button name=btn>go</button><textarea name=t>x</textarea></div></fieldset><input name=out value=2></form>",
+        );
+        let st = FormState::default();
+        for n in ["a", "btn", "t"] {
+            assert!(is_disabled(&dom, by_name(&dom, n)), "{n}");
+            assert!(!is_focusable(&dom, by_name(&dom, n)), "{n}");
+        }
+        assert!(!is_disabled(&dom, by_name(&dom, "in_legend")), "controls in the legend are exempt");
+        assert!(!is_disabled(&dom, by_name(&dom, "out")));
+        let sub = st.submit(&dom, find(&dom, "form", 0), None, &base()).unwrap();
+        assert_eq!(sub.url.query(), Some("in_legend=L&out=2"));
+        let mut st = FormState::default();
+        st.type_text(&dom, by_name(&dom, "a"), "zzz");
+        assert_eq!(st.value(&dom, by_name(&dom, "a")), "1");
+    }
+
+    #[test]
+    fn the_hidden_attribute_removes_controls_from_the_tab_order() {
+        let dom = html::parse("<form><input name=a hidden><div hidden><input name=b></div><input name=c></form>");
+        let mut st = FormState::default();
+        st.focus_next(&dom, true);
+        assert_eq!(st.focus, Some(by_name(&dom, "c")));
+        st.focus_next(&dom, true);
+        assert_eq!(st.focus, Some(by_name(&dom, "c")), "only one focusable control, so it wraps to itself");
     }
 
     #[test]
@@ -401,6 +502,17 @@ mod tests {
         assert!(st.is_checked(&dom, boxes[3]), "a radio of the same name in ANOTHER form is untouched");
         st.toggle(&dom, boxes[1]);
         assert!(st.is_checked(&dom, boxes[1]), "clicking a checked radio keeps it checked");
+    }
+
+    #[test]
+    fn radios_outside_any_form_still_form_a_group() {
+        // they used to stay checked together, since grouping required an enclosing <form>
+        let dom = html::parse("<input type=radio name=r value=1 checked><input type=radio name=r value=2><form><input type=radio name=r value=3 checked></form>");
+        let radios: Vec<_> = (0..dom.nodes.len()).filter(|&i| kind_of(&dom, i) == Some(ControlKind::Radio)).collect();
+        let mut st = FormState::default();
+        st.toggle(&dom, radios[1]);
+        assert!(!st.is_checked(&dom, radios[0]) && st.is_checked(&dom, radios[1]));
+        assert!(st.is_checked(&dom, radios[2]), "the radio inside a form is a different group");
     }
 
     #[test]
@@ -444,6 +556,56 @@ mod tests {
         // no submitter: no button is sent
         let sub = st.submit(&dom, form, None, &base()).unwrap();
         assert!(!sub.url.query().unwrap().contains("go="));
+    }
+
+    #[test]
+    fn textarea_line_breaks_are_submitted_as_crlf() {
+        let dom = html::parse("<form method=post><textarea name=t>a</textarea></form>");
+        let t = by_name(&dom, "t");
+        let mut st = FormState::default();
+        st.type_text(&dom, t, "\nb\n\nc");
+        let sub = st.submit(&dom, find(&dom, "form", 0), None, &base()).unwrap();
+        assert_eq!(sub.body, "t=a%0D%0Ab%0D%0A%0D%0Ac");
+    }
+
+    #[test]
+    fn the_form_attribute_associates_controls_with_a_form_anywhere() {
+        let dom = html::parse(
+            "<form id=f action=/one><input name=in value=1><input name=moved form=g value=X></form>\
+             <input name=out form=f value=2><input name=orphan value=3>\
+             <form id=g action=/two></form>",
+        );
+        let (f, g) = (find(&dom, "form", 0), find(&dom, "form", 1));
+        let st = FormState::default();
+        let one = st.submit(&dom, f, None, &base()).unwrap();
+        assert_eq!((one.url.path(), one.url.query()), ("/one", Some("in=1&out=2")));
+        let two = st.submit(&dom, g, None, &base()).unwrap();
+        assert_eq!((two.url.path(), two.url.query()), ("/two", Some("moved=X")));
+        assert_eq!(form_of(&dom, by_name(&dom, "orphan")), None);
+        // a form= naming no form owns nothing, even inside a <form>
+        let dom = html::parse("<form id=f><input name=a form=nope></form>");
+        assert_eq!(form_of(&dom, by_name(&dom, "a")), None);
+        assert!(controls_in(&dom, find(&dom, "form", 0)).is_empty());
+    }
+
+    #[test]
+    fn a_submit_button_can_override_action_and_method() {
+        let dom = html::parse(
+            "<form action=/default method=get><input name=a value=1>\
+             <button name=plain>x</button><button name=alt formaction=/other formmethod=POST>y</button></form>",
+        );
+        let (form, plain, alt) = (find(&dom, "form", 0), by_name(&dom, "plain"), by_name(&dom, "alt"));
+        let st = FormState::default();
+        let a = st.submit(&dom, form, Some(plain), &base()).unwrap();
+        assert_eq!((a.method, a.url.path()), (Method::Get, "/default"));
+        let b = st.submit(&dom, form, Some(alt), &base()).unwrap();
+        assert_eq!((b.method, b.url.as_str(), b.body.as_str()), (Method::Post, "https://example.com/other", "a=1&alt="));
+    }
+
+    #[test]
+    fn method_dialog_submits_nothing() {
+        let dom = html::parse("<form method=dialog action=/x><input name=a></form>");
+        assert_eq!(FormState::default().submit(&dom, find(&dom, "form", 0), None, &base()), None);
     }
 
     #[test]
@@ -507,6 +669,8 @@ mod tests {
             "<input>", "<form><form><input name=a></form></form>", "<select><option></select>", "<textarea>",
             "<form action='http://[::1'><input name=a></form>", "<form action='javascript:alert(1)'><input name=a></form>",
             "<option><input name=x>", "<form><input name='é日🎉' value='é日🎉'></form>",
+            "<form id=a><input form=a form=a name=x></form>", "<fieldset disabled><fieldset><legend><legend><input>",
+            "<input maxlength=99999999999999999999 readonly hidden>",
         ] {
             let dom = html::parse(src);
             let st = FormState::default();
@@ -519,6 +683,7 @@ mod tests {
                 st.backspace(&dom, i);
                 st.toggle(&dom, i);
                 st.cycle_select(&dom, i);
+                st.focus_next(&dom, true);
                 let _ = st.value(&dom, i);
             }
         }

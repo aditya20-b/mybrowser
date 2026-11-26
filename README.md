@@ -1,8 +1,8 @@
 # mybrowser
 
-I wanted to understand what a browser actually does between receiving some HTML and putting pixels on a screen, so I wrote the rendering part myself in Rust. It parses HTML and CSS, works out which styles apply to what, lays everything out, and paints it into a pixel buffer. There's no WebKit or Blink underneath, and no UI toolkit doing the text layout for me.
+I wanted to understand what a browser actually does, so I'm writing one from scratch in Rust. The goal is a *functional* browser: type an address, fetch the page over HTTPS, parse the HTML and CSS, lay it out, and paint it. There's no WebKit or Blink underneath and no UI toolkit doing the text layout for me. Only the window, the TLS stack and the font rasterizer come from crates.
 
-It's about 2,300 lines including tests, so you can read the whole thing in an afternoon. It's nowhere near a real browser, but it handles a surprising amount of everyday HTML and CSS.
+It is early. It can load and read plain, document-style websites today, and it falls over on anything that depends on JavaScript, tables or flexbox. The [roadmap](#whats-missing) below is honest about the distance to a real browser.
 
 <p align="center">
   <img src="docs/demo.png" width="49%" alt="The demo page rendered by mybrowser">
@@ -16,51 +16,66 @@ Both screenshots come from the engine itself. The `--screenshot` flag runs the s
 You need Rust installed. Then:
 
 ```sh
-cargo run --release -- pages/index.html
+cargo run --release                      # opens the demo pages
+cargo run --release -- https://example.com
+cargo run --release -- some/local/page.html
 ```
 
-That opens a window. Scroll with the wheel or arrow keys, click the links to move between the sample pages, press `Backspace` to go back, and press `R` to reload the file from disk. The reload key is handy while experimenting: edit some HTML or CSS, hit `R`, see the change.
+The window has a toolbar with back, forward and reload buttons and an address bar. You can type a full URL, a bare hostname like `example.com/docs`, or a path to a local file.
 
-To render a page to a PNG without opening a window:
+| Key | Action |
+|---|---|
+| `Cmd+L` (or `Ctrl+L`) | Focus the address bar and select it |
+| `Enter` / `Esc` | Go to the typed address / cancel editing |
+| `Cmd+V`, `Cmd+C`, `Cmd+A` | Paste, copy and select all in the address bar (macOS) |
+| `Cmd+[`, `Cmd+]`, `Alt+←`, `Alt+→`, `Backspace` | Back and forward |
+| `Cmd+R`, `F5`, `R` | Reload |
+| Wheel, arrow keys, `Space`, `PgUp`, `PgDn`, `Home`, `End` | Scroll |
+
+To render a page to a PNG without opening a window (this works on URLs too):
 
 ```sh
-cargo run --release -- --screenshot out.png --width 760 --scale 2 pages/index.html
+cargo run --release -- --screenshot out.png --width 900 --scale 2 https://example.com
 ```
 
 One heads-up: fonts are loaded from the macOS system font folder (see `src/fonts.rs`), so this only works on a Mac for now. The window code is cross-platform, so on Linux or Windows you'd just need to point the font loader at some TTF files.
 
 ## What it can do
 
-On the HTML side, it handles entities, void tags like `<br>` and `<img>`, messy markup (unclosed `<p>` and `<li>`, misnested tags), and builds the `<head>` and `<body>` for you when a page leaves them out.
+**Networking.** It loads `http://` and `https://` pages (TLS through rustls, gzip, redirects, timeouts, a size limit), as well as local files and `data:` URLs. Stylesheets and images are fetched in parallel. It honours `<base href>`, decodes UTF-8, Latin-1 and Windows-1252 text, and shows readable pages for plain text, images and errors (including HTTP 404s with their bodies). A web page can't load local files or send you to one.
 
-For CSS, it reads `<style>` blocks, linked stylesheets and inline `style` attributes. Selectors can be tags, classes, IDs, `*`, and the descendant and child combinators. Specificity, source order, `!important` and inheritance all work. Most of the box model is there too: width, max-width, height, padding, borders, auto margins for centering, `box-sizing`, and margin collapsing, including the awkward cases like a parent and its first child, or negative margins.
+**HTML.** Entities, void tags, messy markup (unclosed `<p>` and `<li>`, misnested tags, stray end tags, tables' implied rows and cells), and a synthesized `<head>` and `<body>` when a page leaves them out. The parser runs in linear time, even on hostile input.
 
-Text is wrapped using real glyph widths, with alignment, bold and italic, monospace, underlines, highlighted spans and clickable links. Lists and `<pre>` blocks work as well, and local PNG images flow inline with the text (scaled with bilinear filtering, with alt text as the fallback).
+**CSS.** `<style>` blocks, linked stylesheets and inline styles. Tag, class, ID, `*`, descendant and child selectors. Specificity, source order, `!important`, origin (author rules beat the built-in stylesheet), inheritance, and `inherit`/`initial`/`unset`. Most of the box model: width, max-width, height, padding, borders, auto margins, `box-sizing`, and margin collapsing including the awkward cases. Colors in hex, `rgb()`, `hsl()` and by name; the `font` and `border` shorthands.
+
+**Text and images.** Text wraps using real glyph widths with alignment, bold, italic, monospace, underlines, highlights and clickable links. Characters missing from the main fonts (arrows, CJK) fall back to a wide-coverage font. PNG images flow inline with the text, scaled with bilinear filtering, with alt text as the fallback.
 
 ## How it works
 
 The engine is a pipeline, and each stage only looks at the output of the one before it:
 
 ```
-HTML  -> DOM  --\
-                 +-> styles -> layout -> display list -> pixels -> window
-CSS   -> rules -/
+URL -> fetch -> HTML -> DOM --\
+                               +-> styles -> layout -> display list -> pixels -> window
+         CSS, images <---------/
 ```
 
 | Stage | File | Notes |
 |---|---|---|
+| Loading | `src/net.rs` | `file:`, `http(s):` and `data:` URLs, redirects, limits, content sniffing, charset decoding. |
 | HTML to DOM | `src/html.rs`, `src/dom.rs` | One pass over the text with a stack of open elements. The DOM is a flat `Vec` of nodes that refer to each other by index, which keeps Rust's ownership rules out of the way. |
-| CSS parsing | `src/css.rs` | Parses rules, matches selectors right to left, and expands shorthands like `margin: 0 auto` into their individual properties up front. |
-| Styles | `src/style.rs` | Walks the DOM once, collects every matching declaration, sorts by importance, specificity and order, and fills in a typed `Style` for each node. |
+| CSS parsing | `src/css.rs` | Parses rules, matches selectors right to left (with memoization so deep trees stay fast), and expands shorthands like `margin: 0 auto` into their individual properties up front. |
+| Styles | `src/style.rs` | Walks the DOM once, collects every matching declaration, sorts by importance, origin, specificity and order, and fills in a typed `Style` for each node. |
 | Layout | `src/layout.rs` | Stacks blocks, collapses margins, breaks text into lines. The output is a flat list of "draw this rect" and "draw this text" commands. |
-| Painting | `src/paint.rs`, `src/fonts.rs` | Fills rectangles into a `u32` buffer and blends glyph bitmaps on top. |
-| Window | `src/main.rs`, `src/page.rs` | Opens the window and handles scrolling, links and history. |
+| Painting | `src/paint.rs`, `src/fonts.rs`, `src/images.rs` | Fills rectangles into a `u32` buffer, blends glyph bitmaps and scaled images on top. |
+| Browser | `src/page.rs`, `src/chrome.rs`, `src/main.rs` | A page ties the stages together; the chrome is the toolbar and address bar; `main` runs the window, input, links and history. |
 
 A few choices worth explaining:
 
 - Layout produces drawing commands instead of a tree of boxes. Painting is then just "run through the list in order", and scrolling only repaints with an offset. Layout reruns only when the window width changes.
 - Selectors I don't support (`a:hover`, `[href]`, `+`) get dropped rather than approximated. Ignoring a rule is better than applying `a:hover` styles to every link.
-- Text is positioned by its baseline, so different font sizes on the same line line up properly.
+- Invalid CSS values are ignored instead of resetting the property, so the common "fallback, then modern value" pattern works.
+- The address bar logic (editing, caret, hit-testing) is plain state with no windowing in it, so it's unit-tested.
 
 ## Dependencies
 
@@ -69,7 +84,8 @@ The engine itself is hand-written. I only used crates for the parts that talk to
 - `winit` for the window and input events
 - `softbuffer` to put a pixel buffer on screen
 - `fontdue` to turn a TrueType glyph into a bitmap and report its metrics
-- `png` to save screenshots
+- `ureq` (with rustls) for HTTP and TLS, and `url` for parsing and resolving URLs
+- `png` to decode PNG images and save screenshots
 
 ## Tests
 
@@ -77,13 +93,21 @@ The engine itself is hand-written. I only used crates for the parts that talk to
 cargo test
 ```
 
-There are 41 tests covering the parsers, selector matching, the cascade and layout. A few of them are regression tests for real bugs I found by throwing nasty input at the engine: text starting with a non-ASCII character crashing the tokenizer, a huge `font-size` killing the process, negative widths, an unclosed `<head>` hiding the whole page, and absurdly deep nesting. The tests load system fonts, so they also need macOS for now.
+There are over a hundred tests. They cover the parsers, selector matching, the cascade, layout, address editing, URL handling, and networking (against a throwaway local HTTP server, so no internet is needed). Many are regression tests for real bugs found by throwing nasty input at the engine and by independent review passes: quadratic-time parsing, exponential selector matching, crashes on odd Unicode and huge values, and so on. The tests load system fonts, so they also need macOS for now.
 
 ## What's missing
 
-Quite a lot. There are no JPEG/GIF/SVG images (PNG only), tables, flexbox, grid, floats or positioning. No pseudo-classes, attribute selectors, `@media`, `var()` or `calc()`. Text goes through no shaping, so no kerning or ligatures and no complex scripts. Pages load from local files only, with no `http://` yet, and there's no JavaScript.
+The honest list, roughly by how much it matters for a real browser:
 
-What I'd like to do next, roughly in this order: loading pages over HTTP, table layout, a flexbox subset, an address bar, and eventually replacing `fontdue` with my own glyph rasterizer.
+- **JavaScript.** None. Pages that build their content with scripts will be blank or broken.
+- **Layout.** No tables, flexbox, grid, floats or positioning, and no `vh`/`vw` units. A lot of the modern web depends on these.
+- **Browser features.** No tabs, cookies, forms or input controls, caching, bookmarks or find-in-page. Pages load synchronously, so the window freezes while one loads.
+- **Media.** PNG only: no JPEG, GIF, WebP or SVG. No fonts from the web (`@font-face`).
+- **CSS gaps.** No pseudo-classes, attribute selectors, `@media`, `var()`, `calc()` or real alpha blending.
+- **Text.** No shaping, so no kerning, ligatures or complex scripts, and no right-to-left text.
+- **Platform.** macOS fonts only, for now.
+
+The order I'm tackling things in: tables, a flexbox subset and viewport units, then loading pages off the main thread, forms, cookies and tabs, more image formats, and eventually a JavaScript engine. Until then it's best at documents, blogs and articles.
 
 ## Where to learn more
 

@@ -3,6 +3,7 @@ use crate::chrome::{self, ChromeView};
 use crate::css::Color;
 use crate::fonts::{invisible, Face, Family, Fonts};
 use crate::layout::{Item, Layout};
+use crate::tabbar::{self, StripView};
 use std::collections::HashMap;
 
 /// Glyph bitmaps are cached per (font slot, char, pixel size). Cap the cache so
@@ -17,6 +18,8 @@ const SELECTION: Color = Color { r: 0xb4, g: 0xd5, b: 0xfe };
 const ICON: Color = Color { r: 0x3c, g: 0x40, b: 0x43 };
 const ICON_DISABLED: Color = Color { r: 0xb0, g: 0xb4, b: 0xb8 };
 const ERROR_TEXT: Color = Color { r: 0xc5, g: 0x22, b: 0x1f };
+const STRIP_BG: Color = Color { r: 0xde, g: 0xe1, b: 0xe6 };
+const TAB_INACTIVE: Color = Color { r: 0xd2, g: 0xd5, b: 0xda };
 
 #[derive(Default)]
 pub struct Painter {
@@ -31,6 +34,24 @@ fn blend(dst: u32, c: Color, a: u32) -> u32 {
 /// A zero, negative or NaN scale would divide by zero or flip the page.
 fn sane_scale(scale: f32) -> f32 {
     if scale.is_finite() && scale > 0.0 { scale } else { 1.0 }
+}
+
+/// The longest prefix of `text` that fits `avail` device pixels, with an
+/// ellipsis if something was cut.
+fn fit_text(fonts: &Fonts, face: Face, size: f32, text: &str, avail: f32) -> String {
+    if fonts.measure(face, size, text) <= avail {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut keep = chars.len();
+    while keep > 0 {
+        keep -= 1;
+        let candidate: String = chars[..keep].iter().chain(std::iter::once(&'…')).collect();
+        if fonts.measure(face, size, &candidate) <= avail {
+            return candidate;
+        }
+    }
+    String::new()
 }
 
 impl Painter {
@@ -117,6 +138,51 @@ impl Painter {
             }
             pen += m.advance_width;
         }
+    }
+
+    /// Draw the tab strip over the top `tabbar::HEIGHT` logical pixels of `buf`.
+    /// The active tab is drawn in the toolbar's colour so the two read as one piece.
+    pub fn paint_tabs(&mut self, buf: &mut [u32], w: usize, h: usize, fonts: &Fonts, scale: f32, view: &StripView) {
+        let scale = sane_scale(scale);
+        let px = |v: f32| (v * scale).round() as i32;
+        let face = Face { family: Family::Sans, bold: false, italic: false };
+        let strip_h = px(tabbar::HEIGHT);
+        let count = view.titles.len();
+        let width = w as f32 / scale;
+
+        fill_rect(buf, w, h, 0, 0, w as i32, strip_h, STRIP_BG);
+        for i in 0..count {
+            let r = tabbar::tab_rect(i, count, width);
+            let active = i == view.active;
+            let (x0, y0, x1) = (px(r.x), px(r.y), px(r.x + r.w));
+            // the active tab runs down into the toolbar; the others stop a hair short
+            let y1 = if active { strip_h } else { strip_h - 1 };
+            fill_rect(buf, w, h, x0, y0, x1, y1, if active { TOOLBAR_BG } else { TAB_INACTIVE });
+
+            let close = tabbar::close_rect(i, count, width);
+            let size = 12.0 * scale;
+            let mut title = view.titles[i].clone();
+            if view.loading.get(i).copied().unwrap_or(false) {
+                title.insert_str(0, "… ");
+            }
+            let avail = px(close.x) as f32 - x0 as f32 - 16.0 * scale;
+            let shown = fit_text(fonts, face, size, &title, avail);
+            let baseline = (y0 + strip_h) as f32 / 2.0 + size * 0.35;
+            self.draw_text(buf, w, h, fonts, face, size, x0 as f32 + 10.0 * scale, baseline, &shown, ICON);
+
+            let cs = 14.0 * scale;
+            let cw = fonts.measure(face, cs, "×");
+            let cx = px(close.x) as f32 + (close.w * scale - cw) / 2.0;
+            let cb = px(close.y) as f32 + close.h * scale / 2.0 + cs * 0.33;
+            self.draw_text(buf, w, h, fonts, face, cs, cx, cb, "×", ICON_DISABLED);
+        }
+
+        let plus = tabbar::new_rect(count, width);
+        let ps = 18.0 * scale;
+        let pw = fonts.measure(face, ps, "+");
+        let px_ = plus.x * scale + (plus.w * scale - pw) / 2.0;
+        let pb = plus.y * scale + plus.h * scale / 2.0 + ps * 0.33;
+        self.draw_text(buf, w, h, fonts, face, ps, px_, pb, "+", ICON);
     }
 
     /// Draw the toolbar over the top `chrome::HEIGHT` logical pixels of `buf`.
@@ -254,6 +320,16 @@ mod tests {
         buf
     }
 
+    fn paint_strip(titles: &[&str], active: usize, w: usize, h: usize, scale: f32) -> Vec<u32> {
+        let fonts = Fonts::load();
+        let titles: Vec<String> = titles.iter().map(|t| t.to_string()).collect();
+        let loading = vec![false; titles.len()];
+        let mut buf = vec![0u32; w * h];
+        let view = StripView { titles: &titles, loading: &loading, active };
+        Painter::default().paint_tabs(&mut buf, w, h, &fonts, scale, &view);
+        buf
+    }
+
     #[test]
     fn huge_coordinates_do_not_overflow() {
         // `margin-left: 3e9px` saturates the i32 pixel coordinates (panicked in debug builds)
@@ -354,5 +430,53 @@ mod tests {
         bar.click_again();
         bar.insert("é日本語🎉");
         paint_bar(&bar, 120, 60, 2.0);
+    }
+
+    #[test]
+    fn tab_strip_marks_the_active_tab_and_draws_titles() {
+        let (w, h) = (500usize, 40usize);
+        let buf = paint_strip(&["First page", "Second page"], 1, w, h, 1.0);
+        let strip_h = tabbar::HEIGHT as usize;
+        let (t0, t1) = (tabbar::tab_rect(0, 2, w as f32), tabbar::tab_rect(1, 2, w as f32));
+        // a pixel in each tab's padding: the active one matches the toolbar, the other is darker
+        assert_eq!(buf[(t0.y as usize + 2) * w + t0.x as usize + 2], TAB_INACTIVE.to_u32());
+        assert_eq!(buf[(t1.y as usize + 2) * w + t1.x as usize + 2], TOOLBAR_BG.to_u32());
+        assert_eq!(buf[(strip_h - 1) * w + t1.x as usize + 2], TOOLBAR_BG.to_u32(), "the active tab reaches the toolbar");
+        assert_eq!(buf[(strip_h - 1) * w + t0.x as usize + 2], STRIP_BG.to_u32(), "inactive ones stop short");
+        assert_eq!(buf[strip_h * w + 5], 0, "nothing below the strip");
+        // titles are ink on the tab
+        let ink = |t: tabbar::Rect| {
+            (t.y as usize..strip_h).flat_map(|y| (t.x as usize..(t.x + t.w) as usize).map(move |x| (x, y))).filter(|&(x, y)| {
+                let p = buf[y * w + x];
+                p != TOOLBAR_BG.to_u32() && p != TAB_INACTIVE.to_u32() && p != STRIP_BG.to_u32()
+            }).count()
+        };
+        assert!(ink(t0) > 40 && ink(t1) > 40, "{} {}", ink(t0), ink(t1));
+    }
+
+    #[test]
+    fn long_titles_are_cut_with_an_ellipsis_and_never_overflow_the_tab() {
+        let fonts = Fonts::load();
+        let face = Face { family: Family::Sans, bold: false, italic: false };
+        let long = "a very long page title that cannot possibly fit in a narrow tab".to_string();
+        let fitted = fit_text(&fonts, face, 12.0, &long, 80.0);
+        assert!(fitted.ends_with('…') && fitted.len() < long.len(), "{fitted}");
+        assert!(fonts.measure(face, 12.0, &fitted) <= 80.0);
+        assert_eq!(fit_text(&fonts, face, 12.0, "short", 500.0), "short");
+        assert_eq!(fit_text(&fonts, face, 12.0, "anything", 0.0), "", "no room at all");
+        assert_eq!(fit_text(&fonts, face, 12.0, "", 10.0), "");
+    }
+
+    #[test]
+    fn tab_strip_survives_tiny_windows_odd_scales_and_many_tabs() {
+        let many: Vec<&str> = vec!["é日本語🎉 tab title"; tabbar::MAX_TABS];
+        for (w, h) in [(1, 1), (10, 5), (100, 20), (400, 40)] {
+            for scale in [0.0, f32::NAN, 0.5, 1.0, 2.0, 3.0] {
+                paint_strip(&["x"], 0, w, h, scale);
+                paint_strip(&many, 3, w, h, scale);
+                paint_strip(&[], 0, w, h, scale);
+            }
+        }
+        paint_strip(&["a", "b"], 9, 200, 40, 1.0); // an out-of-range active index
     }
 }

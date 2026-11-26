@@ -11,6 +11,8 @@ mod net;
 mod page;
 mod paint;
 mod style;
+mod tab;
+mod tabbar;
 
 use chrome::{AddressBar, ChromeView, Hit};
 use dom::NodeId;
@@ -21,6 +23,9 @@ use paint::Painter;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use tab::{is_loopback_host, Notify, Tab, UserEvent};
+use tabbar::{StripView, TabHit};
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -54,13 +59,6 @@ fn parse_number(name: &str, value: &str, min: f32, max: f32) -> Result<f32, Stri
         return Err(format!("{name} must be a number between {min} and {max}"));
     }
     Ok(n)
-}
-
-/// Is `host` (no port) exactly `localhost` or an IPv4 loopback address?
-/// Prefix matching would treat `localhost.evil.com` or `127.evil.com` as local
-/// and send the visit to a remote server in cleartext.
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Turn whatever the user typed (or passed on the command line) into a URL:
@@ -130,7 +128,7 @@ fn main() {
 }
 
 /// Headless mode: render the whole page to a PNG (handy for testing).
-/// This is the page only, without the toolbar.
+/// This is the page only, without the tab strip and toolbar.
 fn screenshot_to_png(url: &Url, fonts: &Fonts, width: f32, scale: f32, out: &Path) {
     let t0 = std::time::Instant::now();
     let mut page = Page::load(url);
@@ -162,198 +160,18 @@ fn screenshot_to_png(url: &Url, fonts: &Fonts, width: f32, scale: f32, out: &Pat
     println!("wrote {} ({w}x{h}); {} display items", out.display(), page.layout.items.len());
 }
 
-/// What a clicked `href` means.
-#[derive(Debug, PartialEq)]
-enum Link {
-    /// Nothing to do: empty href, an in-page `#anchor`, or an unparseable URL.
-    Nothing,
-    /// A scheme we don't handle (`mailto:`, `javascript:`, `tel:`, ...) or
-    /// something a page isn't allowed to open (a web page linking to `file:`).
-    External(String),
-    Navigate(Url),
-}
-
-fn strip_fragment(u: &Url) -> Url {
-    let mut u = u.clone();
-    u.set_fragment(None);
-    u
-}
-
-fn resolve_link(base: &Url, href: &str) -> Link {
-    let href = href.trim();
-    if href.is_empty() || href.starts_with('#') {
-        return Link::Nothing;
-    }
-    let Ok(target) = base.join(href) else { return Link::Nothing };
-    match target.scheme() {
-        // web pages must not be able to send you to local files
-        "file" if matches!(base.scheme(), "http" | "https") => Link::External(target.to_string()),
-        "http" | "https" | "file" => {
-            if strip_fragment(&target) == strip_fragment(base) {
-                Link::Nothing // same document, different fragment: no reload
-            } else {
-                Link::Navigate(target)
-            }
-        }
-        _ => Link::External(target.to_string()),
-    }
-}
-
-/// May a form on `from` send its data to `target`? Data isn't sent from an https
-/// page to plain http (it would travel in the clear, passwords included, unless
-/// the server is on this machine), and only http(s) servers can receive a POST.
-fn form_target_allowed(from: &Url, target: &Url, post: bool) -> Result<(), String> {
-    if post && !matches!(target.scheme(), "http" | "https") {
-        return Err(format!("can't submit a form to {}: URLs", target.scheme()));
-    }
-    let local = target.host_str().is_some_and(is_loopback_host);
-    if from.scheme() == "https" && target.scheme() == "http" && !local {
-        return Err("blocked: this secure page tried to send form data over plain http".into());
-    }
-    Ok(())
-}
-
-/// A fully built page on its way from a loader thread to the UI thread.
-///
-/// `Page` holds `Rc<Image>`s, which are not `Send`. That is only a problem if
-/// two threads could touch the same reference count, and here they can't: every
-/// clone of every `Rc` lives inside this one `Page` (the loader's temporary
-/// caches are dropped before it returns), and the loader thread gives the whole
-/// value away through a channel without keeping anything. Ownership moves as a
-/// unit, so the counts are only ever touched by one thread at a time.
-struct SendPage(Page);
-unsafe impl Send for SendPage {}
-
-enum UserEvent {
-    Loaded { ticket: u64, page: SendPage },
-}
-
-/// How a finished navigation changes the history stacks.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Hist {
-    /// A new page: the one we leave goes on the back stack, forward is dropped.
-    Push,
-    /// Back button: step one entry back.
-    Back,
-    /// Forward button: step one entry forward.
-    Forward,
-    /// Reload: history doesn't change.
-    Replace,
-}
-
-/// The back and forward stacks. They only change when a navigation *lands*, never
-/// when it starts, so a load that is cancelled or superseded can't lose or
-/// duplicate entries.
-#[derive(Default, Debug, PartialEq)]
-struct History {
-    back: Vec<Url>,
-    forward: Vec<Url>,
-}
-
-impl History {
-    /// The page the Back / Forward button would go to.
-    fn back_target(&self) -> Option<&Url> {
-        self.back.last()
-    }
-
-    fn forward_target(&self) -> Option<&Url> {
-        self.forward.last()
-    }
-
-    /// A navigation finished: `from` is the page that was on screen, `landed` the
-    /// page that replaced it (after any redirects).
-    fn apply(&mut self, how: Hist, from: Url, landed: &Url) {
-        match how {
-            Hist::Push => {
-                // Landing on the very page we left (a redirect back to it, or a link to
-                // the current URL) is a replace, not a new entry.
-                if &from != landed {
-                    self.back.push(from);
-                    self.forward.clear();
-                }
-            }
-            Hist::Back => {
-                self.back.pop();
-                self.forward.push(from);
-            }
-            Hist::Forward => {
-                self.forward.pop();
-                self.back.push(from);
-            }
-            Hist::Replace => {}
-        }
-    }
-}
-
-/// A navigation that has started but not finished.
-#[derive(Debug, PartialEq)]
-struct Pending {
-    ticket: u64,
-    /// What is being loaded.
-    url: Url,
-    hist: Hist,
-    /// The page on screen when this started (the one a successful load replaces).
-    from: Url,
-    /// Restore this scroll offset when it lands (reload keeps your place).
-    keep_scroll: Option<f32>,
-}
-
-/// Bookkeeping for the one navigation in flight. Each start gets a ticket;
-/// only the newest ticket may complete, so a slow, superseded load can never
-/// replace a page the user has since moved on to.
-#[derive(Default)]
-struct Navigation {
-    ticket: u64,
-    pending: Option<Pending>,
-}
-
-impl Navigation {
-    fn start(&mut self, from: Url, url: Url, hist: Hist, keep_scroll: Option<f32>) -> u64 {
-        self.ticket += 1;
-        self.pending = Some(Pending { ticket: self.ticket, url, hist, from, keep_scroll });
-        self.ticket
-    }
-
-    /// A load finished: returns its details if it is still the current one.
-    fn finish(&mut self, ticket: u64) -> Option<Pending> {
-        if ticket == self.ticket { self.pending.take() } else { None }
-    }
-
-    /// Abandon whatever is loading. Returns whether something was.
-    fn cancel(&mut self) -> bool {
-        self.ticket += 1;
-        self.pending.take().is_some()
-    }
-
-    fn pending(&self) -> Option<&Pending> {
-        self.pending.as_ref()
-    }
-
-    fn is_loading(&self) -> bool {
-        self.pending.is_some()
-    }
-}
+/// Space above the page: the tab strip and the toolbar, in logical pixels.
+const TOP: f32 = tabbar::HEIGHT + chrome::HEIGHT;
 
 struct App {
     fonts: Fonts,
     painter: Painter,
-    page: Page,
+    tabs: Vec<Tab>,
+    active: usize,
+    next_tab_id: u64,
     bar: AddressBar,
     cwd: std::path::PathBuf,
-    history: History,
-    nav: Navigation,
-    /// Form data for the next `begin_load` to POST (set by `submit_form`).
-    next_post: Option<String>,
-    /// Form data of the navigation in flight, so restarting it (reload while
-    /// loading) POSTs again instead of silently turning into a GET.
-    inflight_post: Option<String>,
-    /// The page the next `begin_load` was started from (a clicked link or a
-    /// submitted form); `None` for typed addresses and history. Decides `SameSite` cookies.
-    next_initiator: Option<Url>,
-    inflight_initiator: Option<Url>,
-    proxy: EventLoopProxy<UserEvent>,
-    scroll: f32,
-    laid_out_width: f32,
+    notify: Notify,
     cursor: (f32, f32), // physical pixels
     hover: Option<String>,
     modifiers: ModifiersState,
@@ -363,16 +181,26 @@ struct App {
 
 impl App {
     fn new(fonts: Fonts, start: Url, cwd: std::path::PathBuf, proxy: EventLoopProxy<UserEvent>) -> App {
-        let page = Page::from_source(&start, "<p style='color:#666'>Loading…</p>");
-        let bar = AddressBar::new(start.as_str());
-        let mut app = App {
-            fonts, painter: Painter::default(), page, bar, cwd, history: History::default(),
-            nav: Navigation::default(), next_post: None, inflight_post: None, next_initiator: None,
-            inflight_initiator: None, proxy, scroll: 0.0, laid_out_width: -1.0, cursor: (0.0, 0.0),
-            hover: None, modifiers: ModifiersState::empty(), window: None, surface: None,
-        };
-        app.begin_load(start, Hist::Replace, None);
-        app
+        let proxy = Mutex::new(proxy);
+        let notify: Notify = Arc::new(move |event| {
+            if let Ok(p) = proxy.lock() {
+                let _ = p.send_event(event);
+            }
+        });
+        let first = Tab::new(0, start, None, notify.clone());
+        let bar = AddressBar::new(&first.address());
+        App {
+            fonts, painter: Painter::default(), tabs: vec![first], active: 0, next_tab_id: 1, bar, cwd, notify,
+            cursor: (0.0, 0.0), hover: None, modifiers: ModifiersState::empty(), window: None, surface: None,
+        }
+    }
+
+    fn tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
     }
 
     fn scale(&self) -> f32 {
@@ -388,9 +216,9 @@ impl App {
         })
     }
 
-    /// Height of the area the page is drawn in (the window minus the toolbar).
+    /// Height of the area the page is drawn in (the window minus the tab strip and toolbar).
     fn view_height(&self) -> f32 {
-        (self.window_size().1 - chrome::HEIGHT).max(0.0)
+        (self.window_size().1 - TOP).max(0.0)
     }
 
     fn request_redraw(&self) {
@@ -401,37 +229,53 @@ impl App {
 
     fn set_title(&self) {
         if let Some(w) = &self.window {
-            let title = if self.nav.is_loading() { "Loading…".to_string() } else { self.page.display_title() };
+            let tab = self.tab();
+            let title = if tab.is_loading() { "Loading…".to_string() } else { tab.title() };
             w.set_title(&format!("{title} — mybrowser"));
         }
     }
 
+    /// Show the active tab's address and title (after anything that navigates or
+    /// switches tabs). Leaves address editing, like a navigation always has.
+    fn sync_chrome(&mut self) {
+        let address = self.tab().address();
+        self.bar.show(&address);
+        self.set_title();
+        self.request_redraw();
+    }
+
     fn clamp_scroll(&mut self) {
-        let max = (self.page.layout.height - self.view_height()).max(0.0);
-        self.scroll = self.scroll.clamp(0.0, max);
+        let view = self.view_height();
+        let tab = self.tab_mut();
+        let max = (tab.page.layout.height - view).max(0.0);
+        tab.scroll = tab.scroll.clamp(0.0, max);
     }
 
     /// Recompute what is under the mouse and set the cursor icon. Must run
     /// whenever the page moves under a stationary cursor: scrolling, relayout,
-    /// navigation.
+    /// navigation, switching tabs.
     fn update_hover(&mut self) {
         let s = self.scale();
         let (cx, cy) = (self.cursor.0 / s, self.cursor.1 / s);
-        let (icon, hover) = if cy < chrome::HEIGHT {
-            let icon = match chrome::hit_test(cx, cy, self.window_size().0) {
+        let (icon, hover) = if cy < tabbar::HEIGHT {
+            let hit = tabbar::hit_test(cx, cy, self.tabs.len(), self.window_size().0);
+            (if hit.is_some() { CursorIcon::Pointer } else { CursorIcon::Default }, None)
+        } else if cy < TOP {
+            let icon = match chrome::hit_test(cx, cy - tabbar::HEIGHT, self.window_size().0) {
                 Some(Hit::Address) => CursorIcon::Text,
                 Some(_) => CursorIcon::Pointer,
                 None => CursorIcon::Default,
             };
             (icon, None)
         } else {
-            let (px, py) = (cx, cy - chrome::HEIGHT + self.scroll);
-            if let Some(id) = self.page.control_at(px, py) {
+            let (px, py) = (cx, cy - TOP + self.tab().scroll);
+            let tab = self.tab();
+            if let Some(id) = tab.page.control_at(px, py) {
                 // an I-beam over text fields, a hand over buttons, boxes and menus
-                let text = forms::kind_of(&self.page.dom, id).is_some_and(forms::is_text_like);
+                let text = forms::kind_of(&tab.page.dom, id).is_some_and(forms::is_text_like);
                 (if text { CursorIcon::Text } else { CursorIcon::Pointer }, None)
             } else {
-                let link = self.link_at(px, py);
+                let link = tab.link_at(px, py);
                 (if link.is_some() { CursorIcon::Pointer } else { CursorIcon::Default }, link)
             }
         };
@@ -442,207 +286,134 @@ impl App {
     }
 
     fn scroll_by(&mut self, dy: f32) {
-        self.scroll += dy;
+        self.tab_mut().scroll += dy;
         self.clamp_scroll();
         self.update_hover();
         self.request_redraw();
     }
 
-    /// Start loading `url` on a background thread. The current page stays on
-    /// screen and responsive until the new one arrives; starting another load (or
-    /// pressing Escape) abandons this one. The history stacks are only touched
-    /// when the load lands (see `finish_load`). If `next_post` is set, the load
-    /// is a form POST with that body; `next_initiator` names the page it came from.
-    fn begin_load(&mut self, url: Url, hist: Hist, keep_scroll: Option<f32>) {
-        let ticket = self.nav.start(self.page.url.clone(), url.clone(), hist, keep_scroll);
-        let post = self.next_post.take();
-        let initiator = self.next_initiator.take();
-        self.inflight_post = post.clone();
-        self.inflight_initiator = initiator.clone();
-        self.bar.show(url.as_str());
-        self.set_title();
-        let proxy = self.proxy.clone();
-        std::thread::spawn(move || {
-            let load = || {
-                net::with_initiator(initiator.clone(), || match &post {
-                    Some(body) => Page::load_post(&url, body),
-                    None => Page::load(&url),
-                })
-            };
-            // A panic while loading must still end the "Loading…" state, even if
-            // building the error page itself panics.
-            let page = std::panic::catch_unwind(std::panic::AssertUnwindSafe(load))
-                .or_else(|_| std::panic::catch_unwind(|| Page::error(&url, "internal error while loading this page")))
-                .unwrap_or_else(|_| Page::from_source(&url, "<p>Could not load this page.</p>"));
-            let _ = proxy.send_event(UserEvent::Loaded { ticket, page: SendPage(page) });
-        });
-        self.request_redraw();
-    }
+    // ---------- tabs ----------
 
-    /// A loader thread delivered a page.
-    fn finish_load(&mut self, ticket: u64, page: Page) {
-        let Some(pending) = self.nav.finish(ticket) else { return }; // superseded or cancelled
-        self.inflight_post = None;
-        self.inflight_initiator = None;
-        self.history.apply(pending.hist, pending.from, &page.url);
-        self.page = page;
-        self.bar.show(self.page.url.as_str()); // the final URL, after redirects
-        self.laid_out_width = -1.0; // force relayout on the next redraw
-        self.scroll = pending.keep_scroll.unwrap_or(0.0); // clamped on the next redraw
+    /// Open a tab (loading `url`, or empty) and switch to it.
+    fn new_tab(&mut self, url: Option<Url>, initiator: Option<Url>) {
+        if self.tabs.len() >= tabbar::MAX_TABS {
+            self.bar.error = Some(format!("too many tabs open (the limit is {})", tabbar::MAX_TABS));
+            return;
+        }
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let blank = url.is_none();
+        let tab = match url {
+            Some(u) => Tab::new(id, u, initiator, self.notify.clone()),
+            None => Tab::blank(id, self.notify.clone()),
+        };
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        self.sync_chrome();
+        if blank {
+            self.bar.focus(); // ready to type an address
+        }
         self.update_hover();
-        self.set_title();
-        self.request_redraw();
     }
 
-    /// Give up on the load in flight and show the current page's address again.
-    fn cancel_load(&mut self) {
-        if self.nav.cancel() {
-            self.inflight_post = None;
-            self.inflight_initiator = None;
-            let url = self.page.url.to_string();
-            self.bar.show(&url);
-            self.set_title();
-            self.request_redraw();
+    /// Close tab `index`. The last tab is replaced by an empty one, not removed.
+    fn close_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        if self.tabs.len() == 1 {
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
+            self.tabs[0] = Tab::blank(id, self.notify.clone());
+            self.active = 0;
+        } else {
+            self.tabs.remove(index);
+            self.active = tabbar::active_after_close(self.active, index, self.tabs.len());
+        }
+        self.sync_chrome();
+        self.update_hover();
+    }
+
+    fn switch_tab(&mut self, index: usize) {
+        if index < self.tabs.len() && index != self.active {
+            self.active = index;
+            self.sync_chrome();
+            self.update_hover();
         }
     }
+
+    // ---------- navigation in the active tab ----------
 
     fn open(&mut self, url: Url) {
-        self.begin_load(url, Hist::Push, None);
+        self.tab_mut().open(url);
+        self.sync_chrome();
     }
 
-    /// Reload. While a navigation is loading, that navigation is restarted (not
-    /// silently replaced by a reload of the page underneath it), form data
-    /// included. Reloading a page that a POST produced fetches its URL with a GET.
     fn reload(&mut self) {
-        if let Some(p) = self.nav.pending() {
-            let (url, hist) = (p.url.clone(), p.hist);
-            self.next_post = self.inflight_post.clone();
-            self.next_initiator = self.inflight_initiator.clone();
-            self.begin_load(url, hist, None);
-        } else {
-            let (url, keep) = (self.page.url.clone(), self.scroll);
-            self.begin_load(url, Hist::Replace, Some(keep));
-        }
+        self.tab_mut().reload();
+        self.sync_chrome();
     }
 
     fn go_back(&mut self) {
-        if let Some(prev) = self.history.back_target().cloned() {
-            self.begin_load(prev, Hist::Back, None);
-        }
+        self.tab_mut().go_back();
+        self.sync_chrome();
     }
 
     fn go_forward(&mut self) {
-        if let Some(next) = self.history.forward_target().cloned() {
-            self.begin_load(next, Hist::Forward, None);
+        self.tab_mut().go_forward();
+        self.sync_chrome();
+    }
+
+    fn cancel_load(&mut self) {
+        if self.tab_mut().cancel_load() {
+            self.sync_chrome();
         }
     }
 
-    fn follow(&mut self, href: &str) {
-        match resolve_link(&self.page.url, href) {
-            Link::Nothing => {} // in-page anchors aren't scrolled to yet
-            Link::External(url) => eprintln!("not supported (yet): {url}"),
-            Link::Navigate(url) => {
-                self.next_initiator = Some(self.page.url.clone());
-                self.open(url);
-            }
+    /// A loader thread delivered a page for some tab (which may have been closed since).
+    fn user_event_loaded(&mut self, tab: u64, ticket: u64, page: Page) {
+        let Some(index) = self.tabs.iter().position(|t| t.id == tab) else { return };
+        if !self.tabs[index].finish_load(ticket, page) {
+            return; // superseded or cancelled
         }
-    }
-
-    fn link_at(&self, x: f32, y: f32) -> Option<String> {
-        let l = self.page.layout.links.iter().find(|l| x >= l.x && x <= l.x + l.w && y >= l.y && y <= l.y + l.h);
-        l.map(|l| l.href.clone())
+        if index == self.active {
+            self.sync_chrome();
+            self.update_hover();
+        } else {
+            self.request_redraw(); // its label changed
+        }
     }
 
     // ---------- forms ----------
 
-    /// The form state changed (focus, text, a toggle): the page must be laid out
-    /// and drawn again.
-    fn form_changed(&mut self) {
-        self.laid_out_width = -1.0;
-        self.request_redraw();
-    }
-
-    /// Move keyboard focus to the address bar. A page field can't keep focus at
-    /// the same time (typing would otherwise go back to it once the bar is left).
-    fn focus_address_bar(&mut self) {
-        if self.page.form.focus.take().is_some() {
-            self.form_changed();
+    /// The result of a click or key that may have submitted a form.
+    fn after_form_action(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.sync_chrome(),
+            Err(why) => self.bar.error = Some(why),
         }
-        self.bar.focus();
     }
 
     /// A click landed on control `id`.
     fn activate_control(&mut self, id: NodeId) {
-        if forms::is_disabled(&self.page.dom, id) {
-            return;
-        }
-        let kind = forms::kind_of(&self.page.dom, id);
-        let Page { dom, form, .. } = &mut self.page;
-        match kind {
-            Some(ControlKind::Text | ControlKind::Password | ControlKind::Textarea) => form.focus = Some(id),
-            Some(ControlKind::Checkbox | ControlKind::Radio) => {
-                form.focus = Some(id);
-                form.toggle(dom, id);
-            }
-            Some(ControlKind::Select) => {
-                form.focus = Some(id);
-                form.cycle_select(dom, id);
-            }
-            Some(ControlKind::Submit) => {
-                form.focus = Some(id);
-                self.submit_form(id, Some(id));
-            }
-            Some(ControlKind::Button) => form.focus = Some(id),
-            _ => {}
-        }
-        self.form_changed();
+        let result = self.tab_mut().activate_control(id);
+        self.after_form_action(result);
     }
 
-    /// Submit the form that contains `control`, as if `submitter` (a button) was clicked.
-    /// The target goes through the same safety checks as a link (a web page's form
-    /// can't send you to `file:` or `javascript:`), plus `form_target_allowed`.
     fn submit_form(&mut self, control: NodeId, submitter: Option<NodeId>) {
-        let Some(form_el) = forms::form_of(&self.page.dom, control) else { return };
-        let Some(sub) = self.page.form.submit(&self.page.dom, form_el, submitter, &self.page.url) else { return };
-        let post = matches!(sub.method, forms::Method::Post);
-        // pressing Enter twice must not send a POST twice (a duplicate order, say)
-        if post && self.nav.is_loading() && self.inflight_post.is_some() {
-            return;
-        }
-        let from = self.page.url.clone();
-        let target = match resolve_link(&from, sub.url.as_str()) {
-            Link::Navigate(url) => url,
-            Link::Nothing => from.clone(), // submitting to the page you're already on
-            Link::External(url) => {
-                eprintln!("not supported (yet): {url}");
-                return;
-            }
-        };
-        if let Err(why) = form_target_allowed(&from, &target, post) {
-            self.bar.error = Some(why);
-            return;
-        }
-        self.next_initiator = Some(from.clone());
-        if post {
-            self.next_post = Some(sub.body);
-        }
-        if target == from {
-            // replace the page in place (not `reload`, which might restart a different pending load)
-            self.begin_load(target, Hist::Replace, None);
-        } else {
-            self.open(target);
-        }
+        let result = self.tab_mut().submit_form(control, submitter);
+        self.after_form_action(result);
     }
 
     /// A key press while a form control has focus. Returns true if the control
     /// consumed it. Typing in a text field consumes everything (so `r` types an
     /// `r` instead of reloading); other controls only take Space, Enter, Tab and Escape.
     fn control_key(&mut self, event: &KeyEvent, cmd: bool) -> bool {
-        let Some(id) = self.page.form.focus else { return false };
+        let Some(id) = self.tab().page.form.focus else { return false };
         if cmd {
             return false; // Cmd+L, Cmd+R ... still work
         }
-        let kind = forms::kind_of(&self.page.dom, id);
+        let kind = forms::kind_of(&self.tab().page.dom, id);
         let text_like = kind.is_some_and(forms::is_text_like);
         let shift = self.modifiers.shift_key();
         // Holding Enter or Space must not toggle a box or navigate over and over.
@@ -655,37 +426,40 @@ impl App {
         }
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => {
-                self.page.form.focus = None;
-                self.form_changed();
+                let tab = self.tab_mut();
+                tab.page.form.focus = None;
+                tab.form_changed();
                 true
             }
             Key::Named(NamedKey::Tab) => {
-                let Page { dom, form, .. } = &mut self.page;
+                let tab = self.tab_mut();
+                let Page { dom, form, .. } = &mut tab.page;
                 form.focus_next(dom, !shift);
-                self.form_changed();
+                tab.form_changed();
                 true
             }
             Key::Named(NamedKey::Enter) => {
                 match kind {
-                    Some(ControlKind::Textarea) => self.page.dom_value_edit(id, "\n"),
+                    Some(ControlKind::Textarea) => self.tab_mut().page.dom_value_edit(id, "\n"),
                     Some(ControlKind::Submit) => self.submit_form(id, Some(id)),
                     Some(ControlKind::Text | ControlKind::Password) => {
                         // implicit submission: Enter "clicks" the form's first submit button
-                        if let Some(form_el) = forms::form_of(&self.page.dom, id) {
-                            let button = FormState::default_button(&self.page.dom, form_el);
+                        if let Some(form_el) = forms::form_of(&self.tab().page.dom, id) {
+                            let button = FormState::default_button(&self.tab().page.dom, form_el);
                             self.submit_form(id, button);
                         }
                     }
                     Some(ControlKind::Checkbox | ControlKind::Radio | ControlKind::Select) => self.activate_control(id),
                     _ => {}
                 }
-                self.form_changed();
+                self.tab_mut().form_changed();
                 true
             }
             Key::Named(NamedKey::Backspace) if text_like => {
-                let Page { dom, form, .. } = &mut self.page;
+                let tab = self.tab_mut();
+                let Page { dom, form, .. } = &mut tab.page;
                 form.backspace(dom, id);
-                self.form_changed();
+                tab.form_changed();
                 true
             }
             Key::Named(NamedKey::Space)
@@ -695,14 +469,25 @@ impl App {
                 true
             }
             _ if text_like => {
+                let tab = self.tab_mut();
                 if let Some(text) = &event.text {
-                    self.page.dom_value_edit(id, text.as_str());
+                    tab.page.dom_value_edit(id, text.as_str());
                 }
-                self.form_changed();
+                tab.form_changed();
                 true
             }
             _ => false,
         }
+    }
+
+    /// Move keyboard focus to the address bar. A page field can't keep focus at
+    /// the same time (typing would otherwise go back to it once the bar is left).
+    fn focus_address_bar(&mut self) {
+        let tab = self.tab_mut();
+        if tab.page.form.focus.take().is_some() {
+            tab.form_changed();
+        }
+        self.bar.focus();
     }
 
     /// Enter pressed in the address bar. Going to the page you're already on is
@@ -710,7 +495,7 @@ impl App {
     fn commit_address(&mut self) {
         let typed = self.bar.submit_text().to_string();
         match url_from_input(&typed, &self.cwd) {
-            Ok(url) if url == self.page.url && !self.nav.is_loading() => self.reload(),
+            Ok(url) if url == self.tab().page.url && !self.tab().is_loading() => self.reload(),
             Ok(url) => self.open(url),
             Err(e) => self.bar.error = Some(e),
         }
@@ -720,8 +505,16 @@ impl App {
     fn click(&mut self) {
         let s = self.scale();
         let (cx, cy) = (self.cursor.0 / s, self.cursor.1 / s);
-        if cy < chrome::HEIGHT {
-            match chrome::hit_test(cx, cy, self.window_size().0) {
+        let width = self.window_size().0;
+        if cy < tabbar::HEIGHT {
+            match tabbar::hit_test(cx, cy, self.tabs.len(), width) {
+                Some(TabHit::Select(i)) => self.switch_tab(i),
+                Some(TabHit::Close(i)) => self.close_tab(i),
+                Some(TabHit::New) => self.new_tab(None, None),
+                None => {}
+            }
+        } else if cy < TOP {
+            match chrome::hit_test(cx, cy - tabbar::HEIGHT, width) {
                 Some(Hit::Back) => self.go_back(),
                 Some(Hit::Forward) => self.go_forward(),
                 Some(Hit::Reload) => self.reload(),
@@ -737,20 +530,29 @@ impl App {
         } else {
             // clicking the page ends address editing
             if self.bar.is_focused() {
-                let url = if self.nav.is_loading() { self.bar.submit_text().to_string() } else { self.page.url.to_string() };
+                let url = if self.tab().is_loading() { self.bar.submit_text().to_string() } else { self.tab().page.url.to_string() };
                 self.bar.show(&url);
             }
-            let (px, py) = (cx, cy - chrome::HEIGHT + self.scroll);
-            if let Some(id) = self.page.control_at(px, py) {
+            let (px, py) = (cx, cy - TOP + self.tab().scroll);
+            if let Some(id) = self.tab().page.control_at(px, py) {
                 self.activate_control(id);
             } else {
                 // clicking anywhere else leaves the control that had focus
-                if self.page.form.focus.take().is_some() {
-                    self.form_changed();
+                let tab = self.tab_mut();
+                if tab.page.form.focus.take().is_some() {
+                    tab.form_changed();
                 }
                 self.update_hover(); // hit-test at release time rather than trusting a stale hover
                 if let Some(href) = self.hover.clone() {
-                    self.follow(&href);
+                    if self.modifiers.super_key() {
+                        // Cmd+click opens the link in a new tab
+                        if let Some(url) = self.tab().link_target(&href) {
+                            let from = self.tab().page.url.clone();
+                            self.new_tab(Some(url), Some(from));
+                        }
+                    } else if self.tab_mut().follow(&href) {
+                        self.sync_chrome();
+                    }
                 }
             }
         }
@@ -762,9 +564,8 @@ impl App {
         match &event.logical_key {
             Key::Named(NamedKey::Enter) => self.commit_address(),
             Key::Named(NamedKey::Escape) => {
-                let url = self.page.url.to_string();
-                self.bar.show(&url);
-                self.cancel_load();
+                self.tab_mut().cancel_load();
+                self.sync_chrome(); // shows the page's own address again
             }
             Key::Named(NamedKey::Backspace) if cmd => self.bar.clear(),
             Key::Named(NamedKey::Backspace) => self.bar.backspace(),
@@ -800,8 +601,44 @@ impl App {
         }
     }
 
+    /// Shortcuts that work wherever the focus is: new tab, close tab, switch tab.
+    /// Returns true if the key was one of them.
+    fn tab_shortcut(&mut self, event: &KeyEvent, cmd: bool) -> bool {
+        match &event.logical_key {
+            Key::Named(NamedKey::Tab) if self.modifiers.control_key() => {
+                let forward = !self.modifiers.shift_key();
+                let next = tabbar::cycle(self.active, self.tabs.len(), forward);
+                self.switch_tab(next);
+                true
+            }
+            Key::Character(c) if cmd => match c.as_str().to_ascii_lowercase().as_str() {
+                "t" | "w" if event.repeat => true, // holding the key must not open or close dozens of tabs
+                "t" => {
+                    self.new_tab(None, None);
+                    true
+                }
+                "w" => {
+                    self.close_tab(self.active);
+                    true
+                }
+                d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && d != "0" => {
+                    // Cmd+1..8 select that tab, Cmd+9 the last one
+                    let n = (d.as_bytes()[0] - b'0') as usize;
+                    self.switch_tab(if n == 9 { self.tabs.len() - 1 } else { n - 1 });
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     fn on_key(&mut self, event: &KeyEvent) {
         let cmd = self.modifiers.super_key() || self.modifiers.control_key();
+        if self.tab_shortcut(event, cmd) {
+            self.request_redraw();
+            return;
+        }
         if self.bar.is_focused() {
             self.address_key(event, cmd);
             self.request_redraw();
@@ -825,9 +662,11 @@ impl App {
             Key::Named(NamedKey::Escape) => self.cancel_load(),
             Key::Named(NamedKey::Tab) => {
                 // Tab into the page's first control (Shift+Tab: the last)
-                let (shift, Page { dom, form, .. }) = (self.modifiers.shift_key(), &mut self.page);
+                let shift = self.modifiers.shift_key();
+                let tab = self.tab_mut();
+                let Page { dom, form, .. } = &mut tab.page;
                 form.focus_next(dom, !shift);
-                self.form_changed();
+                tab.form_changed();
             }
             Key::Named(NamedKey::ArrowDown) => self.scroll_by(48.0),
             Key::Named(NamedKey::ArrowUp) => self.scroll_by(-48.0),
@@ -852,9 +691,12 @@ impl App {
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
         let scale = self.scale();
         let logical_w = size.width as f32 / scale;
-        if (logical_w - self.laid_out_width).abs() > 0.5 {
-            self.page.relayout(&self.fonts, logical_w);
-            self.laid_out_width = logical_w;
+        {
+            let tab = &mut self.tabs[self.active];
+            if (logical_w - tab.laid_out_width).abs() > 0.5 {
+                tab.page.relayout(&self.fonts, logical_w);
+                tab.laid_out_width = logical_w;
+            }
         }
         // The page height or the window height may have changed (resize, reload,
         // navigation), so the clamp and the hover state are refreshed every frame.
@@ -862,19 +704,26 @@ impl App {
         self.update_hover();
 
         let (w_px, h_px) = (size.width as usize, size.height as usize);
-        let top = ((chrome::HEIGHT * scale).round() as usize).min(h_px);
+        let tab_px = ((tabbar::HEIGHT * scale).round() as usize).min(h_px);
+        let bar_px = (chrome::HEIGHT * scale).round() as usize;
+        let top = (tab_px + bar_px).min(h_px);
+        let titles: Vec<String> = self.tabs.iter().map(|t| t.title()).collect();
+        let loading: Vec<bool> = self.tabs.iter().map(|t| t.is_loading()).collect();
+        let tab = &self.tabs[self.active];
         let surface = self.surface.as_mut().unwrap();
         surface.resize(w, h).unwrap();
         let mut buffer = surface.buffer_mut().unwrap();
         let pixels: &mut [u32] = &mut buffer;
-        // The page is painted into the rows below the toolbar, then the toolbar on top.
-        self.painter.paint(&mut pixels[top * w_px..], w_px, h_px - top, &self.page.layout, &self.fonts, self.scroll, scale);
+        // The page goes in the rows below the chrome; then the toolbar, then the tab strip on top.
+        self.painter.paint(&mut pixels[top * w_px..], w_px, h_px - top, &tab.page.layout, &self.fonts, tab.scroll, scale);
         let view = ChromeView {
             bar: &self.bar,
-            can_back: self.history.back_target().is_some(),
-            can_forward: self.history.forward_target().is_some(),
+            can_back: tab.history.back_target().is_some(),
+            can_forward: tab.history.forward_target().is_some(),
         };
-        self.painter.paint_chrome(pixels, w_px, h_px, &self.fonts, scale, &view);
+        self.painter.paint_chrome(&mut pixels[tab_px * w_px..], w_px, h_px - tab_px, &self.fonts, scale, &view);
+        let strip = StripView { titles: &titles, loading: &loading, active: self.active };
+        self.painter.paint_tabs(&mut pixels[..tab_px * w_px], w_px, tab_px, &self.fonts, scale, &strip);
         buffer.present().unwrap();
     }
 }
@@ -896,7 +745,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Loaded { ticket, page } => self.finish_load(ticket, page.0),
+            UserEvent::Loaded { tab, ticket, page } => self.user_event_loaded(tab, ticket, page.0),
         }
     }
 
@@ -996,219 +845,5 @@ mod tests {
         ] {
             assert_eq!(url_from_input(typed, &dir), Ok(u(expected)), "{typed}");
         }
-        assert!(is_loopback_host("localhost") && is_loopback_host("127.0.0.1") && is_loopback_host("127.1.2.3"));
-        assert!(!is_loopback_host("localhost.evil.com") && !is_loopback_host("127.evil.com") && !is_loopback_host("128.0.0.1"));
-    }
-
-    #[test]
-    fn link_resolution() {
-        let page = u("https://example.com/dir/page.html?q=1");
-        assert_eq!(resolve_link(&page, "other.html"), Link::Navigate(u("https://example.com/dir/other.html")));
-        assert_eq!(resolve_link(&page, "../up.html#frag"), Link::Navigate(u("https://example.com/up.html#frag")));
-        assert_eq!(resolve_link(&page, "/root"), Link::Navigate(u("https://example.com/root")));
-        assert_eq!(resolve_link(&page, "//cdn.test/x"), Link::Navigate(u("https://cdn.test/x")));
-        assert_eq!(resolve_link(&page, "?q=2"), Link::Navigate(u("https://example.com/dir/page.html?q=2")));
-        assert_eq!(resolve_link(&page, "http://other.test/"), Link::Navigate(u("http://other.test/")));
-        // same document
-        for nothing in ["", "  ", "#section", "page.html?q=1#other"] {
-            assert_eq!(resolve_link(&page, nothing), Link::Nothing, "{nothing:?}");
-        }
-        // schemes we don't handle, and web -> local file are refused
-        for external in ["mailto:a@b.c", "javascript:void(0)", "tel:123", "data:text/html,hi", "file:///etc/passwd", "ftp://x.test/y"] {
-            assert!(matches!(resolve_link(&page, external), Link::External(_)), "{external}");
-        }
-        // control characters hidden inside a scheme can't smuggle a javascript: link through
-        assert!(matches!(resolve_link(&page, "java\nscript:alert(1)"), Link::External(_)));
-        assert!(matches!(resolve_link(&page, "  JaVaScRiPt:alert(1)"), Link::External(_)));
-        // local pages can link to local files, with percent-encoding handled by the URL parser
-        let local = u("file:///site/pages/index.html");
-        assert_eq!(resolve_link(&local, "a%20b.html?x=1#top"), Link::Navigate(u("file:///site/pages/a%20b.html?x=1#top")));
-        assert_eq!(resolve_link(&local, "file:///other.html"), Link::Navigate(u("file:///other.html")));
-    }
-
-    #[test]
-    fn form_submissions_go_through_the_same_link_safety_checks() {
-        // a form on a web page can't send you to a local file or a javascript: URL
-        let page = u("https://example.com/form.html");
-        for action in ["file:///etc/passwd", "javascript:alert(1)", "mailto:a@b.c"] {
-            assert!(matches!(resolve_link(&page, action), Link::External(_)), "{action}");
-        }
-        // and a GET form to the same URL is "nothing new", which the window turns into a reload
-        assert_eq!(resolve_link(&page, "https://example.com/form.html"), Link::Nothing);
-        assert_eq!(resolve_link(&page, "https://example.com/form.html?q=rust"), Link::Navigate(u("https://example.com/form.html?q=rust")));
-    }
-
-    #[test]
-    fn forms_never_downgrade_to_plain_http_or_post_to_non_http() {
-        // an https login page whose form action is http:// sent the password in the clear
-        let secure = u("https://bank.test/login");
-        assert!(form_target_allowed(&secure, &u("https://bank.test/auth"), true).is_ok());
-        for post in [true, false] {
-            assert!(form_target_allowed(&secure, &u("http://bank.test/auth"), post).is_err());
-            assert!(form_target_allowed(&secure, &u("http://other.test/"), post).is_err());
-            // a server on this machine isn't "the network"
-            assert!(form_target_allowed(&secure, &u("http://localhost:8080/x"), post).is_ok());
-            assert!(form_target_allowed(&secure, &u("http://127.0.0.1/x"), post).is_ok());
-        }
-        // plain-http pages may submit anywhere http(s)
-        let plain = u("http://old.test/form");
-        assert!(form_target_allowed(&plain, &u("http://old.test/go"), true).is_ok());
-        assert!(form_target_allowed(&plain, &u("https://new.test/go"), true).is_ok());
-        // a POST to a file: URL is an error up front, not an error page in your history
-        let local = u("file:///site/form.html");
-        assert!(form_target_allowed(&local, &u("file:///site/x.html"), true).is_err());
-        assert!(form_target_allowed(&local, &u("file:///site/x.html"), false).is_ok(), "GET to a file is a normal navigation");
-    }
-
-    // ---------- background loading ----------
-
-    #[test]
-    fn only_the_newest_navigation_may_complete() {
-        let mut nav = Navigation::default();
-        assert!(!nav.is_loading());
-        let first = nav.start(u("https://home.test/"), u("https://a.test/"), Hist::Push, None);
-        assert!(nav.is_loading());
-        // the user clicks something else before the first load finishes
-        let second = nav.start(u("https://home.test/"), u("https://b.test/"), Hist::Push, Some(42.0));
-        assert_ne!(first, second);
-        // the slow first load arrives late: it must be ignored, and not disturb the second
-        assert_eq!(nav.finish(first), None);
-        assert!(nav.is_loading(), "the second navigation is still pending");
-        let done = nav.finish(second).expect("the newest load completes");
-        assert_eq!((done.hist, done.url, done.keep_scroll), (Hist::Push, u("https://b.test/"), Some(42.0)));
-        assert!(!nav.is_loading());
-        // a duplicate delivery of the same ticket completes nothing
-        assert_eq!(nav.finish(second), None);
-    }
-
-    #[test]
-    fn cancelling_invalidates_the_load_in_flight() {
-        let mut nav = Navigation::default();
-        assert!(!nav.cancel(), "nothing to cancel");
-        let t = nav.start(u("https://home.test/"), u("https://a.test/"), Hist::Replace, None);
-        assert!(nav.cancel());
-        assert!(!nav.is_loading());
-        assert_eq!(nav.finish(t), None, "a cancelled load that still arrives is dropped");
-        // and a new navigation after a cancel works normally
-        let t2 = nav.start(u("https://home.test/"), u("https://c.test/"), Hist::Push, None);
-        assert!(nav.finish(t2).is_some());
-    }
-
-    // ---------- history ----------
-
-    /// The user is on C, having come from A then B.
-    fn on_c() -> (History, Url) {
-        let h = History { back: vec![u("https://a.test/"), u("https://b.test/")], forward: vec![] };
-        (h, u("https://c.test/"))
-    }
-
-    #[test]
-    fn a_cancelled_back_navigation_leaves_history_untouched() {
-        // Back used to pop the stack and push the forward stack the moment it was pressed,
-        // so cancelling lost B and left Forward pointing at the page you were already on.
-        let (history, c) = on_c();
-        let mut nav = Navigation::default();
-        let before = History { back: history.back.clone(), forward: history.forward.clone() };
-        let target = history.back_target().cloned().unwrap();
-        assert_eq!(target, u("https://b.test/"));
-        let t = nav.start(c, target, Hist::Back, None);
-        assert!(nav.cancel());
-        assert_eq!(nav.finish(t), None); // nothing lands, so nothing is applied
-        assert_eq!(history, before);
-    }
-
-    #[test]
-    fn back_then_link_click_keeps_the_pages_you_came_from() {
-        // back (starts), then click a link before it lands: the link wins, and B must survive
-        let (mut history, c) = on_c();
-        let mut nav = Navigation::default();
-        let _back = nav.start(c.clone(), u("https://b.test/"), Hist::Back, None);
-        let link = nav.start(c.clone(), u("https://d.test/"), Hist::Push, None);
-        let done = nav.finish(link).unwrap();
-        history.apply(done.hist, done.from, &u("https://d.test/"));
-        assert_eq!(history.back, [u("https://a.test/"), u("https://b.test/"), c]);
-        assert!(history.forward.is_empty());
-    }
-
-    #[test]
-    fn back_and_forward_move_one_step_when_they_land() {
-        let (mut history, c) = on_c();
-        history.apply(Hist::Back, c.clone(), &u("https://b.test/")); // now on B
-        assert_eq!((history.back.clone(), history.forward.clone()), (vec![u("https://a.test/")], vec![c.clone()]));
-        history.apply(Hist::Back, u("https://b.test/"), &u("https://a.test/")); // now on A
-        assert_eq!((history.back.len(), history.forward.len()), (0, 2));
-        assert_eq!(history.back_target(), None);
-        history.apply(Hist::Forward, u("https://a.test/"), &u("https://b.test/")); // forward to B
-        assert_eq!(history.back, [u("https://a.test/")]);
-        assert_eq!(history.forward_target(), Some(&c));
-        // a fresh navigation drops the forward stack
-        history.apply(Hist::Push, u("https://b.test/"), &u("https://z.test/"));
-        assert!(history.forward.is_empty());
-        assert_eq!(history.back, [u("https://a.test/"), u("https://b.test/")]);
-    }
-
-    #[test]
-    fn landing_on_the_page_you_left_is_a_replace_not_a_new_entry() {
-        // typing X when the page is X/final (X redirects there) used to push a duplicate each time
-        let mut history = History { back: vec![u("https://a.test/")], forward: vec![u("https://f.test/")] };
-        let here = u("https://x.test/final");
-        for _ in 0..3 {
-            history.apply(Hist::Push, here.clone(), &here);
-        }
-        assert_eq!(history.back, [u("https://a.test/")], "no duplicates");
-        assert_eq!(history.forward, [u("https://f.test/")], "forward survives a replace");
-        // and reload never changes history
-        history.apply(Hist::Replace, here.clone(), &here);
-        assert_eq!(history.back.len(), 1);
-    }
-
-    #[test]
-    fn reload_during_a_navigation_restarts_that_navigation() {
-        // the load being restarted is the pending one, with its original history behaviour
-        let mut nav = Navigation::default();
-        nav.start(u("https://home.test/"), u("https://b.test/"), Hist::Push, None);
-        let p = nav.pending().unwrap();
-        let (url, hist) = (p.url.clone(), p.hist);
-        assert_eq!((url.as_str(), hist), ("https://b.test/", Hist::Push));
-        nav.start(u("https://home.test/"), url, hist, None);
-        assert_eq!(nav.pending().unwrap().from, u("https://home.test/"), "still replacing the page on screen");
-    }
-
-    #[test]
-    fn a_page_built_on_another_thread_arrives_intact() {
-        // What the loader thread does, end to end: build a page with images and styles
-        // on one thread, hand it over whole, and use it on this one.
-        let dir = std::env::temp_dir().join(format!("mybrowser-bg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut png = vec![];
-        let mut enc = png::Encoder::new(&mut png, 3, 2);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        enc.write_header().unwrap().write_image_data(&[255u8; 24]).unwrap();
-        std::fs::write(dir.join("a.png"), &png).unwrap();
-        std::fs::write(dir.join("p.html"), "<title>Threaded</title><style>p{color:red}</style><p>hi</p><img src=a.png><img src=a.png><form><input name=q value=x></form>").unwrap();
-        let url = Url::from_file_path(dir.join("p.html")).unwrap();
-
-        let (tx, rx) = std::sync::mpsc::channel::<(u64, SendPage)>();
-        let handles: Vec<_> = (0..4u64)
-            .map(|i| {
-                let (tx, url) = (tx.clone(), url.clone());
-                std::thread::spawn(move || tx.send((i, SendPage(Page::load(&url)))).unwrap())
-            })
-            .collect();
-        drop(tx);
-        for h in handles {
-            h.join().unwrap();
-        }
-        let fonts = Fonts::load();
-        let mut seen = 0;
-        for (_, SendPage(mut page)) in rx {
-            seen += 1;
-            assert_eq!((page.title.as_str(), page.images.len()), ("Threaded", 2));
-            page.relayout(&fonts, 300.0); // lays out and clones the Rc'd images, on this thread
-            assert!(page.layout.items.iter().any(|i| matches!(i, layout::Item::Image { .. })));
-            assert_eq!(page.layout.controls.len(), 1, "form controls survive the handoff too");
-        }
-        assert_eq!(seen, 4);
     }
 }

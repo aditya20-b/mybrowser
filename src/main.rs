@@ -1,3 +1,4 @@
+mod chrome;
 mod css;
 mod dom;
 mod fonts;
@@ -9,6 +10,7 @@ mod page;
 mod paint;
 mod style;
 
+use chrome::{AddressBar, ChromeView, Hit};
 use fonts::Fonts;
 use page::Page;
 use paint::Painter;
@@ -18,7 +20,7 @@ use std::rc::Rc;
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
@@ -116,6 +118,7 @@ fn main() {
 }
 
 /// Headless mode: render the whole page to a PNG (handy for testing).
+/// With `--chrome` semantics intentionally absent: this is the page only.
 fn screenshot_to_png(url: &Url, fonts: &Fonts, width: f32, scale: f32, out: &Path) {
     let t0 = std::time::Instant::now();
     let mut page = Page::load(url);
@@ -188,6 +191,7 @@ struct App {
     fonts: Fonts,
     painter: Painter,
     page: Page,
+    bar: AddressBar,
     cwd: std::path::PathBuf,
     back: Vec<Url>,
     forward: Vec<Url>,
@@ -203,8 +207,9 @@ struct App {
 impl App {
     fn new(fonts: Fonts, start: Url, cwd: std::path::PathBuf) -> App {
         let page = Page::load(&start);
+        let bar = AddressBar::new(page.url.as_str());
         App {
-            fonts, painter: Painter::default(), page, cwd, back: vec![], forward: vec![], scroll: 0.0,
+            fonts, painter: Painter::default(), page, bar, cwd, back: vec![], forward: vec![], scroll: 0.0,
             laid_out_width: -1.0, cursor: (0.0, 0.0), hover: None, modifiers: ModifiersState::empty(),
             window: None, surface: None,
         }
@@ -214,8 +219,24 @@ impl App {
         self.window.as_ref().map_or(1.0, |w| w.scale_factor() as f32)
     }
 
+    /// Window size in logical pixels.
+    fn window_size(&self) -> (f32, f32) {
+        let s = self.scale();
+        self.window.as_ref().map_or((0.0, 0.0), |w| {
+            let p = w.inner_size();
+            (p.width as f32 / s, p.height as f32 / s)
+        })
+    }
+
+    /// Height of the area the page is drawn in (the window minus the toolbar).
     fn view_height(&self) -> f32 {
-        self.window.as_ref().map_or(0.0, |w| w.inner_size().height as f32) / self.scale()
+        (self.window_size().1 - chrome::HEIGHT).max(0.0)
+    }
+
+    fn request_redraw(&self) {
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
     }
 
     fn clamp_scroll(&mut self) {
@@ -223,13 +244,26 @@ impl App {
         self.scroll = self.scroll.clamp(0.0, max);
     }
 
-    /// Recompute which link is under the mouse. Must run whenever the page moves
-    /// under a stationary cursor: scrolling, relayout, navigation.
+    /// Recompute what is under the mouse and set the cursor icon. Must run
+    /// whenever the page moves under a stationary cursor: scrolling, relayout,
+    /// navigation.
     fn update_hover(&mut self) {
         let s = self.scale();
-        self.hover = self.link_at(self.cursor.0 / s, self.cursor.1 / s + self.scroll);
+        let (cx, cy) = (self.cursor.0 / s, self.cursor.1 / s);
+        let (icon, hover) = if cy < chrome::HEIGHT {
+            let icon = match chrome::hit_test(cx, cy, self.window_size().0) {
+                Some(Hit::Address) => CursorIcon::Text,
+                Some(_) => CursorIcon::Pointer,
+                None => CursorIcon::Default,
+            };
+            (icon, None)
+        } else {
+            let link = self.link_at(cx, cy - chrome::HEIGHT + self.scroll);
+            (if link.is_some() { CursorIcon::Pointer } else { CursorIcon::Default }, link)
+        };
+        self.hover = hover;
         if let Some(w) = &self.window {
-            w.set_cursor(if self.hover.is_some() { CursorIcon::Pointer } else { CursorIcon::Default });
+            w.set_cursor(icon);
         }
     }
 
@@ -237,9 +271,7 @@ impl App {
         self.scroll += dy;
         self.clamp_scroll();
         self.update_hover();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_redraw();
     }
 
     /// Load `url` into the current tab. `record` pushes the page we're leaving
@@ -250,13 +282,20 @@ impl App {
             self.forward.clear();
         }
         self.page = Page::load(&url);
+        self.bar.show(self.page.url.as_str());
         self.laid_out_width = -1.0; // force relayout on the next redraw
         self.scroll = 0.0;
         self.update_hover();
         if let Some(w) = &self.window {
             w.set_title(&format!("{} — mybrowser", self.page.display_title()));
-            w.request_redraw();
         }
+        self.request_redraw();
+    }
+
+    fn reload(&mut self) {
+        let (url, keep) = (self.page.url.clone(), self.scroll);
+        self.open(url, false);
+        self.scroll = keep; // clamped on the next redraw
     }
 
     fn go_back(&mut self) {
@@ -286,6 +325,122 @@ impl App {
         l.map(|l| l.href.clone())
     }
 
+    /// Enter pressed in the address bar.
+    fn commit_address(&mut self) {
+        match url_from_input(self.bar.text(), &self.cwd) {
+            Ok(url) => self.open(url, true),
+            Err(e) => self.bar.error = Some(e),
+        }
+    }
+
+    /// Left click released at the current cursor position.
+    fn click(&mut self) {
+        let s = self.scale();
+        let (cx, cy) = (self.cursor.0 / s, self.cursor.1 / s);
+        if cy < chrome::HEIGHT {
+            match chrome::hit_test(cx, cy, self.window_size().0) {
+                Some(Hit::Back) => self.go_back(),
+                Some(Hit::Forward) => self.go_forward(),
+                Some(Hit::Reload) => self.reload(),
+                Some(Hit::Address) => {
+                    if self.bar.is_focused() {
+                        self.bar.click_again();
+                    } else {
+                        self.bar.focus();
+                    }
+                }
+                None => {}
+            }
+        } else {
+            // clicking the page ends address editing
+            if self.bar.is_focused() {
+                let url = self.page.url.to_string();
+                self.bar.show(&url);
+            }
+            self.update_hover(); // hit-test at release time rather than trusting a stale hover
+            if let Some(href) = self.hover.clone() {
+                self.follow(&href);
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// A key pressed while the address bar has focus.
+    fn address_key(&mut self, event: &KeyEvent, cmd: bool) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Enter) => self.commit_address(),
+            Key::Named(NamedKey::Escape) => {
+                let url = self.page.url.to_string();
+                self.bar.show(&url);
+            }
+            Key::Named(NamedKey::Backspace) if cmd => self.bar.clear(),
+            Key::Named(NamedKey::Backspace) => self.bar.backspace(),
+            Key::Named(NamedKey::Delete) => self.bar.delete(),
+            Key::Named(NamedKey::ArrowLeft) if cmd => self.bar.home(),
+            Key::Named(NamedKey::ArrowRight) if cmd => self.bar.end(),
+            Key::Named(NamedKey::ArrowLeft) => self.bar.left(),
+            Key::Named(NamedKey::ArrowRight) => self.bar.right(),
+            Key::Named(NamedKey::Home) => self.bar.home(),
+            Key::Named(NamedKey::End) => self.bar.end(),
+            Key::Character(c) if cmd => match c.as_str().to_ascii_lowercase().as_str() {
+                "a" => self.bar.select_all(),
+                "l" => self.bar.focus(),
+                "v" => {
+                    if let Some(text) = chrome::clipboard_get() {
+                        self.bar.insert(&text);
+                    }
+                }
+                "c" => chrome::clipboard_set(self.bar.text()),
+                "x" => {
+                    chrome::clipboard_set(self.bar.text());
+                    self.bar.clear();
+                }
+                _ => {}
+            },
+            _ => {
+                if !cmd {
+                    if let Some(text) = &event.text {
+                        self.bar.insert(text.as_str());
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_key(&mut self, event: &KeyEvent) {
+        let cmd = self.modifiers.super_key() || self.modifiers.control_key();
+        if self.bar.is_focused() {
+            self.address_key(event, cmd);
+            self.request_redraw();
+            return;
+        }
+        let page = self.view_height() * 0.9;
+        let alt_or_cmd = self.modifiers.alt_key() || self.modifiers.super_key();
+        match &event.logical_key {
+            Key::Character(c) if cmd => match c.as_str().to_ascii_lowercase().as_str() {
+                "l" => self.bar.focus(),
+                "r" => self.reload(),
+                "[" => self.go_back(),
+                "]" => self.go_forward(),
+                _ => {}
+            },
+            Key::Named(NamedKey::ArrowDown) => self.scroll_by(48.0),
+            Key::Named(NamedKey::ArrowUp) => self.scroll_by(-48.0),
+            Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => self.scroll_by(page),
+            Key::Named(NamedKey::PageUp) => self.scroll_by(-page),
+            Key::Named(NamedKey::Home) => self.scroll_by(-1e9),
+            Key::Named(NamedKey::End) => self.scroll_by(1e9),
+            Key::Named(NamedKey::ArrowLeft) if alt_or_cmd => self.go_back(),
+            Key::Named(NamedKey::ArrowRight) if alt_or_cmd => self.go_forward(),
+            Key::Named(NamedKey::Backspace) if self.modifiers.shift_key() => self.go_forward(),
+            Key::Named(NamedKey::Backspace) => self.go_back(),
+            Key::Named(NamedKey::F5) => self.reload(),
+            Key::Character(c) if c.eq_ignore_ascii_case("r") => self.reload(),
+            _ => {}
+        }
+        self.request_redraw();
+    }
+
     fn redraw(&mut self) {
         let Some(window) = self.window.clone() else { return };
         let size = window.inner_size();
@@ -300,11 +455,17 @@ impl App {
         // navigation), so the clamp and the hover state are refreshed every frame.
         self.clamp_scroll();
         self.update_hover();
+
+        let (w_px, h_px) = (size.width as usize, size.height as usize);
+        let top = ((chrome::HEIGHT * scale).round() as usize).min(h_px);
         let surface = self.surface.as_mut().unwrap();
         surface.resize(w, h).unwrap();
         let mut buffer = surface.buffer_mut().unwrap();
-        self.painter.paint(&mut buffer, size.width as usize, size.height as usize,
-            &self.page.layout, &self.fonts, self.scroll, scale);
+        let pixels: &mut [u32] = &mut buffer;
+        // The page is painted into the rows below the toolbar, then the toolbar on top.
+        self.painter.paint(&mut pixels[top * w_px..], w_px, h_px - top, &self.page.layout, &self.fonts, self.scroll, scale);
+        let view = ChromeView { bar: &self.bar, can_back: !self.back.is_empty(), can_forward: !self.forward.is_empty() };
+        self.painter.paint_chrome(pixels, w_px, h_px, &self.fonts, scale, &view);
         buffer.present().unwrap();
     }
 }
@@ -327,11 +488,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::RedrawRequested => self.redraw(),
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-            }
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => self.request_redraw(),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
@@ -344,38 +501,8 @@ impl ApplicationHandler for App {
                 self.cursor = (position.x as f32, position.y as f32);
                 self.update_hover();
             }
-            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
-                // Hit-test again at release time instead of trusting a stale hover.
-                self.update_hover();
-                if let Some(href) = self.hover.clone() {
-                    self.follow(&href);
-                }
-            }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let page = self.view_height() * 0.9;
-                let alt_or_cmd = self.modifiers.alt_key() || self.modifiers.super_key();
-                match &event.logical_key {
-                    Key::Named(NamedKey::ArrowDown) => self.scroll_by(48.0),
-                    Key::Named(NamedKey::ArrowUp) => self.scroll_by(-48.0),
-                    Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => self.scroll_by(page),
-                    Key::Named(NamedKey::PageUp) => self.scroll_by(-page),
-                    Key::Named(NamedKey::Home) => self.scroll_by(-1e9),
-                    Key::Named(NamedKey::End) => self.scroll_by(1e9),
-                    Key::Named(NamedKey::ArrowLeft) if alt_or_cmd => self.go_back(),
-                    Key::Named(NamedKey::ArrowRight) if alt_or_cmd => self.go_forward(),
-                    Key::Named(NamedKey::Backspace) if self.modifiers.shift_key() => self.go_forward(),
-                    Key::Named(NamedKey::Backspace) => self.go_back(),
-                    Key::Character(c) if c.eq_ignore_ascii_case("r") => {
-                        let url = self.page.url.clone();
-                        let keep = self.scroll;
-                        self.open(url, false);
-                        self.scroll = keep; // clamped on the next redraw
-                    }
-                    _ => {
-                        let _ = &self.cwd; // used by the address bar
-                    }
-                }
-            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => self.click(),
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => self.on_key(&event),
             _ => {}
         }
     }

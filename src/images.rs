@@ -8,9 +8,16 @@ pub struct Image {
     pub rgba: Vec<u8>,
 }
 
-/// Refuse to decode anything that would need more than this many pixels
-/// (a decompression-bomb guard: 64M pixels = 256 MB of RGBA).
-const MAX_PIXELS: u64 = 64 * 1024 * 1024;
+impl Image {
+    /// Memory the decoded pixels occupy.
+    pub fn bytes(&self) -> u64 {
+        self.rgba.len() as u64
+    }
+}
+
+/// Refuse to decode anything with more pixels than this (a decompression-bomb
+/// guard: 16M pixels = 64 MB of RGBA; a tiny file can claim far more).
+pub const MAX_PIXELS: u64 = 16 * 1024 * 1024;
 
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
@@ -115,5 +122,15 @@ mod tests {
         assert!(decode(b"\x89PNG\r\n\x1a\nnot really").is_none());
         let good = encode(4, 4, png::ColorType::Rgb, &[0; 48]);
         assert!(decode(&good[..good.len() / 2]).is_none());
+    }
+
+    #[test]
+    fn oversized_images_are_refused_before_allocating() {
+        // 5000 x 4000 = 20M pixels (> MAX_PIXELS) compresses to a few KB but would need 80 MB
+        let big = encode(5000, 4000, png::ColorType::Grayscale, &vec![0u8; 5000 * 4000]);
+        assert!(big.len() < 100_000, "the file is small ({} bytes)", big.len());
+        assert!(decode(&big).is_none());
+        let ok = encode(100, 100, png::ColorType::Grayscale, &vec![0u8; 100 * 100]);
+        assert_eq!(decode(&ok).unwrap().bytes(), 100 * 100 * 4);
     }
 }

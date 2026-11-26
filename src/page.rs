@@ -10,14 +10,25 @@ use crate::net::{self, Fetched};
 use crate::style::{self, Style};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use url::Url;
 
 /// Upper bounds on sub-resources per page, so a hostile page can't make us
-/// issue thousands of requests.
+/// issue thousands of requests or exhaust memory.
 const MAX_STYLESHEETS: usize = 32;
 const MAX_IMAGES: usize = 300;
 /// At most this many requests in flight at once.
 const PARALLEL_FETCHES: usize = 8;
+/// After this long, no new sub-resource requests are started.
+const SUBRESOURCE_DEADLINE: Duration = Duration::from_secs(30);
+/// Total bytes of sub-resource bodies we will hold at once.
+const MAX_FETCHED_BYTES: u64 = 256 * 1024 * 1024;
+/// Total decoded image memory per page.
+const IMAGE_BUDGET: u64 = 256 * 1024 * 1024;
+/// Longest document name / title we hand to the window system.
+const MAX_TITLE_CHARS: usize = 120;
 
 pub struct Page {
     pub url: Url,
@@ -32,6 +43,40 @@ pub struct Page {
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Escape for use inside a quoted HTML attribute.
+fn esc_attr(s: &str) -> String {
+    esc(s).replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(max).collect();
+    t.push('…');
+    t
+}
+
+fn without_fragment(u: &Url) -> Url {
+    let mut u = u.clone();
+    u.set_fragment(None);
+    u
+}
+
+/// A short human name for a document: its decoded file name, else the host.
+/// `data:` URLs (which can be megabytes long) just say so.
+fn document_name(url: &Url) -> String {
+    if url.scheme() == "data" {
+        return "data document".into();
+    }
+    let segment = url.path_segments().and_then(|mut s| s.next_back()).filter(|s| !s.is_empty());
+    let name = match segment {
+        Some(s) => String::from_utf8_lossy(&net::percent_decode_bytes(s)).into_owned(),
+        None => url.host_str().map(String::from).unwrap_or_else(|| url.as_str().to_string()),
+    };
+    truncate_chars(&name, MAX_TITLE_CHARS)
 }
 
 /// Does a `media` attribute apply to a screen? Feature-only queries like
@@ -53,23 +98,56 @@ fn is_stylesheet_link(rel: Option<&str>) -> bool {
     tokens.iter().any(|t| t == "stylesheet") && !tokens.iter().any(|t| t == "alternate")
 }
 
-/// Fetch many URLs concurrently (bounded), keyed by the URL string requested.
-/// Failures are simply absent from the result.
-fn fetch_parallel(urls: Vec<Url>) -> HashMap<String, Fetched> {
-    let mut out = HashMap::new();
-    for chunk in urls.chunks(PARALLEL_FETCHES) {
-        let results: Vec<(String, Option<Fetched>)> = std::thread::scope(|s| {
-            let handles: Vec<_> =
-                chunk.iter().map(|u| s.spawn(move || (u.to_string(), net::fetch(u).ok()))).collect();
-            handles.into_iter().filter_map(|h| h.join().ok()).collect()
-        });
-        for (key, fetched) in results {
-            if let Some(f) = fetched {
-                out.insert(key, f);
-            }
+/// Fetch many URLs with a small pool of worker threads that pull from a shared
+/// queue, so one slow server only ever stalls one worker. No new request is
+/// started after `deadline`, and bodies stop being kept once `MAX_FETCHED_BYTES`
+/// is reached. Results are keyed by the URL string requested; failures are absent.
+fn fetch_parallel(urls: Vec<Url>, deadline: Duration) -> HashMap<String, Fetched> {
+    let started = Instant::now();
+    let next = AtomicUsize::new(0);
+    let total = AtomicU64::new(0);
+    let results = Mutex::new(HashMap::new());
+    std::thread::scope(|s| {
+        for _ in 0..PARALLEL_FETCHES.min(urls.len()) {
+            s.spawn(|| loop {
+                if started.elapsed() >= deadline {
+                    break;
+                }
+                let Some(u) = urls.get(next.fetch_add(1, Ordering::SeqCst)) else { break };
+                // a panic in one fetch must not take the whole page load down
+                let Ok(Ok(f)) = std::panic::catch_unwind(|| net::fetch(u)) else { continue };
+                let len = f.body.len() as u64;
+                if total.fetch_add(len, Ordering::SeqCst) + len > MAX_FETCHED_BYTES {
+                    continue;
+                }
+                if let Ok(mut map) = results.lock() {
+                    map.insert(u.to_string(), f);
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap_or_default()
+}
+
+/// A simple spending limit, used for decoded image memory.
+struct Budget {
+    remaining: u64,
+}
+
+impl Budget {
+    fn new(total: u64) -> Budget {
+        Budget { remaining: total }
+    }
+
+    /// Spend `bytes` if there is enough left.
+    fn take(&mut self, bytes: u64) -> bool {
+        if bytes <= self.remaining {
+            self.remaining -= bytes;
+            true
+        } else {
+            false
         }
     }
-    out
 }
 
 enum Sheet {
@@ -92,33 +170,33 @@ impl Page {
             url,
             &format!(
                 "<title>Error</title><h1>Could not open page</h1><p><code>{}</code></p><p>{}</p>",
-                esc(url.as_str()),
-                esc(message)
+                esc(&truncate_chars(url.as_str(), 300)),
+                esc(&truncate_chars(message, 500))
             ),
         )
     }
 
     fn from_fetched(f: Fetched) -> Page {
-        let name = f.url.path_segments().and_then(|mut s| s.next_back()).filter(|s| !s.is_empty()).unwrap_or(f.url.as_str()).to_string();
+        let name = document_name(&f.url);
         let mut page = match f.content_type.as_str() {
             "text/html" | "application/xhtml+xml" => {
-                Page::from_source(&f.url, &net::decode_text(&f.body, f.charset.as_deref()))
+                Page::from_source(&f.url, &net::decode_text(&f.body, f.charset.as_deref(), true))
             }
             "text/plain" | "text/css" | "text/javascript" | "application/javascript" | "application/json"
             | "text/xml" | "application/xml" | "text/markdown" => {
-                let text = net::decode_text(&f.body, f.charset.as_deref());
+                let text = net::decode_text(&f.body, f.charset.as_deref(), false);
                 Page::from_source(&f.url, &format!("<title>{}</title><pre>{}</pre>", esc(&name), esc(&text)))
             }
             c if c.starts_with("image/") => match images::decode(&f.body) {
                 Some(img) => {
                     let title = format!("{name} ({}×{})", img.w, img.h);
                     let src = format!(
-                        "<title>{}</title><body style='margin:0;background:#1e1e1e'><img src='{}'>",
+                        "<title>{}</title><body style='margin:0;background:#1e1e1e'><img src=\"{}\">",
                         esc(&title),
-                        f.url.as_str().replace('\'', "%27")
+                        esc_attr(f.url.as_str())
                     );
                     let mut preloaded = HashMap::new();
-                    preloaded.insert(f.url.to_string(), Rc::new(img));
+                    preloaded.insert(without_fragment(&f.url).to_string(), Rc::new(img));
                     Page::build(&f.url, &src, preloaded)
                 }
                 None => Page::error(&f.url, &format!("Cannot decode this {} image (only PNG is supported so far)", f.content_type)),
@@ -136,12 +214,11 @@ impl Page {
 
     /// A short label for tabs and the window title.
     pub fn display_title(&self) -> String {
-        if !self.title.is_empty() {
-            return self.title.clone();
+        let title = self.title.trim();
+        if !title.is_empty() {
+            return truncate_chars(title, MAX_TITLE_CHARS);
         }
-        self.url.host_str().map(String::from).unwrap_or_else(|| {
-            self.url.path_segments().and_then(|mut s| s.next_back()).unwrap_or("untitled").to_string()
-        })
+        document_name(&self.url)
     }
 
     fn build(url: &Url, src: &str, preloaded: HashMap<String, Rc<Image>>) -> Page {
@@ -161,6 +238,8 @@ impl Page {
         }
         // An http(s) page must never be able to read local files.
         let allowed = |target: &Url| !(matches!(url.scheme(), "http" | "https") && target.scheme() == "file");
+        // Resource URLs are compared without their `#fragment` (it never reaches the server).
+        let resolve = |href: &str| base.join(href.trim()).ok().map(|u| without_fragment(&u)).filter(&allowed);
 
         // Pass 1: find stylesheets and images, and the URLs that need fetching.
         let mut sheets: Vec<Sheet> = vec![];
@@ -173,8 +252,7 @@ impl Page {
             match tag.as_str() {
                 "style" if media_applies(dom.attr(id, "media")) => sheets.push(Sheet::Inline(dom.text_content(id))),
                 "link" if is_stylesheet_link(dom.attr(id, "rel")) && media_applies(dom.attr(id, "media")) => {
-                    let target = dom.attr(id, "href").and_then(|h| base.join(h.trim()).ok()).filter(&allowed);
-                    if let Some(u) = target {
+                    if let Some(u) = dom.attr(id, "href").and_then(&resolve) {
                         if sheets.iter().filter(|s| matches!(s, Sheet::Link(_))).count() < MAX_STYLESHEETS {
                             if queued.insert(u.to_string()) {
                                 to_fetch.push(u.clone());
@@ -185,8 +263,7 @@ impl Page {
                 }
                 "title" if title.is_empty() => title = dom.text_content(id).trim().to_string(),
                 "img" => {
-                    let target = dom.attr(id, "src").and_then(|s| base.join(s.trim()).ok()).filter(&allowed);
-                    if let Some(u) = target {
+                    if let Some(u) = dom.attr(id, "src").and_then(&resolve) {
                         if image_urls.len() < MAX_IMAGES {
                             if !preloaded.contains_key(u.as_str()) && queued.insert(u.to_string()) {
                                 to_fetch.push(u.clone());
@@ -200,7 +277,7 @@ impl Page {
         }
 
         // Pass 2: fetch everything at once.
-        let fetched = fetch_parallel(to_fetch);
+        let mut fetched = fetch_parallel(to_fetch, SUBRESOURCE_DEADLINE);
 
         // Stylesheets in cascade order: user agent, then document order.
         let mut rules: Vec<Rule> = vec![];
@@ -210,28 +287,30 @@ impl Page {
                 Sheet::Inline(text) => css::parse_stylesheet(text, &mut rules),
                 Sheet::Link(u) => {
                     if let Some(f) = fetched.get(u.as_str()).filter(|f| f.status < 400) {
-                        css::parse_stylesheet(&net::decode_text(&f.body, f.charset.as_deref()), &mut rules);
+                        css::parse_stylesheet(&net::decode_text(&f.body, f.charset.as_deref(), false), &mut rules);
                     }
                 }
             }
         }
         let styles = style::compute(&dom, &rules);
 
-        // Decode each distinct image once and share it between <img> elements.
+        // Decode each distinct image once, share it between <img> elements, free
+        // its raw bytes right away, and stop when the page's memory budget is spent.
+        let mut budget = Budget::new(IMAGE_BUDGET);
         let mut decoded: HashMap<String, Option<Rc<Image>>> = HashMap::new();
         let mut images = HashMap::new();
         for (id, u) in image_urls {
-            let img = decoded
-                .entry(u.to_string())
-                .or_insert_with(|| {
-                    preloaded.get(u.as_str()).cloned().or_else(|| {
-                        let f = fetched.get(u.as_str()).filter(|f| f.status < 400)?;
-                        images::decode(&f.body).map(Rc::new)
-                    })
-                })
-                .clone();
-            if let Some(img) = img {
-                images.insert(id, img);
+            let key = u.to_string();
+            if !decoded.contains_key(&key) {
+                let img = preloaded.get(&key).cloned().or_else(|| {
+                    let f = fetched.remove(&key).filter(|f| f.status < 400)?;
+                    let img = images::decode(&f.body)?;
+                    budget.take(img.bytes()).then(|| Rc::new(img))
+                });
+                decoded.insert(key.clone(), img);
+            }
+            if let Some(Some(img)) = decoded.get(&key) {
+                images.insert(id, img.clone());
             }
         }
 
@@ -475,6 +554,18 @@ mod tests {
         assert_eq!((im[0].2, im[0].3), (6.0, 3.0));
     }
 
+    #[test]
+    fn the_same_image_with_different_fragments_is_one_resource() {
+        let dir = temp_dir_with_png("frag", 5, 5);
+        let p = render_in(&dir, "<img src='a.png#1'><img src='a.png#2'><img src='a.png'>", 400.0);
+        assert_eq!(images_of(&p).len(), 3);
+        // all three share one decoded copy
+        let mut ptrs: Vec<_> = p.images.values().map(Rc::as_ptr).collect();
+        ptrs.dedup();
+        assert_eq!(p.images.len(), 3);
+        assert!(ptrs.windows(2).all(|w| w[0] == w[1]) || ptrs.len() == 1);
+    }
+
     // ---------- stylesheets, base URLs, security ----------
 
     #[test]
@@ -539,6 +630,23 @@ mod tests {
         std::fs::write(dir.join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
         assert!(Page::load(&url_of(&dir.join("blob.bin"))).title == "Error");
         assert!(Page::load(&url_of(&dir.join("nope.html"))).title == "Error");
+    }
+
+    #[test]
+    fn document_names_are_short_decoded_and_safe() {
+        assert_eq!(document_name(&Url::parse("file:///tmp/my%20file.txt").unwrap()), "my file.txt");
+        assert_eq!(document_name(&Url::parse("https://example.org/").unwrap()), "example.org");
+        assert_eq!(document_name(&Url::parse("file:///").unwrap()), "file:///");
+        let big = format!("data:text/plain,{}", "x".repeat(100_000));
+        assert_eq!(document_name(&Url::parse(&big).unwrap()), "data document");
+        let long = format!("https://example.org/{}", "y".repeat(500));
+        assert!(document_name(&Url::parse(&long).unwrap()).chars().count() <= MAX_TITLE_CHARS + 1);
+        // a data: URL document gets a short title too
+        let p = Page::load(&Url::parse(&big).unwrap());
+        assert_eq!(p.title, "data document");
+        // and a very long <title> is clipped for the window
+        let p = Page::from_source(&t_url(), &format!("<title>{}</title>", "z".repeat(5000)));
+        assert!(p.display_title().chars().count() <= MAX_TITLE_CHARS + 1);
     }
 
     /// A tiny multi-route HTTP server: serves `routes` (path -> (content type, body))
@@ -610,8 +718,66 @@ mod tests {
     }
 
     #[test]
+    fn image_documents_with_ampersands_in_the_url_are_fetched_only_once() {
+        // The URL goes through an HTML attribute; unescaped, `&lt=2` was decoded to `<=2`,
+        // the preloaded image no longer matched, and the image was downloaded again.
+        let (port, server) = serve_routes(vec![("/a.png?x=1&lt=2", "image/png", png_bytes(4, 4))], 1);
+        let fonts = Fonts::load();
+        let mut p = Page::load(&Url::parse(&format!("http://127.0.0.1:{port}/a.png?x=1&lt=2")).unwrap());
+        server.join().unwrap(); // a second request would have no server left to answer it
+        p.relayout(&fonts, 200.0);
+        assert_eq!(images_of(&p).len(), 1);
+    }
+
+    #[test]
+    fn fragments_do_not_cause_duplicate_downloads() {
+        let html = "<img src='/p.png#1'><img src='/p.png#2'>";
+        let (port, server) = serve_routes(
+            vec![("/i.html", "text/html", html.as_bytes().to_vec()), ("/p.png", "image/png", png_bytes(3, 3))],
+            2, // the page and ONE image request
+        );
+        let p = Page::load(&Url::parse(&format!("http://127.0.0.1:{port}/i.html")).unwrap());
+        server.join().unwrap();
+        assert_eq!(p.images.len(), 2, "both <img> elements got the image");
+    }
+
+    #[test]
+    fn parallel_fetching_is_bounded_and_survives_failures() {
+        // many unreachable URLs finish quickly and yield nothing
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let urls: Vec<Url> = (0..60).map(|i| Url::parse(&format!("http://127.0.0.1:{dead}/{i}")).unwrap()).collect();
+        let t = Instant::now();
+        assert!(fetch_parallel(urls.clone(), Duration::from_secs(30)).is_empty());
+        assert!(t.elapsed().as_secs() < 10);
+        // a deadline of zero starts no requests at all
+        let (port, server) = serve_routes(vec![("/x", "text/plain", b"hi".to_vec())], 0);
+        let u = Url::parse(&format!("http://127.0.0.1:{port}/x")).unwrap();
+        assert!(fetch_parallel(vec![u; 5], Duration::ZERO).is_empty());
+        server.join().unwrap();
+        // results from a live server are keyed by the requested URL
+        let (port, server) = serve_routes(vec![("/a", "text/plain", b"A".to_vec()), ("/b", "text/plain", b"B".to_vec())], 2);
+        let (a, b) = (Url::parse(&format!("http://127.0.0.1:{port}/a")).unwrap(), Url::parse(&format!("http://127.0.0.1:{port}/b")).unwrap());
+        let got = fetch_parallel(vec![a.clone(), b.clone()], Duration::from_secs(30));
+        server.join().unwrap();
+        assert_eq!(got[a.as_str()].body, b"A");
+        assert_eq!(got[b.as_str()].body, b"B");
+    }
+
+    #[test]
+    fn the_image_memory_budget_is_enforced() {
+        let mut b = Budget::new(100);
+        assert!(b.take(60));
+        assert!(!b.take(41), "would exceed the budget");
+        assert!(b.take(40));
+        assert!(!b.take(1));
+        assert!(Budget::new(0).take(0));
+    }
+
+    #[test]
     fn display_title_falls_back_to_host_or_file_name() {
         let p = Page::from_source(&Url::parse("https://example.org/a/b.html").unwrap(), "<p>x</p>");
+        assert_eq!(p.display_title(), "b.html");
+        let p = Page::from_source(&Url::parse("https://example.org/").unwrap(), "<p>x</p>");
         assert_eq!(p.display_title(), "example.org");
         let p = Page::from_source(&Url::parse("file:///tmp/notes.html").unwrap(), "<p>x</p>");
         assert_eq!(p.display_title(), "notes.html");

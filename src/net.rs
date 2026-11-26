@@ -1,4 +1,5 @@
 //! Resource loading for `file:`, `http:`, `https:` and `data:` URLs.
+use std::io::Read;
 use std::sync::OnceLock;
 use std::time::Duration;
 use url::Url;
@@ -30,13 +31,22 @@ pub fn fetch(url: &Url) -> Result<Fetched, String> {
 fn fetch_file(url: &Url) -> Result<Fetched, String> {
     let path = url.to_file_path().map_err(|_| format!("not a local file path: {url}"))?;
     let meta = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if meta.is_dir() {
-        return Err(format!("{} is a directory", path.display()));
+    // Devices and FIFOs (`/dev/zero`, `/dev/urandom`) report a length of 0 but
+    // never end, so only regular files are documents.
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
     }
-    if meta.len() > MAX_BODY {
-        return Err(format!("{} is too large ({} bytes)", path.display(), meta.len()));
+    // Bound by what is actually read, not by the size the file claimed a moment
+    // ago: it may grow in between.
+    let mut body = Vec::new();
+    std::fs::File::open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if body.len() as u64 > MAX_BODY {
+        return Err(format!("{} is too large", path.display()));
     }
-    let body = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let content_type = match ext.as_str() {
         "html" | "htm" | "xhtml" => "text/html",
@@ -89,38 +99,56 @@ fn fetch_http(url: &Url) -> Result<Fetched, String> {
 }
 
 fn fetch_data(url: &Url) -> Result<Fetched, String> {
+    // A data: URL's fragment is not part of its data.
+    let mut url = url.clone();
+    url.set_fragment(None);
     let rest = url.as_str().strip_prefix("data:").ok_or("not a data: URL")?;
     let (meta, data) = rest.split_once(',').ok_or("malformed data: URL (no comma)")?;
-    let (meta, is_base64) = match meta.strip_suffix(";base64") {
-        Some(m) => (m, true),
-        None => (meta, false),
+    let lower = meta.to_ascii_lowercase();
+    let (meta, is_base64) = match lower.strip_suffix(";base64") {
+        Some(m) => (m.to_string(), true),
+        None => (lower, false),
     };
     let mut params = meta.split(';');
-    let mime = params.next().filter(|m| !m.is_empty()).unwrap_or("text/plain").to_ascii_lowercase();
-    let charset = params.find_map(|p| p.trim().strip_prefix("charset=")).map(|c| c.to_ascii_lowercase());
+    let mime = params.next().filter(|m| !m.is_empty()).unwrap_or("text/plain").to_string();
+    let charset = params.find_map(|p| p.trim().strip_prefix("charset=")).map(String::from);
     let raw = percent_decode_bytes(data);
     let body = if is_base64 { base64_decode(&raw).ok_or("invalid base64 in data: URL")? } else { raw };
     if body.len() as u64 > MAX_BODY {
         return Err("data: URL too large".into());
     }
-    Ok(Fetched { url: url.clone(), status: 200, content_type: mime, charset, body })
+    Ok(Fetched { url, status: 200, content_type: mime, charset, body })
 }
 
 /// Guess a content type from the bytes themselves.
 pub fn sniff(body: &[u8]) -> &'static str {
     if body.starts_with(b"\x89PNG\r\n\x1a\n") {
-        "image/png"
-    } else if body.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        "image/jpeg"
-    } else if body.starts_with(b"GIF8") {
-        "image/gif"
-    } else if body.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'<') {
-        "text/html"
-    } else if std::str::from_utf8(&body[..body.len().min(4096)]).is_ok() || body.len() > 4096 {
-        "text/plain"
-    } else {
-        "application/octet-stream"
+        return "image/png";
     }
+    if body.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "image/jpeg";
+    }
+    if body.starts_with(b"GIF8") {
+        return "image/gif";
+    }
+    if body.starts_with(&[0xFF, 0xFE]) || body.starts_with(&[0xFE, 0xFF]) {
+        return "text/plain"; // UTF-16 text
+    }
+    let head = &body[..body.len().min(4096)];
+    if head.contains(&0) {
+        return "application/octet-stream";
+    }
+    // `<` only starts markup when a tag name, `!`, `?` or `/` follows (not `<3 love`).
+    let mut non_space = head.iter().skip_while(|b| b.is_ascii_whitespace());
+    if non_space.next() == Some(&b'<') && non_space.next().is_some_and(|b| b.is_ascii_alphabetic() || matches!(b, b'!' | b'?' | b'/')) {
+        return "text/html";
+    }
+    // valid UTF-8, allowing for a multi-byte character cut off at the sniff boundary
+    let text_like = match std::str::from_utf8(head) {
+        Ok(_) => true,
+        Err(e) => e.error_len().is_none(),
+    };
+    if text_like { "text/plain" } else { "application/octet-stream" }
 }
 
 pub fn percent_decode_bytes(s: &str) -> Vec<u8> {
@@ -142,19 +170,29 @@ pub fn percent_decode_bytes(s: &str) -> Vec<u8> {
     out
 }
 
-/// Standard and URL-safe base64; whitespace and padding are ignored.
+/// Standard and URL-safe base64. Whitespace is ignored; padding may only be
+/// followed by more padding or whitespace.
 pub fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
     let (mut acc, mut bits) = (0u32, 0u32);
+    let mut padding = false;
     for &c in input {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        if c == b'=' {
+            padding = true;
+            continue;
+        }
+        if padding {
+            return None; // data after the padding
+        }
         let v = match c {
             b'A'..=b'Z' => c - b'A',
             b'a'..=b'z' => c - b'a' + 26,
             b'0'..=b'9' => c - b'0' + 52,
             b'+' | b'-' => 62,
             b'/' | b'_' => 63,
-            b'=' => break,
-            c if c.is_ascii_whitespace() => continue,
             _ => return None,
         };
         acc = (acc << 6) | v as u32;
@@ -168,15 +206,28 @@ pub fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Turn response bytes into text, honouring a UTF-8 BOM, the HTTP charset, or a
-/// `<meta charset>` near the top. UTF-8 is the default; Latin-1 and
-/// Windows-1252 are decoded properly, and anything else falls back to lossy UTF-8.
-pub fn decode_text(body: &[u8], header_charset: Option<&str>) -> String {
+/// Turn response bytes into text. A BOM wins, then the HTTP charset, then (for
+/// HTML only) a `<meta charset>` in the head. UTF-8 is the default; UTF-16,
+/// Latin-1 and Windows-1252 are decoded properly, and anything else falls back
+/// to lossy UTF-8.
+pub fn decode_text(body: &[u8], header_charset: Option<&str>, is_html: bool) -> String {
+    if let Some(rest) = body.strip_prefix(&[0xFF, 0xFE][..]) {
+        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if let Some(rest) = body.strip_prefix(&[0xFE, 0xFF][..]) {
+        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        return String::from_utf16_lossy(&units);
+    }
     let (body, bom) = match body.strip_prefix(&[0xEF, 0xBB, 0xBF][..]) {
         Some(rest) => (rest, true),
         None => (body, false),
     };
-    let charset = if bom { None } else { header_charset.map(String::from).or_else(|| meta_charset(body)) };
+    let charset = if bom {
+        None
+    } else {
+        header_charset.map(String::from).or_else(|| if is_html { meta_charset(body) } else { None })
+    };
     match charset.as_deref() {
         Some("iso-8859-1" | "latin1" | "windows-1252" | "cp1252" | "us-ascii" | "ascii") => {
             body.iter().map(|&b| windows_1252(b)).collect()
@@ -185,15 +236,29 @@ pub fn decode_text(body: &[u8], header_charset: Option<&str>) -> String {
     }
 }
 
+/// The charset declared by a real `<meta>` tag in the head. Only `<meta ...>`
+/// tags before `</head>` count, so a `charset=` inside a script, a comment or
+/// the page text is ignored.
 fn meta_charset(body: &[u8]) -> Option<String> {
-    let head = String::from_utf8_lossy(&body[..body.len().min(2048)]).to_ascii_lowercase();
-    let at = head.find("charset=")? + "charset=".len();
-    let value: String = head[at..]
-        .trim_start_matches(['"', '\''])
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    (!value.is_empty()).then_some(value)
+    let text = String::from_utf8_lossy(&body[..body.len().min(4096)]).to_ascii_lowercase();
+    let head = text.split("</head").next().unwrap_or(&text);
+    let mut rest = head;
+    while let Some(at) = rest.find("<meta") {
+        let tag = &rest[at..];
+        let tag = &tag[..tag.find('>').unwrap_or(tag.len())];
+        if let Some(c) = tag.find("charset=") {
+            let value: String = tag[c + "charset=".len()..]
+                .trim_start_matches(['"', '\''])
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+        rest = &rest[at + "<meta".len()..];
+    }
+    None
 }
 
 fn windows_1252(b: u8) -> char {
@@ -210,7 +275,7 @@ fn windows_1252(b: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
 
     /// Serve one canned response per connection on a free local port.
@@ -272,6 +337,14 @@ mod tests {
     }
 
     #[test]
+    fn redirects_to_local_files_are_not_followed_into_file_urls() {
+        let (port, h) = serve(vec![http("302 Found", "Location: file:///etc/hosts\r\n", "")]);
+        let r = fetch(&Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap());
+        h.join().unwrap();
+        assert!(r.is_err(), "http must never redirect into file:");
+    }
+
+    #[test]
     fn connection_refused_and_unsupported_schemes_are_errors_not_panics() {
         // bind then drop to get a port nobody is listening on
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
@@ -294,6 +367,18 @@ mod tests {
     }
 
     #[test]
+    fn special_files_do_not_hang_or_exhaust_memory() {
+        // /dev/zero reports length 0 but never ends: it used to be read until memory ran out
+        for dev in ["/dev/zero", "/dev/urandom", "/dev/null"] {
+            if std::path::Path::new(dev).exists() {
+                let t = std::time::Instant::now();
+                assert!(fetch(&Url::from_file_path(dev).unwrap()).is_err(), "{dev}");
+                assert!(t.elapsed().as_secs() < 2);
+            }
+        }
+    }
+
+    #[test]
     fn data_urls() {
         let f = fetch(&Url::parse("data:text/plain;base64,SGVsbG8sIHdvcmxkIQ==").unwrap()).unwrap();
         assert_eq!((f.content_type.as_str(), f.body.as_slice()), ("text/plain", &b"Hello, world!"[..]));
@@ -306,32 +391,82 @@ mod tests {
     }
 
     #[test]
+    fn data_url_fragment_and_base64_case_and_garbage() {
+        // the fragment isn't data
+        assert_eq!(fetch(&Url::parse("data:text/plain,abc#frag").unwrap()).unwrap().body, b"abc");
+        // `;BASE64` is case-insensitive
+        assert_eq!(fetch(&Url::parse("data:text/plain;BASE64,aGk=").unwrap()).unwrap().body, b"hi");
+        // junk after padding is an error, not silently ignored
+        assert!(fetch(&Url::parse("data:text/plain;base64,aGk=garbage").unwrap()).is_err());
+    }
+
+    #[test]
     fn base64_variants() {
         assert_eq!(base64_decode(b"aGk="), Some(b"hi".to_vec()));
         assert_eq!(base64_decode(b"aGk"), Some(b"hi".to_vec()));
         assert_eq!(base64_decode(b"a G\nk="), Some(b"hi".to_vec()));
         assert_eq!(base64_decode(b"_-8"), Some(vec![0xFF, 0xEF]));
+        assert_eq!(base64_decode(b"aGk==="), Some(b"hi".to_vec()));
         assert_eq!(base64_decode(b"!"), None);
+        assert_eq!(base64_decode(b"aGk=x"), None);
     }
 
     #[test]
     fn text_decoding_handles_bom_header_and_meta_charsets() {
-        assert_eq!(decode_text(b"\xEF\xBB\xBFhi \xC3\xA9", None), "hi é");
-        assert_eq!(decode_text(b"caf\xE9", Some("iso-8859-1")), "café");
-        assert_eq!(decode_text(b"\x93quoted\x94 \x80", Some("windows-1252")), "“quoted” €");
-        assert_eq!(decode_text(b"<meta charset=\"ISO-8859-1\">caf\xE9", None), "<meta charset=\"ISO-8859-1\">café");
-        assert_eq!(decode_text(b"<meta http-equiv=x content='text/html; charset=windows-1252'>\x92", None).chars().last(), Some('’'));
+        let html = |b: &[u8], cs: Option<&str>| decode_text(b, cs, true);
+        assert_eq!(html(b"\xEF\xBB\xBFhi \xC3\xA9", None), "hi é");
+        assert_eq!(html(b"caf\xE9", Some("iso-8859-1")), "café");
+        assert_eq!(html(b"\x93quoted\x94 \x80", Some("windows-1252")), "“quoted” €");
+        assert_eq!(html(b"<meta charset=\"ISO-8859-1\">caf\xE9", None), "<meta charset=\"ISO-8859-1\">café");
+        assert_eq!(html(b"<meta http-equiv=x content='text/html; charset=windows-1252'>\x92", None).chars().last(), Some('’'));
         // invalid UTF-8 never panics
-        assert!(decode_text(b"\xFF\xFE\xFD", None).contains('\u{fffd}'));
+        assert!(html(b"\xFF\xFD\xFD", None).contains('\u{fffd}'));
         // a BOM beats a conflicting declaration
-        assert_eq!(decode_text(b"\xEF\xBB\xBF\xC3\xA9", Some("iso-8859-1")), "é");
+        assert_eq!(html(b"\xEF\xBB\xBF\xC3\xA9", Some("iso-8859-1")), "é");
+    }
+
+    #[test]
+    fn meta_charset_only_counts_in_real_meta_tags_of_html() {
+        let utf8 = "Café —".as_bytes();
+        // plain text and other non-HTML types never sniff a meta charset
+        let mut txt = b"<meta charset=iso-8859-1>\n".to_vec();
+        txt.extend_from_slice(utf8);
+        assert!(decode_text(&txt, None, false).ends_with("Café —"));
+        // `charset=` in a script, a comment, or the body text is not a declaration
+        for page in [
+            "<head><script>var s='charset=windows-1252'</script></head>Café —",
+            "<!-- charset=windows-1252 -->Café —",
+            "<p>use charset=iso-8859-1 for old pages</p>Café —",
+            "<head></head><meta charset=windows-1252>Café —",
+        ] {
+            assert!(decode_text(page.as_bytes(), None, true).ends_with("Café —"), "{page}");
+        }
+    }
+
+    #[test]
+    fn utf16_text_is_decoded() {
+        let le: Vec<u8> = [0xFF, 0xFE].into_iter().chain("héllo".encode_utf16().flat_map(|u| u.to_le_bytes())).collect();
+        assert_eq!(decode_text(&le, None, false), "héllo");
+        let be: Vec<u8> = [0xFE, 0xFF].into_iter().chain("日本".encode_utf16().flat_map(|u| u.to_be_bytes())).collect();
+        assert_eq!(decode_text(&be, None, false), "日本");
+        assert_eq!(decode_text(&[0xFF, 0xFE, 0x41], None, false), ""); // truncated unit is dropped, no panic
     }
 
     #[test]
     fn sniffing() {
         assert_eq!(sniff(b"\x89PNG\r\n\x1a\n...."), "image/png");
         assert_eq!(sniff(b"  \n<!doctype html>"), "text/html");
+        assert_eq!(sniff(b"<p>hi"), "text/html");
         assert_eq!(sniff(b"just words"), "text/plain");
+        assert_eq!(sniff(b"<3 love letters"), "text/plain");
         assert_eq!(sniff(&[0, 159, 146, 150]), "application/octet-stream");
+        assert_eq!(sniff(&[0xFF, 0xFE, b'h', 0]), "text/plain");
+        // a big binary blob without NULs in its first 4 KB is not text
+        let blob: Vec<u8> = (0..8000u32).map(|i| 0x80 | (i % 0x40) as u8).collect();
+        assert_eq!(sniff(&blob), "application/octet-stream");
+        // a multi-byte char split by the 4 KB boundary is still text
+        let mut text = "a".repeat(4095).into_bytes();
+        text.extend_from_slice("é".as_bytes());
+        assert_eq!(sniff(&text), "text/plain");
     }
 }

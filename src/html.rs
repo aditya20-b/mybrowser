@@ -84,6 +84,28 @@ fn ensure_body(dom: &mut Dom, stack: &mut Vec<NodeId>) {
     }
 }
 
+/// A `<td>`/`<th>` written directly inside `<table>` (or a row group) with no
+/// `<tr>` gets an implied row, as browsers do. Without it the cell has no row
+/// to live in and its content would vanish from the layout.
+fn ensure_row(dom: &mut Dom, stack: &mut Vec<NodeId>) {
+    let mut needs_row = false;
+    for &n in stack.iter().rev() {
+        match dom.tag(n) {
+            Some("tr") => break,
+            Some("table" | "thead" | "tbody" | "tfoot") => {
+                needs_row = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if needs_row {
+        let parent = *stack.last().unwrap();
+        let tr = dom.add(parent, Kind::Element { tag: "tr".into(), attrs: HashMap::new() });
+        stack.push(tr);
+    }
+}
+
 enum Scan {
     /// Index of the closing `>`.
     Tag(usize),
@@ -252,6 +274,9 @@ fn handle_tag(
     }
 
     close_implied(dom, stack, &tag);
+    if tag == "td" || tag == "th" {
+        ensure_row(dom, stack);
+    }
 
     let parent = *stack.last().unwrap();
     let id = dom.add(parent, Kind::Element { tag: tag.clone(), attrs: parse_attrs(attr_src) });
@@ -563,6 +588,31 @@ mod tests {
         let dom = parse("<ul><li>a<ul><li>b</ul></ul>");
         let ul = dom.nodes[body(&dom)].children[0];
         assert_eq!(tags(&dom, ul), ["li"]);
+    }
+
+    #[test]
+    fn cells_without_a_row_get_an_implied_row() {
+        // `<td>` straight inside <table> used to have no row, so its content vanished from the layout
+        let dom = parse("<table><td>X</td><td>Y</td></table>");
+        let table = dom.nodes[body(&dom)].children[0];
+        assert_eq!(tags(&dom, table), ["tr"]);
+        let tr = dom.nodes[table].children[0];
+        assert_eq!(tags(&dom, tr), ["td", "td"]);
+        // inside a row group, and a later <tr> closes the implied one
+        let dom = parse("<table><tbody><th>h<tr><td>b</table>");
+        let tbody = dom.nodes[dom.nodes[body(&dom)].children[0]].children[0];
+        assert_eq!(tags(&dom, tbody), ["tr", "tr"]);
+        // an ordinary row gets no extra wrapper
+        let dom = parse("<table><tr><td>a<td>b</table>");
+        let table = dom.nodes[body(&dom)].children[0];
+        assert_eq!(tags(&dom, table), ["tr"]);
+        assert_eq!(tags(&dom, dom.nodes[table].children[0]), ["td", "td"]);
+        // a nested table inside a cell gets its own implied row
+        let dom = parse("<table><tr><td><table><td>in</table></td></tr></table>");
+        let outer_td = dom.nodes[dom.nodes[body(&dom)].children[0]].children[0];
+        let outer_td = dom.nodes[outer_td].children[0];
+        let inner_table = dom.nodes[outer_td].children[0];
+        assert_eq!(tags(&dom, inner_table), ["tr"]);
     }
 
     #[test]

@@ -146,6 +146,7 @@ struct Cell {
     id: NodeId,
     col: usize,
     span: usize,
+    rowspan: usize,
 }
 
 struct RowInfo {
@@ -166,22 +167,41 @@ struct TableModel {
     html_border: bool,
 }
 
+/// A cell that spans several rows, waiting for its last row to be measured.
+struct Spanning {
+    out: CellOut,
+    first: usize,
+    last: usize,
+    valign: VAlign,
+}
+
 /// Divide `avail` between columns: percentage columns get their share, the rest
 /// share what's left between their min and max content widths.
 fn distribute(min: &[f32], max: &[f32], pct: &[Option<f32>], avail: f32) -> Vec<f32> {
     let n = min.len();
     let mut w = vec![0.0f32; n];
     let mut fixed = vec![false; n];
-    let mut fixed_total = 0.0;
     for i in 0..n {
         if let Some(p) = pct[i] {
             w[i] = (avail * p / 100.0).max(min[i]);
             fixed[i] = true;
-            fixed_total += w[i];
         }
     }
-    let rest = (avail - fixed_total).max(0.0);
     let idx: Vec<usize> = (0..n).filter(|&i| !fixed[i]).collect();
+    let mut fixed_total: f32 = (0..n).filter(|&i| fixed[i]).map(|i| w[i]).sum();
+    // Percentages that add up to more than the space are scaled down to fit; if
+    // every column is a percentage and they add up to less, they're scaled up to
+    // fill the table (never below a column's min-content).
+    if fixed_total > 0.0 && (fixed_total > avail || idx.is_empty()) {
+        let k = avail / fixed_total;
+        for i in 0..n {
+            if fixed[i] {
+                w[i] = (w[i] * k).max(min[i]);
+            }
+        }
+        fixed_total = (0..n).filter(|&i| fixed[i]).map(|i| w[i]).sum();
+    }
+    let rest = (avail - fixed_total).max(0.0);
     let smin: f32 = idx.iter().map(|&i| min[i]).sum();
     let smax: f32 = idx.iter().map(|&i| max[i]).sum();
     for &i in &idx {
@@ -916,6 +936,15 @@ impl<'a> Ctx<'a> {
         self.dom.attr(cell, "colspan").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1).clamp(1, MAX_COLS)
     }
 
+    /// `rowspan`: 1 by default; 0 means "to the end of the table".
+    fn rowspan(&self, cell: NodeId) -> usize {
+        match self.dom.attr(cell, "rowspan").and_then(|v| v.trim().parse::<usize>().ok()) {
+            None => 1,
+            Some(0) => usize::MAX,
+            Some(n) => n,
+        }
+    }
+
     /// Padding, border widths and (for legacy `<table border>`) a border colour for a cell.
     fn cell_box(&self, table: NodeId, cell: NodeId) -> ([f32; 4], [f32; 4], Option<Color>) {
         let s = &self.styles[cell];
@@ -928,6 +957,12 @@ impl<'a> Ctx<'a> {
         if bw.iter().all(|&w| w == 0.0) && self.html_border(table) > 0.0 {
             bw = [1.0; 4];
             color = Some(Color { r: 128, g: 128, b: 128 });
+        }
+        // `border-collapse: collapse` approximation: neighbouring cells each draw
+        // half of the shared edge, so interior lines come out at the full width
+        // instead of double.
+        if self.styles[table].collapse {
+            bw = bw.map(|w| w / 2.0);
         }
         (pad, bw, color)
     }
@@ -965,24 +1000,37 @@ impl<'a> Ctx<'a> {
             }
         }
         let spacing = self.table_spacing(id);
+        let nrows = row_ids.len();
         let mut rows = vec![];
-        let mut ncols = 0;
-        for (r, group) in row_ids {
+        // occupied[c] = the first row index at which column c is free again: a
+        // cell with rowspan > 1 keeps its columns busy in the rows below it.
+        let mut occupied: Vec<usize> = vec![];
+        for (ri, (r, group)) in row_ids.into_iter().enumerate() {
             let (mut col, mut cells) = (0, vec![]);
             for cc in self.flow_children(r) {
                 if self.styles[cc].display != Display::TableCell {
                     continue;
                 }
+                while col < occupied.len() && occupied[col] > ri {
+                    col += 1;
+                }
                 if col >= MAX_COLS {
                     break;
                 }
                 let span = self.colspan(cc).min(MAX_COLS - col);
-                cells.push(Cell { id: cc, col, span });
+                let rowspan = self.rowspan(cc).min(nrows - ri).max(1);
+                if occupied.len() < col + span {
+                    occupied.resize(col + span, 0);
+                }
+                for o in &mut occupied[col..col + span] {
+                    *o = ri + rowspan;
+                }
+                cells.push(Cell { id: cc, col, span, rowspan });
                 col += span;
             }
-            ncols = ncols.max(col);
             rows.push(RowInfo { id: r, group, cells });
         }
+        let ncols = occupied.len();
 
         let (mut min, mut max, mut pct) = (vec![0.0f32; ncols], vec![0.0f32; ncols], vec![None; ncols]);
         // single-column cells set the baseline; spanning cells then top up what they need
@@ -1029,11 +1077,23 @@ impl<'a> Ctx<'a> {
         TableModel { rows, captions, min, max, pct, spacing, bw, html_border: html_border > 0.0 }
     }
 
+    /// The table's (min, max) outer width taking its captions into account: a
+    /// caption is as wide as the table, so its longest word is a lower bound.
+    fn table_extent(&self, m: &TableModel) -> (f32, f32) {
+        let chrome = m.spacing * (m.min.len() as f32 + 1.0) + m.bw[1] + m.bw[3];
+        let (mut min_w, mut max_w) = (m.min.iter().sum::<f32>() + chrome, m.max.iter().sum::<f32>() + chrome);
+        for cap in &m.captions {
+            let (cmin, cmax) = self.outer_widths(*cap);
+            min_w = min_w.max(cmin);
+            max_w = max_w.max(cmax);
+        }
+        (min_w, max_w.max(min_w))
+    }
+
     /// (min, max) outer width of a whole table.
     fn table_widths(&self, id: NodeId) -> (f32, f32) {
         let m = self.build_table(id);
-        let chrome = m.spacing * (m.min.len() as f32 + 1.0) + m.bw[1] + m.bw[3];
-        let (mut min, mut max) = (m.min.iter().sum::<f32>() + chrome, m.max.iter().sum::<f32>() + chrome);
+        let (mut min, mut max) = self.table_extent(&m);
         if let Length::Px(w) = self.styles[id].width {
             min = min.max(w);
             max = min;
@@ -1065,6 +1125,21 @@ impl<'a> Ctx<'a> {
         CellOut { height, decor, content, links }
     }
 
+    /// Vertically align a laid-out cell inside the box `[top, bottom]` and stretch
+    /// its background and borders to fill it.
+    fn place_cell(&mut self, out: &CellOut, valign: VAlign, top: f32, bottom: f32) {
+        let free = (bottom - top) - out.height;
+        let dy = match valign {
+            VAlign::Top => 0.0,
+            VAlign::Middle => free / 2.0,
+            VAlign::Bottom => free,
+        };
+        if dy != 0.0 {
+            self.shift(out.content, out.links, dy);
+        }
+        self.stretch_decor(&out.decor, bottom);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn layout_table(
         &mut self,
@@ -1090,7 +1165,7 @@ impl<'a> Ctx<'a> {
         let n = model.min.len();
         let (spacing, bw) = (model.spacing, model.bw);
         let chrome = spacing * (n as f32 + 1.0) + bw[1] + bw[3];
-        let (min_w, max_w) = (model.min.iter().sum::<f32>() + chrome, model.max.iter().sum::<f32>() + chrome);
+        let (min_w, max_w) = self.table_extent(&model);
 
         // Table width: an explicit width (never below the min-content), otherwise
         // shrink-to-fit: as wide as the contents want, but no wider than the space.
@@ -1129,44 +1204,69 @@ impl<'a> Ctx<'a> {
             y = self.layout_block(*cap, bx, y, 0.0, table_w, None, true).0;
         }
 
+        let nrows = model.rows.len();
+        let mut row_top = vec![0.0f32; nrows];
+        let mut row_h = vec![0.0f32; nrows];
+        let mut spanning: Vec<Spanning> = vec![];
         let mut y_row = y + spacing;
-        for row in &model.rows {
+        for (ri, row) in model.rows.iter().enumerate() {
             let rs = &styles[row.id];
-            let row_start = self.items.len();
-            let mut outs: Vec<(CellOut, f32, f32)> = vec![];
-            let mut row_h = 0.0f32;
-            for cell in &row.cells {
+            // Reserve a slot for the row's background now, so nothing is ever inserted
+            // into the middle of the display list (which would shift recorded indices).
+            let row_bg_slot = self.items.len();
+            self.items.push(Item::Nop);
+            row_top[ri] = y_row;
+
+            let mut outs: Vec<(usize, CellOut)> = vec![]; // (index into row.cells, laid-out cell)
+            let mut h = 0.0f32;
+            let (mut x_min, mut x_max) = (f32::MAX, f32::MIN);
+            for (ci, cell) in row.cells.iter().enumerate() {
                 let x = content_x + spacing + widths[..cell.col].iter().sum::<f32>() + spacing * cell.col as f32;
                 let w = widths[cell.col..cell.col + cell.span].iter().sum::<f32>() + spacing * (cell.span as f32 - 1.0);
+                x_min = x_min.min(x);
+                x_max = x_max.max(x + w);
                 let out = self.layout_cell(id, cell.id, x, y_row, w);
-                row_h = row_h.max(out.height);
-                outs.push((out, x, w));
-            }
-            if let Some(h) = rs.height {
-                row_h = row_h.max(h);
-            }
-            for (cell, (out, _, _)) in row.cells.iter().zip(&outs) {
-                let va = styles[cell.id]
-                    .valign
-                    .or(rs.valign)
-                    .or(row.group.and_then(|g| styles[g].valign))
-                    .unwrap_or(VAlign::Middle);
-                let dy = match va {
-                    VAlign::Top => 0.0,
-                    VAlign::Middle => (row_h - out.height) / 2.0,
-                    VAlign::Bottom => row_h - out.height,
-                };
-                if dy != 0.0 {
-                    self.shift(out.content, out.links, dy);
+                if cell.rowspan > 1 {
+                    let valign = styles[cell.id].valign.or(rs.valign).or(row.group.and_then(|g| styles[g].valign)).unwrap_or(VAlign::Middle);
+                    spanning.push(Spanning { out, first: ri, last: ri + cell.rowspan - 1, valign });
+                } else {
+                    h = h.max(out.height);
+                    outs.push((ci, out));
                 }
-                self.stretch_decor(&out.decor, y_row + row_h);
+            }
+            if let Some(rh) = rs.height {
+                h = h.max(rh);
+            }
+            // A spanning cell that ends in this row may need more height than its rows
+            // have between them: the last row grows to fit it.
+            for sp in spanning.iter().filter(|sp| sp.last == ri) {
+                let above: f32 = row_h[sp.first..ri].iter().sum::<f32>() + spacing * (ri - sp.first) as f32;
+                let deficit = sp.out.height - (above + h);
+                if deficit > 0.0 {
+                    h += deficit;
+                }
+            }
+            row_h[ri] = h;
+            let bottom = y_row + h;
+
+            for (ci, out) in &outs {
+                let cell = &row.cells[*ci];
+                let valign = styles[cell.id].valign.or(rs.valign).or(row.group.and_then(|g| styles[g].valign)).unwrap_or(VAlign::Middle);
+                self.place_cell(out, valign, y_row, bottom);
+            }
+            let finished: Vec<Spanning> = {
+                let (done, rest): (Vec<_>, Vec<_>) = spanning.into_iter().partition(|sp| sp.last == ri);
+                spanning = rest;
+                done
+            };
+            for sp in finished {
+                self.place_cell(&sp.out, sp.valign, row_top[sp.first], bottom);
             }
             // a row's own background sits behind its cells
-            if let (Some(color), Some(first), Some(last)) = (rs.background, outs.first(), outs.last()) {
-                let (x0, x1) = (first.1, last.1 + last.2);
-                self.items.insert(row_start, Item::Rect { x: x0, y: y_row, w: x1 - x0, h: row_h, color });
+            if let (Some(color), true) = (rs.background, x_min <= x_max) {
+                self.items[row_bg_slot] = Item::Rect { x: x_min, y: y_row, w: x_max - x_min, h, color };
             }
-            y_row += row_h + spacing;
+            y_row += h + spacing;
         }
 
         let bottom = y_row + bw[2];
@@ -1455,6 +1555,8 @@ mod tests {
             "<tr><td>row with no table</td></tr>",
             "<table><tr><td><table></table></td></tr></table>",
             "<div style='display:table-cell'>x</div><div style='display:table-row'>y</div>",
+            "<table><tr><td rowspan=999999999>x</td><td rowspan=0>y</td><td rowspan=-2>z</td><td rowspan=abc>w</td></tr><tr><td>q</td></tr></table>",
+            "<table><tr><td rowspan=3 colspan=3>big</td></tr><tr></tr><tr><td>a</td></tr></table>",
         ] {
             let p = render(body);
             assert!(p.layout.height.is_finite(), "{body}");
@@ -1496,5 +1598,75 @@ mod tests {
         let p = render("<table border=1 width=100%><caption>c</caption><tr bgcolor=red><td>a</td><td rowspan=2>b</td></tr><tr><td>c</td></tr></table>");
         let (w, h) = (400usize, 200usize);
         Painter::default().paint(&mut vec![0; w * h], w, h, &p.layout, &fonts, 0.0, 2.0);
+    }
+
+    // ---------- regressions from the table review ----------
+
+    #[test]
+    fn cells_with_no_row_still_render() {
+        let p = render("<table border=1><td>X</td><td>Y</td></table>");
+        let (x, y) = (at(&p, "X"), at(&p, "Y"));
+        assert_eq!(x.1, y.1);
+        assert!(y.0 > x.0, "two cells side by side in one implied row");
+    }
+
+    #[test]
+    fn rowspan_cells_span_rows_and_push_later_cells_over() {
+        // A spans both rows, so C sits under B (column 1), and D opens a third column
+        let p = render("<table style='border-spacing:0'><tr><td rowspan=2>A</td><td>B</td></tr><tr><td>C</td><td>D</td></tr></table>");
+        let (a, b, c, d) = (at(&p, "A"), at(&p, "B"), at(&p, "C"), at(&p, "D"));
+        assert!((c.0 - b.0).abs() < 0.01, "C is under B, not under A: {c:?} vs {b:?}");
+        assert!(c.1 > b.1 + 10.0, "C is on the second row");
+        assert!(d.0 > c.0 + 5.0, "D is in a third column");
+        assert!(a.1 > b.1 && a.1 < c.1, "A is vertically centred between the two rows: {a:?} {b:?} {c:?}");
+        assert!(a.0 < b.0);
+    }
+
+    #[test]
+    fn rowspan_backgrounds_cover_all_spanned_rows_and_grow_rows_to_fit() {
+        let p = render("<table style='border-spacing:0'><tr><td rowspan=2 style='background:red;padding:0'>a</td><td>B</td></tr><tr><td>C</td></tr></table>");
+        let red = rects(&p).into_iter().find(|r| r.4 == RED).unwrap();
+        let (b, c) = (at(&p, "B"), at(&p, "C"));
+        assert!(red.3 > (c.1 - b.1) + 10.0, "red spans both rows: h={} rows apart by {}", red.3, c.1 - b.1);
+        // a tall spanning cell makes the table as tall as the cell needs
+        let short = render("<table><tr><td rowspan=2>one</td><td>B</td></tr><tr><td>C</td></tr></table>");
+        let tall = render("<table><tr><td rowspan=2>1<br>2<br>3<br>4<br>5<br>6</td><td>B</td></tr><tr><td>C</td></tr></table>");
+        assert!(tall.layout.height > short.layout.height + 60.0, "{} vs {}", tall.layout.height, short.layout.height);
+        // and the cells of the last spanned row sit within it
+        let (tb, tc) = (at(&tall, "B"), at(&tall, "C"));
+        assert!(tc.1 > tb.1);
+    }
+
+    #[test]
+    fn percentage_columns_fill_or_scale_to_the_table() {
+        // under 100% with no auto column: scaled up to fill the 300px table
+        let p = render("<table width=300 style='background:red;border-spacing:0'><tr><td width=25%>a</td><td width=25%>b</td></tr></table>");
+        let t = rects(&p).into_iter().find(|r| r.4 == RED).unwrap();
+        assert!((t.2 - 300.0).abs() < 1.0, "table fills 300px: {}", t.2);
+        // over 100%: scaled down instead of overflowing
+        let p = render("<table width=300 style='background:red;border-spacing:0'><tr><td width=70%>a</td><td width=70%>b</td></tr></table>");
+        let t = rects(&p).into_iter().find(|r| r.4 == RED).unwrap();
+        assert!(t.2 <= 301.0, "no overflow past 300px: {}", t.2);
+        let (a, b) = (at(&p, "a"), at(&p, "b"));
+        assert!((b.0 - a.0 - 150.0).abs() < 8.0, "two equal halves: {a:?} {b:?}");
+        // distribute() directly
+        let w = distribute(&[0.0, 0.0], &[10.0, 10.0], &[Some(25.0), Some(25.0)], 300.0);
+        assert!((w.iter().sum::<f32>() - 300.0).abs() < 0.01);
+        let w = distribute(&[0.0, 0.0], &[10.0, 10.0], &[Some(70.0), Some(70.0)], 300.0);
+        assert!((w.iter().sum::<f32>() - 300.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn captions_widen_the_table_and_collapsed_borders_are_not_doubled() {
+        // a caption's longest word is a lower bound on the table width
+        let p = render("<table style='background:red'><caption>averyveryverylongcaptionwordthatexceedsthetable</caption><tr><td>a</td></tr></table>");
+        let table = rects(&p).into_iter().find(|r| r.4 == RED).unwrap();
+        let cap_x = at(&p, "averyveryverylongcaptionwordthatexceedsthetable").0;
+        assert!(table.2 > 150.0, "table {} wide", table.2);
+        assert!(cap_x >= table.0 - 0.5 && cap_x < table.0 + table.2, "caption starts inside the table");
+        // collapsed borders: every drawn border line is the declared 2px total, not 4px between cells
+        let p = render("<style>table{border-collapse:collapse} td{border:2px solid red;padding:2px}</style><table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>");
+        let thickest = rects(&p).into_iter().filter(|r| r.4 == RED).map(|r| r.2.min(r.3)).fold(0.0f32, f32::max);
+        assert!(thickest <= 1.01, "each cell draws half of a 2px edge, got {thickest}");
     }
 }

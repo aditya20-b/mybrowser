@@ -11,7 +11,7 @@ It is early. It can load and read plain, document-style websites today, includin
   <img src="docs/forms.png" width="24%" alt="Form controls rendered by mybrowser">
 </p>
 
-All the screenshots come from the engine itself. The `--screenshot` flag runs the same layout and paint code as the window, just into an image instead.
+All the screenshots come from the engine itself. The `--screenshot` flag runs the same layout and paint code as the window, just into an image instead (the page only, without the tabs and toolbar).
 
 ## Try it
 
@@ -23,10 +23,13 @@ cargo run --release -- https://example.com
 cargo run --release -- some/local/page.html
 ```
 
-The window has a toolbar with back, forward and reload buttons and an address bar. You can type a full URL, a bare hostname like `example.com/docs`, or a path to a local file. Pages load in the background: the current page stays on screen and responsive until the next one arrives, and `Esc` cancels a load. Open `pages/forms.html` to try the form controls.
+The window has a tab strip, a toolbar with back, forward and reload buttons, and an address bar. You can type a full URL, a bare hostname like `example.com/docs`, or a path to a local file. Pages load in the background: the current page stays on screen and responsive until the next one arrives, and `Esc` cancels a load. Open `pages/forms.html` to try the form controls.
 
 | Key | Action |
 |---|---|
+| `Cmd+T`, `Cmd+W` | New tab, close tab (the last tab is replaced by an empty one) |
+| `Ctrl+Tab`, `Ctrl+Shift+Tab`, `Cmd+1`…`Cmd+9` | Next / previous tab, jump to a tab (`Cmd+9` is the last one) |
+| `Cmd+click` a link | Open it in a new tab |
 | `Cmd+L` (or `Ctrl+L`) | Focus the address bar and select it |
 | `Enter` / `Esc` | Go to the typed address / cancel editing, or cancel a load in progress |
 | `Cmd+V`, `Cmd+C`, `Cmd+A` | Paste, copy and select all in the address bar (macOS) |
@@ -47,9 +50,9 @@ One heads-up: fonts are loaded from the macOS system font folder (see `src/fonts
 
 **Networking.** It loads `http://` and `https://` pages (TLS through rustls, gzip, timeouts, a size limit), as well as local files and `data:` URLs. It sends `GET` requests and form `POST`s. Redirects are followed by hand so cookies carry across each hop and a redirect can never lead to a `file:` or `data:` URL; after a `POST`, 301/302/303 redirects are followed with a `GET` and 307/308 repeat the `POST` (never from https down to http), like in other browsers. Stylesheets and images are fetched in parallel by a small worker pool with a deadline. It honours `<base href>`, decodes UTF-8, UTF-16, Latin-1 and Windows-1252 text, and shows readable pages for plain text, images and errors (including HTTP 404s with their bodies). A web page can't load local files or send you to one.
 
-**Cookies and privacy.** One in-memory cookie jar is shared by every request and never written to disk. Beyond the usual host, path and expiry rules it refuses a `Domain` that is a public suffix (so `Domain=co.uk` can't make a supercookie), refuses `Secure` cookies from plain http, never sends them over it and doesn't let a plain-http response overwrite one, enforces the `__Secure-` and `__Host-` prefixes, and caps cookie size and count. When a site goes over its limit it loses its own oldest cookies, never another site's. `SameSite` works the way browsers now do it: cookies without the attribute count as `Lax`, so a form on another site can't POST with your login cookie (no CSRF), `Strict` cookies never leave their site, and `SameSite=None` needs `Secure`. Images and stylesheets from a different site than the page get no cookies at all, in either direction, so a tracking pixel can't recognise you. No `Referer` is sent.
+**Cookies and privacy.** One in-memory cookie jar is shared by every request and never written to disk. Beyond the usual host, path and expiry rules it refuses a `Domain` that is a public suffix (so `Domain=co.uk` can't make a supercookie), refuses `Secure` cookies from plain http, never sends them over it and doesn't let a plain-http response overwrite one, enforces the `__Secure-` and `__Host-` prefixes, and caps cookie size and count. When a site goes over its limit it loses its own oldest cookies, never another site's. `SameSite` works the way browsers now do it: cookies without the attribute count as `Lax`, so a form on another site can't POST with your login cookie (no CSRF), `Strict` cookies never leave their site (even if a redirect chain leaves the site and comes back), and `SameSite=None` needs `Secure`. Images and stylesheets from a different site than the page get no cookies at all, in either direction, so a tracking pixel can't recognise you. No `Referer` is sent.
 
-**Browsing.** Pages load on a background thread, so the window never freezes; only the newest navigation can land, so a slow load can't replace a page you've moved on from. Back and forward history changes only when a navigation actually lands, so cancelling or superseding a load never loses or duplicates entries, and typing the address you're already on reloads instead of adding an entry.
+**Browsing.** Tabs, each with its own page, history, scroll position and load in flight: a slow load in a background tab lands in the right tab when it finishes, and closing a tab abandons its loads. Pages load on background threads, so the window never freezes; only the newest navigation in a tab can land, so a slow load can't replace a page you've moved on from. Back and forward history changes only when a navigation actually lands, so cancelling or superseding a load never loses or duplicates entries, and typing the address you're already on reloads instead of adding an entry.
 
 **Forms.** Text, password, checkbox, radio, submit and button inputs, `<button>`, `<textarea>` and `<select>` draw as native-looking boxes that sit on the text baseline. Click to focus, type, toggle and cycle options; `Tab` and `Enter` work. Disabled controls (including those in a `<fieldset disabled>`) can't be clicked, `readonly` and `maxlength` are honoured, and `hidden` controls skip the Tab order. Submitting builds a properly URL-encoded body (only the clicked button, only checked boxes, no disabled or nameless controls, hidden fields included, textarea line breaks as CRLF) and either navigates with it as a query (`GET`) or sends it (`POST`). `form="id"` ties a control to a form elsewhere on the page, and `formaction`/`formmethod` on the clicked button override the form's. The target goes through the same safety checks as links, and a form on an https page refuses to send its data to plain http. Pressing Enter twice doesn't send a `POST` twice. Password text is never drawn.
 
@@ -79,8 +82,8 @@ URL -> fetch -> HTML -> DOM --\
 | Styles | `src/style.rs` | Walks the DOM once, collects every matching declaration, sorts by importance, origin, specificity and order, and fills in a typed `Style` for each node. Legacy presentational attributes act as very low-priority rules. |
 | Forms | `src/forms.rs` | Pure logic: which elements are controls, their typed or chosen values, Tab order, and turning a submitted form into a request. |
 | Layout | `src/layout.rs` | Stacks blocks, collapses margins, breaks text into lines, sizes and positions table cells and form controls. The output is a flat list of "draw this rect" and "draw this text" commands. |
-| Painting | `src/paint.rs`, `src/fonts.rs`, `src/images.rs` | Fills rectangles into a `u32` buffer, blends glyph bitmaps and scaled images on top. |
-| Browser | `src/page.rs`, `src/chrome.rs`, `src/main.rs` | A page ties the stages together; the chrome is the toolbar and address bar; `main` runs the window, input, links, history and the loader threads. |
+| Painting | `src/paint.rs`, `src/fonts.rs`, `src/images.rs` | Fills rectangles into a `u32` buffer, blends glyph bitmaps and scaled images on top; also draws the toolbar and tab strip. |
+| Browser | `src/page.rs`, `src/tab.rs`, `src/tabbar.rs`, `src/chrome.rs`, `src/main.rs` | A page ties the stages together; a tab owns a page, its history and its loads; the tab strip and toolbar are pure state and geometry; `main` runs the window and routes input. |
 
 A few choices worth explaining:
 
@@ -91,8 +94,9 @@ A few choices worth explaining:
 - Form controls are drawn by the engine from plain rects and text, so they need no new paint code, and a control's size never depends on what's typed in it, so typing doesn't reflow the page.
 - The HTTP client's built-in cookie handling and redirect following are switched off. I wanted every cookie to pass through my own rules first, and a redirect to be checked before it's followed, so both happen in `net.rs` and `cookies.rs`.
 - `SameSite` needs to know which page started a navigation (a clicked link or submitted form, as opposed to a typed address). That is passed to the loader thread through a thread-local, so the page-loading code didn't have to change.
+- A tab doesn't know about the window: loader threads report back through a plain callback carrying the tab's id, so a tab (its history, its stale-load handling, its form submission) is unit-tested by feeding it local files.
 - A page is built whole on a loader thread and handed to the UI thread in one piece. It contains `Rc`s (not `Send`), so the handoff uses a tiny `unsafe impl Send` whose safety argument (every clone lives inside the one value being moved) is written next to it and was reviewed independently.
-- The address bar logic, the form logic, the cookie policy, and the navigation and history bookkeeping are plain state with no windowing in them, so they're unit-tested.
+- The address bar logic, the tab strip geometry, the form logic, the cookie policy, and the navigation and history bookkeeping are plain state with no windowing in them, so they're unit-tested.
 
 ## Dependencies
 
@@ -111,7 +115,7 @@ The engine itself is hand-written. I only used crates for the parts that talk to
 cargo test
 ```
 
-There are over two hundred tests. They cover the parsers, selector matching, the cascade, layout, tables and form controls, address editing, URL handling, history, form submission, the cookie rules, and networking (against throwaway local HTTP servers, so no internet is needed). Many are regression tests for real bugs found by throwing nasty input at the engine and by independent review passes: quadratic-time parsing, exponential selector matching, crashes on odd Unicode and huge values, unbounded memory use, history desyncs, and so on. The tests load system fonts, so they also need macOS for now.
+There are over two hundred tests. They cover the parsers, selector matching, the cascade, layout, tables and form controls, address editing, tabs, URL handling, history, form submission, the cookie rules, and networking (against throwaway local HTTP servers, so no internet is needed). Many are regression tests for real bugs found by throwing nasty input at the engine and by independent review passes: quadratic-time parsing, exponential selector matching, crashes on odd Unicode and huge values, unbounded memory use, history desyncs, and so on. The tests load system fonts, so they also need macOS for now.
 
 ## What's missing
 
@@ -121,13 +125,14 @@ The honest list, roughly by how much it matters for a real browser:
 - **Layout.** No flexbox, grid, floats or positioning, no inline padding or margins, and no `vh`/`vw`/`calc()`. A lot of the modern web depends on these.
 - **Selectors.** No pseudo-classes (even `:link` and `:first-child`), attribute selectors or `@media`, so many stylesheets lose rules.
 - **Forms.** No `multipart/form-data` (so no file uploads; a form asking for it is sent urlencoded), no `<select multiple>`, and `<label>` clicks don't focus their control. Reloading or going back to a page a `POST` produced fetches its URL with a `GET`. No caret movement or selection inside fields (typing appends, backspace deletes), no file, date or colour inputs, radio buttons draw as squares, and selects cycle on click instead of opening a menu. Controls hidden with CSS (`display:none`) can still be tabbed to.
+- **Tabs.** No dragging to reorder, no restoring closed tabs, and tabs shrink to a minimum width rather than scrolling when there are many (at most 20 can be open).
 - **Cookies.** Nothing persists between runs, and there's no UI to see or clear them.
-- **Browser features.** No tabs, caching, bookmarks or find-in-page.
+- **Browser features.** No caching, bookmarks, find-in-page or downloads.
 - **Media.** PNG only: no JPEG, GIF, WebP or SVG. No fonts from the web (`@font-face`).
 - **Text.** No shaping, so no kerning, ligatures or complex scripts, and no right-to-left text.
 - **Platform.** macOS fonts only, for now.
 
-The order I'm tackling things in: tabs, the CSS gaps above (pseudo-classes, inline boxes, viewport units), a flexbox subset, more image formats, and eventually a JavaScript engine. Until then it's best at documents, blogs, articles and older table-based sites.
+The order I'm tackling things in: the CSS gaps above (pseudo-classes, inline boxes, viewport units), a flexbox subset, more image formats, and eventually a JavaScript engine. Until then it's best at documents, blogs, articles and older table-based sites.
 
 ## Where to learn more
 

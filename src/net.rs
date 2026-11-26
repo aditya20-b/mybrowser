@@ -27,12 +27,20 @@ thread_local! {
     static INITIATOR: RefCell<Option<Url>> = const { RefCell::new(None) };
 }
 
+/// Puts the previous initiator back when dropped, even while unwinding from a panic.
+struct RestoreInitiator(Option<Url>);
+
+impl Drop for RestoreInitiator {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        INITIATOR.with(|i| *i.borrow_mut() = previous);
+    }
+}
+
 /// Run `f` (a top-level load) as a navigation started from `initiator`.
 pub fn with_initiator<T>(initiator: Option<Url>, f: impl FnOnce() -> T) -> T {
-    let previous = INITIATOR.with(|i| i.replace(initiator));
-    let result = f();
-    INITIATOR.with(|i| *i.borrow_mut() = previous);
-    result
+    let _restore = RestoreInitiator(INITIATOR.with(|i| i.replace(initiator)));
+    f()
 }
 
 pub struct Fetched {
@@ -137,10 +145,18 @@ fn fetch_http(start: &Url, top: Option<&Url>, post: Option<&str>) -> Result<Fetc
     let mut post = post;
     // Only a top-level navigation has an initiating page; subresources are judged against `top`.
     let initiator = if top.is_none() { INITIATOR.with(|i| i.borrow().clone()) } else { None };
+    // Once a redirect chain has been on another site it stays cross-site, even if it comes
+    // back (an open redirector on a same-site page must not launder Strict cookies).
+    let mut crossed = false;
     for _ in 0..=MAX_REDIRECTS {
         // Each hop is judged on its own: a redirect to another site loses the cookies.
         let use_cookies = top.is_none_or(|t| cookies::same_site(t, &url));
-        let ctx = cookies::context(initiator.as_ref(), &url, post.is_some());
+        let mut ctx = cookies::context(initiator.as_ref(), &url, post.is_some());
+        if ctx != cookies::Ctx::SameSite {
+            crossed = true;
+        } else if crossed {
+            ctx = if post.is_some() { cookies::Ctx::CrossSitePost } else { cookies::Ctx::CrossSiteGet };
+        }
         let cookie_header = if use_cookies { cookies::global().header_for(&url, ctx) } else { None };
         let result = match post {
             Some(body) => {
@@ -688,6 +704,74 @@ mod tests {
         assert!(heads[1].contains("ss_lax=2") && !heads[1].contains("ss_strict"), "a link carries Lax but not Strict: {}", heads[1]);
         assert!(!heads[2].contains("ss_lax") && !heads[2].contains("ss_strict"), "a cross-site POST carries neither: {}", heads[2]);
         assert!(heads[3].contains("ss_strict=1") && heads[3].contains("ss_lax=2"), "typed addresses carry everything: {}", heads[3]);
+    }
+
+    #[test]
+    fn a_redirect_chain_that_leaves_the_site_and_returns_stays_cross_site() {
+        // same-site page -> open redirector -> another site -> back: the last hop used to look
+        // same-site again and carried Strict cookies
+        let page = Url::parse("http://127.0.0.1:1/page.html").unwrap();
+        let (port_b, h_b) = serve(vec![]); // placeholder so the port is reserved below
+        drop(h_b);
+        let (hop_port, hop_heads, hop) = serve_recording(vec![]);
+        drop((hop_heads, hop, port_b));
+        // the real servers: A (127.0.0.1) handles seed, start, final; B (localhost) handles the middle hop
+        let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port_b = listener_b.local_addr().unwrap().port();
+        let _ = hop_port;
+        let (port_a, heads_a, ha) = {
+            // A needs to know where to send the first redirect, so bind it by hand
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let heads = Arc::new(Mutex::new(Vec::new()));
+            let record = heads.clone();
+            let handle = std::thread::spawn(move || {
+                let replies = [
+                    http("200 OK", "Set-Cookie: rc_strict=1; SameSite=Strict; Path=/\r\nSet-Cookie: rc_lax=2; Path=/\r\n", "seed"),
+                    http("302 Found", &format!("Location: http://localhost:{port_b}/hop\r\n"), ""),
+                    http("200 OK", "", "final"),
+                ];
+                for reply in replies {
+                    let (mut sock, _) = listener.accept().unwrap();
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).unwrap_or(0);
+                    record.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase());
+                    sock.write_all(reply.as_bytes()).unwrap();
+                }
+            });
+            (port, heads, handle)
+        };
+        let hb = std::thread::spawn(move || {
+            let (mut sock, _) = listener_b.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let back = format!("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port_a}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            sock.write_all(back.as_bytes()).unwrap();
+        });
+        let a = |p: &str| Url::parse(&format!("http://127.0.0.1:{port_a}{p}")).unwrap();
+        fetch(&a("/seed")).unwrap();
+        let f = with_initiator(Some(page), || fetch(&a("/start")).unwrap());
+        ha.join().unwrap();
+        hb.join().unwrap();
+        assert_eq!(f.url.path(), "/final");
+        let heads = heads_a.lock().unwrap();
+        assert!(heads[1].contains("rc_strict=1"), "the first hop is same-site: {}", heads[1]);
+        assert!(!heads[2].contains("rc_strict"), "the returning hop must not carry Strict cookies: {}", heads[2]);
+        assert!(heads[2].contains("rc_lax=2"), "but Lax cookies still go on a top-level GET: {}", heads[2]);
+    }
+
+    #[test]
+    fn a_panic_inside_with_initiator_does_not_leave_it_set() {
+        let evil = Url::parse("http://127.0.0.1:1/evil.html").unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| with_initiator(Some(evil), || panic!("loader crashed"))));
+        assert!(result.is_err());
+        assert_eq!(INITIATOR.with(|i| i.borrow().clone()), None, "a later load on this thread is a normal navigation again");
+        // and nesting restores the outer value
+        let outer = Url::parse("http://outer.test/").unwrap();
+        with_initiator(Some(outer.clone()), || {
+            with_initiator(None, || assert_eq!(INITIATOR.with(|i| i.borrow().clone()), None));
+            assert_eq!(INITIATOR.with(|i| i.borrow().clone()), Some(outer.clone()));
+        });
     }
 
     #[test]

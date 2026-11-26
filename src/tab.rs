@@ -25,11 +25,13 @@ fn strip_fragment(u: &Url) -> Url {
     u
 }
 
-/// Is `host` (no port) exactly `localhost` or an IPv4 loopback address?
-/// Prefix matching would treat `localhost.evil.com` or `127.evil.com` as local
-/// and send the visit to a remote server in cleartext.
+/// Is `host` (no port; an IPv6 address may still carry its brackets) exactly
+/// `localhost` (a trailing dot is fine) or a loopback IP address? Prefix matching
+/// would treat `localhost.evil.com` or `127.evil.com` as local and send the visit
+/// to a remote server in cleartext.
 pub fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+    let h = host.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.');
+    h.eq_ignore_ascii_case("localhost") || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 pub fn resolve_link(base: &Url, href: &str) -> Link {
@@ -528,9 +530,23 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_and_trailing_dot_loopback_targets_are_local_too() {
+        // `host_str()` keeps the brackets of an IPv6 address, so [::1] used to count as remote
+        let secure = u("https://app.test/");
+        for local in ["http://[::1]:8000/x", "http://localhost./x", "http://LOCALHOST/x", "http://[0:0:0:0:0:0:0:1]/x"] {
+            assert!(form_target_allowed(&secure, &u(local), true).is_ok(), "{local}");
+        }
+        for remote in ["http://[2001:db8::1]/x", "http://localhost.evil.test./x", "http://128.0.0.1/x"] {
+            assert!(form_target_allowed(&secure, &u(remote), true).is_err(), "{remote}");
+        }
+    }
+
+    #[test]
     fn look_alike_hosts_are_not_loopback() {
         assert!(is_loopback_host("localhost") && is_loopback_host("127.0.0.1") && is_loopback_host("127.1.2.3"));
+        assert!(is_loopback_host("[::1]") && is_loopback_host("::1") && is_loopback_host("localhost."));
         assert!(!is_loopback_host("localhost.evil.com") && !is_loopback_host("127.evil.com") && !is_loopback_host("128.0.0.1"));
+        assert!(!is_loopback_host("") && !is_loopback_host("[]") && !is_loopback_host("."));
     }
 
     // ---------- navigation tickets ----------
@@ -776,7 +792,7 @@ mod tests {
         assert!(deliver(&mut tab, &rx));
         assert_eq!((tab.title().as_str(), tab.page.url.path()), ("Page B", b.path()));
         assert_eq!(tab.page.url.query(), Some("q=1"));
-        // a second submit while it is loading a POST is ignored; a refused one reports why
+        // a refused submission reports why and sends nothing
         let (notify, _rx) = queue();
         let mut secure = Tab::blank(2, notify);
         secure.page = Page::from_source(&u("https://bank.test/login"), "<form method=post action='http://evil.test/x'><input name=pw value=s><button>go</button></form>");

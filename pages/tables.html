@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Tables</title>
+  <style>
+    body { font-family: Helvetica, sans-serif; background-color: #f8fafc; color: #0f172a; }
+    .wrap { max-width: 680px; margin: 0 auto; padding: 8px 20px; }
+    h1 { color: #1e3a8a; font-size: 28px; }
+    table.data { width: 100%; border-collapse: collapse; background-color: white; border: 1px solid #cbd5e1; }
+    table.data th { background-color: #1e3a8a; color: white; padding: 8px 10px; text-align: left; }
+    table.data td { padding: 8px 10px; border-bottom: 1px solid #e2e8f0; }
+    table.data tr.alt td { background-color: #f1f5f9; }
+    .num { text-align: right; }
+    .ok { color: #15803d; font-weight: bold; }
+    .warn { color: #b45309; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Tables</h1>
+    <p>Column widths come from the content, rows stay level, and cells can span columns.</p>
+
+    <table class="data">
+      <tr><th>Feature</th><th>Status</th><th class="num">Tests</th></tr>
+      <tr><td>HTML parser</td><td class="ok">done</td><td class="num">23</td></tr>
+      <tr class="alt"><td>CSS cascade</td><td class="ok">done</td><td class="num">38</td></tr>
+      <tr><td>Block and inline layout</td><td class="ok">done</td><td class="num">18</td></tr>
+      <tr class="alt"><td>Tables</td><td class="ok">just landed</td><td class="num">12</td></tr>
+      <tr><td>Flexbox</td><td class="warn">not yet</td><td class="num">0</td></tr>
+      <tr class="alt"><td colspan="3" style="text-align:center">colspan=3: one cell across the whole row</td></tr>
+    </table>
+
+    <h2>The old-school way</h2>
+    <p>Pre-CSS pages used attributes like <code>bgcolor</code>, <code>border</code>, <code>cellpadding</code> and <code>align</code>, and nested tables for layout.</p>
+    <table border="1" cellpadding="6" cellspacing="0" bgcolor="#fde68a" align="center">
+      <tr><td><b>Left</b></td><td align="center">centred</td><td align="right">right</td></tr>
+      <tr>
+        <td bgcolor="#bfdbfe" valign="top">top</td>
+        <td bgcolor="#bbf7d0">a taller cell<br>with three<br>lines</td>
+        <td bgcolor="#fecaca" valign="bottom">bottom</td>
+      </tr>
+    </table>
+  </div>
+</body>
+</html>

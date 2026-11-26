@@ -2,6 +2,7 @@
 use crate::css::{self, Color, Declaration, Length, Rule};
 use crate::dom::{Dom, Kind};
 use crate::fonts::{Face, Family};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Display {
@@ -9,6 +10,11 @@ pub enum Display {
     Inline,
     Block,
     ListItem,
+    Table,
+    TableRow,
+    /// `<thead>`, `<tbody>`, `<tfoot>`: transparent wrappers around rows.
+    TableRowGroup,
+    TableCell,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -16,6 +22,14 @@ pub enum Align {
     Left,
     Center,
     Right,
+}
+
+/// Vertical alignment of a table cell's content within its row.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum VAlign {
+    Top,
+    Middle,
+    Bottom,
 }
 
 #[derive(Clone)]
@@ -31,6 +45,10 @@ pub struct Style {
     pub align: Align,
     pub pre: bool,
     pub list_none: bool,
+    /// `border-spacing` (None = the default, or the table's `cellspacing`).
+    pub spacing: Option<f32>,
+    /// `border-collapse: collapse` (approximated: no spacing between cells).
+    pub collapse: bool,
     // not inherited. Sides are ordered top, right, bottom, left.
     pub background: Option<Color>,
     pub margin: [Length; 4],
@@ -47,6 +65,8 @@ pub struct Style {
     pub max_width: Option<f32>,
     pub height: Option<f32>,
     pub border_box: bool, // box-sizing: border-box (width/height include padding+border)
+    /// `vertical-align` / `valign=`; None = unspecified (cells then use their row's, else middle).
+    pub valign: Option<VAlign>,
 }
 
 impl Style {
@@ -62,6 +82,8 @@ impl Style {
             align: Align::Left,
             pre: false,
             list_none: false,
+            spacing: None,
+            collapse: false,
             background: None,
             margin: [Length::Px(0.0); 4],
             padding: [Length::Px(0.0); 4],
@@ -73,6 +95,7 @@ impl Style {
             max_width: None,
             height: None,
             border_box: false,
+            valign: None,
         }
     }
 
@@ -88,6 +111,8 @@ impl Style {
             align: parent.align,
             pre: parent.pre,
             list_none: parent.list_none,
+            spacing: parent.spacing,
+            collapse: parent.collapse,
             ..Style::initial()
         }
     }
@@ -115,7 +140,7 @@ fn side(name: &str) -> Option<usize> {
 
 fn is_inherited(name: &str) -> bool {
     matches!(name, "color" | "font-size" | "font-weight" | "font-style" | "font-family"
-        | "text-align" | "white-space" | "list-style" | "list-style-type")
+        | "text-align" | "white-space" | "list-style" | "list-style-type" | "border-spacing" | "border-collapse")
 }
 
 /// Copy one property from `src` to `dst` (used for inherit / initial / unset).
@@ -136,6 +161,9 @@ fn copy_prop(dst: &mut Style, src: &Style, name: &str) {
         "max-width" => dst.max_width = src.max_width,
         "height" => dst.height = src.height,
         "box-sizing" => dst.border_box = src.border_box,
+        "vertical-align" => dst.valign = src.valign,
+        "border-spacing" => dst.spacing = src.spacing,
+        "border-collapse" => dst.collapse = src.collapse,
         _ => {
             if let Some(i) = name.strip_prefix("margin-").and_then(side) {
                 dst.margin[i] = src.margin[i];
@@ -153,6 +181,32 @@ fn copy_prop(dst: &mut Style, src: &Style, name: &str) {
             }
         }
     }
+}
+
+fn parse_valign(v: &str) -> Option<VAlign> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "top" | "baseline" | "text-top" => Some(VAlign::Top),
+        "middle" | "center" => Some(VAlign::Middle),
+        "bottom" | "text-bottom" => Some(VAlign::Bottom),
+        _ => None,
+    }
+}
+
+fn family_from_names(list: &str) -> Option<Family> {
+    for f in list.split(',') {
+        let f = f.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase();
+        let fam = match f.as_str() {
+            "monospace" | "courier" | "courier new" | "menlo" | "monaco" | "consolas" | "sfmono-regular" => Some(Family::Mono),
+            "serif" | "georgia" | "times" | "times new roman" | "palatino" => Some(Family::Serif),
+            "sans-serif" | "arial" | "helvetica" | "helvetica neue" | "system-ui" | "verdana" | "tahoma"
+            | "-apple-system" | "segoe ui" => Some(Family::Sans),
+            _ => None,
+        };
+        if fam.is_some() {
+            return fam;
+        }
+    }
+    None
 }
 
 fn apply(s: &mut Style, parent: &Style, d: &Declaration) {
@@ -179,44 +233,47 @@ fn apply(s: &mut Style, parent: &Style, d: &Declaration) {
         if let Some(l) = css::parse_length(v, fs) { s.padding[i] = l; }
         return;
     }
-    if let Some(rest) = name.strip_prefix("border-") {
-        if let Some((sd, what)) = rest.split_once('-') {
-            if let Some(i) = side(sd) {
-                match what {
-                    "width" => {
-                        let l = css::border_width_keyword(v).and_then(|k| css::parse_length(k, fs))
-                            .or_else(|| css::parse_length(v, fs));
-                        if let Some(Length::Px(px)) = l { s.border_w[i] = px.max(0.0); }
-                    }
-                    "style" => {
-                        if matches!(lv.as_str(), "none" | "hidden") {
-                            s.border_on[i] = false;
-                        } else if matches!(lv.as_str(), "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset") {
-                            s.border_on[i] = true; // all styles are drawn as solid for now
-                        }
-                    }
-                    "color" => {
-                        if lv == "currentcolor" {
-                            s.border_c[i] = None;
-                        } else if let Some(c) = css::color_value(v) {
-                            s.border_c[i] = Some(c);
-                        } // an invalid value is ignored, not a reset
-                    }
-                    _ => {}
+    // Per-side border longhands (border-top-width ...). Other `border-*` names,
+    // like border-spacing and border-collapse, fall through to the match below.
+    if let Some((sd, what)) = name.strip_prefix("border-").and_then(|r| r.split_once('-')) {
+        if let Some(i) = side(sd) {
+            match what {
+                "width" => {
+                    let l = css::border_width_keyword(v).and_then(|k| css::parse_length(k, fs))
+                        .or_else(|| css::parse_length(v, fs));
+                    if let Some(Length::Px(px)) = l { s.border_w[i] = px.max(0.0); }
                 }
+                "style" => {
+                    if matches!(lv.as_str(), "none" | "hidden") {
+                        s.border_on[i] = false;
+                    } else if matches!(lv.as_str(), "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset") {
+                        s.border_on[i] = true; // all styles are drawn as solid for now
+                    }
+                }
+                "color" => {
+                    if lv == "currentcolor" {
+                        s.border_c[i] = None;
+                    } else if let Some(c) = css::color_value(v) {
+                        s.border_c[i] = Some(c);
+                    } // an invalid value is ignored, not a reset
+                }
+                _ => {}
             }
+            return;
         }
-        return;
     }
 
     match name {
         "display" => match lv.as_str() {
-            "none" => s.display = Display::None,
+            "none" | "table-column" | "table-column-group" => s.display = Display::None,
             "list-item" => s.display = Display::ListItem,
-            "inline" | "contents" | "table-cell" | "table-column" | "table-column-group" => s.display = Display::Inline,
+            "inline" | "contents" => s.display = Display::Inline,
             l if l.starts_with("inline-") => s.display = Display::Inline,
-            "block" | "flex" | "grid" | "table" | "table-row" | "table-row-group"
-            | "table-header-group" | "table-footer-group" | "table-caption" | "flow-root" => s.display = Display::Block,
+            "table" => s.display = Display::Table,
+            "table-row" => s.display = Display::TableRow,
+            "table-row-group" | "table-header-group" | "table-footer-group" => s.display = Display::TableRowGroup,
+            "table-cell" => s.display = Display::TableCell,
+            "block" | "flex" | "grid" | "table-caption" | "flow-root" => s.display = Display::Block,
             _ => {} // unknown value: ignore the declaration
         },
         "color" => { if let Some(Some(c)) = css::color_value(v) { s.color = c; } }
@@ -248,17 +305,8 @@ fn apply(s: &mut Style, parent: &Style, d: &Declaration) {
             _ => {}
         },
         "font-family" => {
-            for f in lv.split(',') {
-                let f = f.trim().trim_matches(|c| c == '"' || c == '\'');
-                let fam = match f {
-                    "monospace" | "courier" | "courier new" | "menlo" | "monaco" | "consolas"
-                    | "sfmono-regular" => Some(Family::Mono),
-                    "serif" | "georgia" | "times" | "times new roman" | "palatino" => Some(Family::Serif),
-                    "sans-serif" | "arial" | "helvetica" | "helvetica neue" | "system-ui"
-                    | "verdana" | "tahoma" | "-apple-system" | "segoe ui" => Some(Family::Sans),
-                    _ => None,
-                };
-                if let Some(fam) = fam { s.family = fam; break; }
+            if let Some(fam) = family_from_names(&lv) {
+                s.family = fam;
             }
         }
         "text-decoration" | "text-decoration-line" => {
@@ -268,6 +316,23 @@ fn apply(s: &mut Style, parent: &Style, d: &Declaration) {
             "center" => s.align = Align::Center,
             "right" | "end" => s.align = Align::Right,
             "left" | "start" => s.align = Align::Left,
+            _ => {}
+        },
+        "vertical-align" => {
+            if let Some(va) = parse_valign(&lv) {
+                s.valign = Some(va);
+            }
+        }
+        "border-spacing" => {
+            // `border-spacing: 4px 2px` -> use the horizontal value
+            let first = lv.split_whitespace().next().unwrap_or("");
+            if let Some(Length::Px(px)) = css::parse_length(first, fs) {
+                s.spacing = Some(px.clamp(0.0, 100.0));
+            }
+        }
+        "border-collapse" => match lv.as_str() {
+            "collapse" => s.collapse = true,
+            "separate" => s.collapse = false,
             _ => {}
         },
         "white-space" => s.pre = matches!(lv.as_str(), "pre" | "pre-wrap" | "pre-line"),
@@ -289,6 +354,65 @@ fn apply(s: &mut Style, parent: &Style, d: &Declaration) {
     }
 }
 
+/// A legacy `width="50"` / `width="50%"` attribute value.
+fn attr_length(v: &str) -> Option<Length> {
+    let v = v.trim();
+    let digits: String = v.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let n: f32 = digits.parse().ok()?;
+    if n < 0.0 {
+        return None;
+    }
+    Some(if v[digits.len()..].trim_start().starts_with('%') { Length::Pct(n) } else { Length::Px(n) })
+}
+
+/// Presentational HTML attributes (`bgcolor`, `align`, `<font color>` ...). They
+/// act like very low-priority author rules: applied before the cascade, so any
+/// CSS overrides them. Table-based pages from before CSS depend on these.
+fn presentational_hints(s: &mut Style, tag: &str, attrs: &HashMap<String, String>) {
+    if matches!(tag, "body" | "table" | "tr" | "td" | "th" | "thead" | "tbody" | "tfoot") {
+        if let Some(c) = attrs.get("bgcolor").and_then(|v| css::parse_color(v)) {
+            s.background = Some(c);
+        }
+    }
+    if matches!(tag, "td" | "th" | "tr" | "thead" | "tbody" | "tfoot" | "caption" | "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+        match attrs.get("align").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("center") | Some("middle") => s.align = Align::Center,
+            Some("right") => s.align = Align::Right,
+            Some("left") => s.align = Align::Left,
+            _ => {}
+        }
+    }
+    if matches!(tag, "td" | "th" | "tr" | "thead" | "tbody" | "tfoot") {
+        if let Some(va) = attrs.get("valign").and_then(|v| parse_valign(v)) {
+            s.valign = Some(va);
+        }
+    }
+    if matches!(tag, "table" | "td" | "th") {
+        if let Some(l) = attrs.get("width").and_then(|v| attr_length(v)) {
+            s.width = l;
+        }
+    }
+    if tag == "font" {
+        if let Some(c) = attrs.get("color").and_then(|v| css::parse_color(v)) {
+            s.color = c;
+        }
+        if let Some(size) = attrs.get("size") {
+            let size = size.trim();
+            // 1..7 absolute, or +n / -n relative to the default size 3
+            let step: Option<i32> = match size.chars().next() {
+                Some('+') | Some('-') => size.parse::<i32>().ok().map(|d| 3 + d),
+                _ => size.parse::<i32>().ok(),
+            };
+            if let Some(step) = step {
+                s.font_size = [10.0, 13.0, 16.0, 18.0, 24.0, 32.0, 48.0][(step.clamp(1, 7) - 1) as usize];
+            }
+        }
+        if let Some(fam) = attrs.get("face").and_then(|v| family_from_names(v)) {
+            s.family = fam;
+        }
+    }
+}
+
 /// Cascade sort key: (important, origin rank, specificity, source order).
 /// Normal declarations: UA < author. `!important` flips it: author < UA.
 type CascadeKey = (bool, u8, (u32, u32, u32), usize);
@@ -306,7 +430,9 @@ pub fn compute(dom: &Dom, rules: &[Rule]) -> Vec<Style> {
         };
         let mut s = Style::inherit(parent_style);
 
-        if let Kind::Element { attrs, .. } = &dom.nodes[id].kind {
+        if let Kind::Element { tag, attrs } = &dom.nodes[id].kind {
+            presentational_hints(&mut s, tag, attrs);
+
             let rank = |important: bool, ua: bool| if important { ua as u8 } else { !ua as u8 };
             let mut matched: Vec<(CascadeKey, &Declaration)> = vec![];
             for rule in rules {
@@ -342,10 +468,14 @@ pub fn compute(dom: &Dom, rules: &[Rule]) -> Vec<Style> {
 
 /// The browser's built-in default stylesheet.
 pub const USER_AGENT_CSS: &str = "
-head, style, script, title, meta, link, template, base { display: none }
+head, style, script, title, meta, link, template, base, col, colgroup { display: none }
 html, body, div, section, article, header, footer, nav, main, aside, p, h1, h2, h3, h4, h5,
 h6, ul, ol, dl, dt, dd, pre, blockquote, hr, form, figure, figcaption, fieldset, address,
-details, summary, table, thead, tbody, tfoot, tr, caption { display: block }
+details, summary, center, caption { display: block }
+table { display: table; border-spacing: 2px }
+thead, tbody, tfoot { display: table-row-group }
+tr { display: table-row }
+td, th { display: table-cell; padding: 1px }
 li { display: list-item }
 body { margin: 8px }
 h1 { font-size: 2em; font-weight: bold; margin: 0.67em 0 }
@@ -359,6 +489,8 @@ blockquote { margin: 1em 40px }
 ul, ol { padding-left: 40px }
 ul ul, ul ol, ol ul, ol ol { margin: 0 }
 dd { margin-left: 40px }
+center { text-align: center }
+caption { text-align: center }
 b, strong, th { font-weight: bold }
 i, em, cite, var, dfn, address { font-style: italic }
 u, ins { text-decoration: underline }
@@ -519,5 +651,73 @@ mod tests {
         assert_eq!(d("flex"), Display::Block);
         assert_eq!(d("bogus"), Display::Block); // ignored: keeps the UA default for <p>
         assert_eq!(style_of("<div style='display:inline'><p style='display:inherit'>x</p></div>", "p").display, Display::Inline);
+    }
+
+    // ---------- tables and presentational attributes ----------
+
+    #[test]
+    fn table_elements_get_table_display_types() {
+        let t = "<table><thead><tr><th>h</th></tr></thead><tbody><tr><td>c</td></tr></tbody><caption>c</caption></table>";
+        for (tag, display) in [
+            ("table", Display::Table), ("thead", Display::TableRowGroup), ("tbody", Display::TableRowGroup),
+            ("tr", Display::TableRow), ("th", Display::TableCell), ("td", Display::TableCell), ("caption", Display::Block),
+        ] {
+            assert_eq!(style_of(t, tag).display, display, "{tag}");
+        }
+        // CSS can turn other elements into table parts, and columns are ignored
+        assert_eq!(style_of("<div style='display:table-cell'>x</div>", "div").display, Display::TableCell);
+        assert_eq!(style_of("<div style='display:table-row-group'>x</div>", "div").display, Display::TableRowGroup);
+        assert_eq!(style_of("<div style='display:table-column'>x</div>", "div").display, Display::None);
+    }
+
+    #[test]
+    fn presentational_attributes_apply_but_css_overrides_them() {
+        let s = style_of("<table bgcolor='#ff6600' width='85%'><tr><td align=right valign=top bgcolor=red width=120>x</td></tr></table>", "table");
+        assert_eq!((s.background, s.width), (Some(Color { r: 255, g: 102, b: 0 }), Length::Pct(85.0)));
+        let s = style_of("<table><tr><td align=right valign=top bgcolor=red width=120>x</td></tr></table>", "td");
+        assert_eq!((s.align, s.valign, s.width), (Align::Right, Some(VAlign::Top), Length::Px(120.0)));
+        assert_eq!(s.background, Some(Color { r: 255, g: 0, b: 0 }));
+        // author CSS beats the attributes
+        let s = style_of("<style>td{background:blue;text-align:left;width:50px}</style><table><tr><td align=right bgcolor=red width=120>x</td></tr></table>", "td");
+        assert_eq!((s.background, s.align, s.width), (Some(Color { r: 0, g: 0, b: 255 }), Align::Left, Length::Px(50.0)));
+    }
+
+    #[test]
+    fn font_tag_attributes() {
+        let s = style_of("<p><font color='#828282' size='1' face='Verdana, Arial'>x</font></p>", "font");
+        assert_eq!((s.color, s.font_size, s.family), (Color { r: 0x82, g: 0x82, b: 0x82 }, 10.0, Family::Sans));
+        assert_eq!(style_of("<font size=+2>x</font>", "font").font_size, 24.0);
+        assert_eq!(style_of("<font size=-1>x</font>", "font").font_size, 13.0);
+        assert_eq!(style_of("<font size=99>x</font>", "font").font_size, 48.0);
+        assert_eq!(style_of("<font size=junk>x</font>", "font").font_size, 16.0);
+        assert_eq!(style_of("<font face='Courier New'>x</font>", "font").family, Family::Mono);
+    }
+
+    #[test]
+    fn table_spacing_valign_and_collapse_properties() {
+        // border-spacing / border-collapse must not be swallowed by the border-<side> handling
+        let s = style_of("<table style='border-spacing: 7px 3px; border-collapse: collapse'><tr><td style='vertical-align: bottom'>x</td></tr></table>", "table");
+        assert_eq!((s.spacing, s.collapse), (Some(7.0), true));
+        assert_eq!(style_of("<table><tr><td style='vertical-align: bottom'>x</td></tr></table>", "td").valign, Some(VAlign::Bottom));
+        // spacing and collapse are inherited by cells, valign is not
+        let s = style_of("<table style='border-spacing: 5px'><tr><td>x</td></tr></table>", "td");
+        assert_eq!(s.spacing, Some(5.0));
+        assert_eq!(style_of("<table><tr valign=top><td>x</td></tr></table>", "td").valign, None);
+        // the UA default spacing is 2px, and hostile values are clamped
+        assert_eq!(style_of("<table><tr><td>x</td></tr></table>", "table").spacing, Some(2.0));
+        assert_eq!(style_of("<table style='border-spacing: 99999px'><tr><td>x</td></tr></table>", "table").spacing, Some(100.0));
+        // and the per-side border longhands still work next to them
+        let s = style_of("<table style='border-top-width: 3px; border-top-style: solid; border-spacing: 1px'><tr><td>x</td></tr></table>", "table");
+        assert_eq!((s.borders()[0], s.spacing), (3.0, Some(1.0)));
+    }
+
+    #[test]
+    fn legacy_width_attribute_parsing() {
+        assert_eq!(attr_length("100"), Some(Length::Px(100.0)));
+        assert_eq!(attr_length(" 50% "), Some(Length::Pct(50.0)));
+        assert_eq!(attr_length("12.5px"), Some(Length::Px(12.5)));
+        assert_eq!(attr_length("auto"), None);
+        assert_eq!(attr_length(""), None);
+        assert_eq!(attr_length("-5"), None);
     }
 }

@@ -3,14 +3,20 @@
 //! Block layout: boxes stack vertically; width fills the container unless
 //! `width`/`max-width` say otherwise; auto margins centre; adjacent vertical
 //! margins collapse. Inline layout: text is flattened into words and
-//! greedily wrapped into lines, then aligned.
+//! greedily wrapped into lines, then aligned. Tables use the classic
+//! auto-layout idea: measure each column's min/max content width, fit the
+//! table to the available space, then lay the cells out row by row.
 use crate::css::{Color, Length};
 use crate::dom::{Dom, Kind, NodeId};
 use crate::fonts::{Face, Fonts};
 use crate::images::Image;
-use crate::style::{Align, Display, Style};
+use crate::style::{Align, Display, Style, VAlign};
 use std::collections::HashMap;
 use std::rc::Rc;
+
+/// A table never has more columns than this (cells beyond it are dropped), so
+/// `colspan=999999999` can't allocate gigabytes.
+const MAX_COLS: usize = 1000;
 
 pub enum Item {
     Nop,
@@ -47,9 +53,9 @@ pub fn layout_document(
     let mut has_block = vec![false; dom.nodes.len()];
     for id in (0..dom.nodes.len()).rev() {
         has_block[id] = dom.nodes[id].children.iter().any(|&c| match styles[c].display {
-            Display::Block | Display::ListItem => true,
             Display::Inline => has_block[c],
             Display::None => false,
+            _ => true,
         });
     }
     let mut cx = Ctx { dom, styles, fonts, images, has_block, items: vec![], links: vec![] };
@@ -119,6 +125,78 @@ struct Line {
     content: bool,
 }
 
+/// Where a box's background and border rects live in the display list, so a
+/// table row can stretch them after the row's height is known.
+struct Decor {
+    bg_slot: usize,
+    top: f32,
+    bw: [f32; 4],
+    border_slots: [Option<usize>; 4],
+}
+
+struct CellOut {
+    height: f32,
+    decor: Decor,
+    /// Range of display items / link regions that make up the cell's content.
+    content: (usize, usize),
+    links: (usize, usize),
+}
+
+struct Cell {
+    id: NodeId,
+    col: usize,
+    span: usize,
+}
+
+struct RowInfo {
+    id: NodeId,
+    group: Option<NodeId>,
+    cells: Vec<Cell>,
+}
+
+struct TableModel {
+    rows: Vec<RowInfo>,
+    captions: Vec<NodeId>,
+    min: Vec<f32>,
+    max: Vec<f32>,
+    pct: Vec<Option<f32>>,
+    spacing: f32,
+    /// Outer border widths of the table box (CSS or the legacy `border` attribute).
+    bw: [f32; 4],
+    html_border: bool,
+}
+
+/// Divide `avail` between columns: percentage columns get their share, the rest
+/// share what's left between their min and max content widths.
+fn distribute(min: &[f32], max: &[f32], pct: &[Option<f32>], avail: f32) -> Vec<f32> {
+    let n = min.len();
+    let mut w = vec![0.0f32; n];
+    let mut fixed = vec![false; n];
+    let mut fixed_total = 0.0;
+    for i in 0..n {
+        if let Some(p) = pct[i] {
+            w[i] = (avail * p / 100.0).max(min[i]);
+            fixed[i] = true;
+            fixed_total += w[i];
+        }
+    }
+    let rest = (avail - fixed_total).max(0.0);
+    let idx: Vec<usize> = (0..n).filter(|&i| !fixed[i]).collect();
+    let smin: f32 = idx.iter().map(|&i| min[i]).sum();
+    let smax: f32 = idx.iter().map(|&i| max[i]).sum();
+    for &i in &idx {
+        w[i] = if rest >= smax {
+            // everything fits at its natural width: share the extra in proportion to max
+            if smax > 0.0 { max[i] + (rest - smax) * max[i] / smax } else { rest / idx.len() as f32 }
+        } else if rest <= smin {
+            min[i]
+        } else {
+            min[i] + (rest - smin) * (max[i] - min[i]) / (smax - smin)
+        };
+    }
+    w
+}
+
 impl<'a> Ctx<'a> {
     /// Lay out a block-level box. `cursor` is the bottom border edge of the
     /// previous sibling (or the top of the container's content), `prev_mb` the
@@ -146,9 +224,9 @@ impl<'a> Ctx<'a> {
         let mt_raw = resolve(s.margin[0], avail).unwrap_or(0.0);
         let mb = resolve(s.margin[2], avail).unwrap_or(0.0);
 
-        // An empty block (no content, no height, padding or border) has no box
-        // to speak of: its top and bottom margins collapse with each other and
-        // with its neighbours' ("collapse through").
+        // An empty block (no content, no height, padding or border) has no box to
+        // speak of: its top and bottom margins collapse with each other and with
+        // its neighbours' ("collapse through").
         if marker.is_none()
             && pad[0] + pad[2] + bw[0] + bw[2] == 0.0
             && s.height.is_none_or(|h| h <= 0.0)
@@ -240,28 +318,79 @@ impl<'a> Ctx<'a> {
             content_bottom = content_top + h;
         }
         let bottom = content_bottom + pad[2] + bw[2];
+        self.emit_decor(s, bg_slot, bx, top, border_w, bottom, bw, None);
+        (bottom, eff_mb)
+    }
 
+    /// Fill the background placeholder at `bg_slot` and push the border rects.
+    /// `color_override` replaces the border colour (legacy `<table border>`).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_decor(
+        &mut self,
+        s: &Style,
+        bg_slot: usize,
+        bx: f32,
+        top: f32,
+        border_w: f32,
+        bottom: f32,
+        bw: [f32; 4],
+        color_override: Option<Color>,
+    ) -> Decor {
         if let Some(color) = s.background {
             self.items[bg_slot] = Item::Rect { x: bx, y: top, w: border_w, h: bottom - top, color };
         }
         // None = transparent border: it still takes space but draws nothing
-        let bc = |i: usize| match s.border_c[i] {
-            None => Some(s.color),
-            Some(c) => c,
+        let bc = |i: usize| match (color_override, s.border_c[i]) {
+            (Some(c), _) => Some(c),
+            (None, None) => Some(s.color),
+            (None, Some(c)) => c,
         };
-        if let (true, Some(color)) = (bw[0] > 0.0, bc(0)) {
-            self.items.push(Item::Rect { x: bx, y: top, w: border_w, h: bw[0], color });
+        let mut slots = [None; 4];
+        let sides = [
+            (bx, top, border_w, bw[0]),
+            (bx + border_w - bw[1], top, bw[1], bottom - top),
+            (bx, bottom - bw[2], border_w, bw[2]),
+            (bx, top, bw[3], bottom - top),
+        ];
+        for (i, (x, y, w, h)) in sides.into_iter().enumerate() {
+            if let (true, Some(color)) = (bw[i] > 0.0, bc(i)) {
+                slots[i] = Some(self.items.len());
+                self.items.push(Item::Rect { x, y, w, h, color });
+            }
         }
-        if let (true, Some(color)) = (bw[2] > 0.0, bc(2)) {
-            self.items.push(Item::Rect { x: bx, y: bottom - bw[2], w: border_w, h: bw[2], color });
+        Decor { bg_slot, top, bw, border_slots: slots }
+    }
+
+    /// Make a laid-out box taller: extend its background and side borders, and
+    /// move its bottom border down.
+    fn stretch_decor(&mut self, d: &Decor, new_bottom: f32) {
+        if let Item::Rect { h, .. } = &mut self.items[d.bg_slot] {
+            *h = new_bottom - d.top;
         }
-        if let (true, Some(color)) = (bw[3] > 0.0, bc(3)) {
-            self.items.push(Item::Rect { x: bx, y: top, w: bw[3], h: bottom - top, color });
+        for (i, slot) in d.border_slots.iter().enumerate() {
+            let Some(ix) = slot else { continue };
+            if let Item::Rect { y, h, .. } = &mut self.items[*ix] {
+                match i {
+                    2 => *y = new_bottom - d.bw[2],
+                    1 | 3 => *h = new_bottom - d.top,
+                    _ => {}
+                }
+            }
         }
-        if let (true, Some(color)) = (bw[1] > 0.0, bc(1)) {
-            self.items.push(Item::Rect { x: bx + border_w - bw[1], y: top, w: bw[1], h: bottom - top, color });
+    }
+
+    /// Move a range of already-emitted content down by `dy`.
+    fn shift(&mut self, items: (usize, usize), links: (usize, usize), dy: f32) {
+        for it in &mut self.items[items.0..items.1] {
+            match it {
+                Item::Rect { y, .. } | Item::Image { y, .. } => *y += dy,
+                Item::Text { baseline, .. } => *baseline += dy,
+                Item::Nop => {}
+            }
         }
-        (bottom, eff_mb)
+        for l in &mut self.links[links.0..links.1] {
+            l.y += dy;
+        }
     }
 
     /// The children that take part in `id`'s formatting context. An inline
@@ -317,15 +446,19 @@ impl<'a> Ctx<'a> {
                 Display::Inline => run.push(c),
                 d => {
                     self.flush_run(id, &mut run, x, &mut cursor, &mut prev_mb, width);
-                    let mut marker = None;
-                    if d == Display::ListItem {
-                        counter += 1;
-                        if !self.styles[id].list_none && !self.styles[c].list_none {
-                            marker = Some(if is_ol { format!("{counter}.") } else { "•".to_string() });
-                        }
-                    }
                     let collapsed = collapsed_child == Some(c);
-                    let (b, mb) = self.layout_block(c, x, cursor, prev_mb, width, marker, collapsed);
+                    let (b, mb) = if d == Display::Table {
+                        self.layout_table(c, x, cursor, prev_mb, width, collapsed, id)
+                    } else {
+                        let mut marker = None;
+                        if d == Display::ListItem {
+                            counter += 1;
+                            if !self.styles[id].list_none && !self.styles[c].list_none {
+                                marker = Some(if is_ol { format!("{counter}.") } else { "•".to_string() });
+                            }
+                        }
+                        self.layout_block(c, x, cursor, prev_mb, width, marker, collapsed)
+                    };
                     cursor = b;
                     prev_mb = mb;
                 }
@@ -359,6 +492,10 @@ impl<'a> Ctx<'a> {
     fn collapsed_top(&self, id: NodeId, avail: f32) -> f32 {
         let s = &self.styles[id];
         let mt = resolve(s.margin[0], avail).unwrap_or(0.0);
+        // a table's own margin is all there is: its rows don't collapse into it
+        if s.display == Display::Table {
+            return mt;
+        }
         let pad_top = resolve(s.padding[0], avail).unwrap_or(0.0);
         if pad_top + s.borders()[0] == 0.0 {
             if let Some(c) = self.first_block_child(id) {
@@ -651,6 +788,392 @@ impl<'a> Ctx<'a> {
         }
         cy - y
     }
+
+    // ---------------------------------------------------------------- intrinsic widths
+
+    /// (min-content, max-content) width of the inline content in `items`: the
+    /// widest unbreakable word, and the width of the longest line left unwrapped.
+    fn inline_widths(&self, items: &[Inl]) -> (f32, f32) {
+        let (mut min, mut max, mut line) = (0.0f32, 0.0f32, 0.0f32);
+        let mut space: Option<NodeId> = None;
+        for it in items {
+            let w = match it {
+                Inl::Space(n) => {
+                    space = Some(*n);
+                    continue;
+                }
+                Inl::Break(_) => {
+                    max = max.max(line);
+                    line = 0.0;
+                    space = None;
+                    continue;
+                }
+                Inl::Word { text, node, .. } => {
+                    let s = &self.styles[*node];
+                    self.fonts.measure(s.face(), s.font_size, text)
+                }
+                Inl::Image { w, .. } => *w,
+            };
+            if line > 0.0 {
+                if let Some(sn) = space {
+                    let ss = &self.styles[sn];
+                    line += self.fonts.measure(ss.face(), ss.font_size, " ");
+                }
+            }
+            line += w;
+            min = min.max(w);
+            space = None;
+        }
+        (min, max.max(line))
+    }
+
+    /// (min, max) content width of a block's contents (not including its own
+    /// padding, border or margin).
+    fn content_widths(&self, id: NodeId) -> (f32, f32) {
+        let (mut min, mut max) = (0.0f32, 0.0f32);
+        let mut run: Vec<NodeId> = vec![];
+        let flush = |this: &Self, run: &mut Vec<NodeId>, min: &mut f32, max: &mut f32| {
+            if run.is_empty() {
+                return;
+            }
+            let mut items = vec![];
+            for &n in run.iter() {
+                this.flatten(n, &mut items);
+            }
+            run.clear();
+            let (a, b) = this.inline_widths(&items);
+            *min = min.max(a);
+            *max = max.max(b);
+        };
+        for c in self.flow_children(id) {
+            match self.styles[c].display {
+                Display::None => {}
+                Display::Inline => run.push(c),
+                _ => {
+                    flush(self, &mut run, &mut min, &mut max);
+                    let (a, b) = self.outer_widths(c);
+                    min = min.max(a);
+                    max = max.max(b);
+                }
+            }
+        }
+        flush(self, &mut run, &mut min, &mut max);
+        (min, max)
+    }
+
+    /// (min, max) outer width of a block-level child: contents plus its own
+    /// padding, border and (fixed) margins. A fixed CSS `width` overrides the contents.
+    fn outer_widths(&self, id: NodeId) -> (f32, f32) {
+        let s = &self.styles[id];
+        if s.display == Display::Table {
+            return self.table_widths(id);
+        }
+        let (mut min, mut max) = self.content_widths(id);
+        if let Length::Px(w) = s.width {
+            min = w.max(0.0);
+            max = min;
+        }
+        let px = |l: Length| resolve(l, 0.0).unwrap_or(0.0);
+        let bw = s.borders();
+        let extras = px(s.padding[1]).max(0.0) + px(s.padding[3]).max(0.0) + bw[1] + bw[3]
+            + px(s.margin[1]) + px(s.margin[3]);
+        ((min + extras).max(0.0), (max + extras).max(0.0))
+    }
+
+    // ---------------------------------------------------------------- tables
+
+    /// A legacy numeric attribute (`cellpadding="4"`), clamped to something sane.
+    fn attr_num(&self, id: NodeId, name: &str) -> Option<f32> {
+        let v = self.dom.attr(id, name)?;
+        let digits: String = v.trim().chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        digits.parse::<f32>().ok().map(|n| n.clamp(0.0, 100.0))
+    }
+
+    /// The legacy `border` attribute: `border=2` -> 2px, bare `border` -> 1px.
+    fn html_border(&self, table: NodeId) -> f32 {
+        match self.dom.attr(table, "border") {
+            Some(v) if v.trim().is_empty() => 1.0,
+            Some(_) => self.attr_num(table, "border").unwrap_or(0.0),
+            None => 0.0,
+        }
+    }
+
+    fn table_spacing(&self, table: NodeId) -> f32 {
+        let s = &self.styles[table];
+        if s.collapse {
+            return 0.0;
+        }
+        match (s.spacing, self.attr_num(table, "cellspacing")) {
+            // 2px is the user-agent default, so a `cellspacing` attribute overrides it
+            (Some(v), Some(a)) if v == 2.0 => a,
+            (Some(v), _) => v,
+            (None, Some(a)) => a,
+            (None, None) => 2.0,
+        }
+    }
+
+    fn colspan(&self, cell: NodeId) -> usize {
+        self.dom.attr(cell, "colspan").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1).clamp(1, MAX_COLS)
+    }
+
+    /// Padding, border widths and (for legacy `<table border>`) a border colour for a cell.
+    fn cell_box(&self, table: NodeId, cell: NodeId) -> ([f32; 4], [f32; 4], Option<Color>) {
+        let s = &self.styles[cell];
+        let pad = match self.attr_num(table, "cellpadding") {
+            Some(p) => [p; 4],
+            None => s.padding.map(|l| resolve(l, 0.0).unwrap_or(0.0).max(0.0)),
+        };
+        let mut bw = s.borders();
+        let mut color = None;
+        if bw.iter().all(|&w| w == 0.0) && self.html_border(table) > 0.0 {
+            bw = [1.0; 4];
+            color = Some(Color { r: 128, g: 128, b: 128 });
+        }
+        (pad, bw, color)
+    }
+
+    /// (min, max, percentage) outer width of a cell.
+    fn cell_widths(&self, table: NodeId, cell: NodeId) -> (f32, f32, Option<f32>) {
+        let (pad, bw, _) = self.cell_box(table, cell);
+        let extras = pad[1] + pad[3] + bw[1] + bw[3];
+        let (cmin, cmax) = self.content_widths(cell);
+        let (min, mut max) = (cmin + extras, cmax + extras);
+        let mut pct = None;
+        match self.styles[cell].width {
+            Length::Px(w) => max = (w.max(0.0) + extras).max(min),
+            Length::Pct(p) => pct = Some(p.clamp(0.0, 100.0)),
+            Length::Auto => {}
+        }
+        (min, max.max(min), pct)
+    }
+
+    fn build_table(&self, id: NodeId) -> TableModel {
+        let mut row_ids: Vec<(NodeId, Option<NodeId>)> = vec![];
+        let mut captions = vec![];
+        for c in self.flow_children(id) {
+            match self.styles[c].display {
+                Display::TableRow => row_ids.push((c, None)),
+                Display::TableRowGroup => {
+                    for r in self.flow_children(c) {
+                        if self.styles[r].display == Display::TableRow {
+                            row_ids.push((r, Some(c)));
+                        }
+                    }
+                }
+                Display::Block if self.dom.tag(c) == Some("caption") => captions.push(c),
+                _ => {}
+            }
+        }
+        let spacing = self.table_spacing(id);
+        let mut rows = vec![];
+        let mut ncols = 0;
+        for (r, group) in row_ids {
+            let (mut col, mut cells) = (0, vec![]);
+            for cc in self.flow_children(r) {
+                if self.styles[cc].display != Display::TableCell {
+                    continue;
+                }
+                if col >= MAX_COLS {
+                    break;
+                }
+                let span = self.colspan(cc).min(MAX_COLS - col);
+                cells.push(Cell { id: cc, col, span });
+                col += span;
+            }
+            ncols = ncols.max(col);
+            rows.push(RowInfo { id: r, group, cells });
+        }
+
+        let (mut min, mut max, mut pct) = (vec![0.0f32; ncols], vec![0.0f32; ncols], vec![None; ncols]);
+        // single-column cells set the baseline; spanning cells then top up what they need
+        for pass in 0..2 {
+            for row in &rows {
+                for cell in &row.cells {
+                    if (pass == 0) != (cell.span == 1) {
+                        continue;
+                    }
+                    let (cmin, cmax, cpct) = self.cell_widths(id, cell.id);
+                    let c = cell.col;
+                    if cell.span == 1 {
+                        min[c] = min[c].max(cmin);
+                        max[c] = max[c].max(cmax);
+                        if let Some(p) = cpct {
+                            pct[c] = Some(pct[c].map_or(p, |q: f32| q.max(p)));
+                        }
+                    } else {
+                        let gaps = spacing * (cell.span as f32 - 1.0);
+                        for (need, cols) in [(cmin, &mut min), (cmax, &mut max)] {
+                            let need = (need - gaps).max(0.0);
+                            let have: f32 = cols[c..c + cell.span].iter().sum();
+                            if need > have {
+                                let extra = (need - have) / cell.span as f32;
+                                for v in &mut cols[c..c + cell.span] {
+                                    *v += extra;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for i in 0..ncols {
+            max[i] = max[i].max(min[i]);
+        }
+
+        let s = &self.styles[id];
+        let html_border = self.html_border(id);
+        let mut bw = s.borders();
+        if bw.iter().all(|&w| w == 0.0) && html_border > 0.0 {
+            bw = [html_border; 4];
+        }
+        TableModel { rows, captions, min, max, pct, spacing, bw, html_border: html_border > 0.0 }
+    }
+
+    /// (min, max) outer width of a whole table.
+    fn table_widths(&self, id: NodeId) -> (f32, f32) {
+        let m = self.build_table(id);
+        let chrome = m.spacing * (m.min.len() as f32 + 1.0) + m.bw[1] + m.bw[3];
+        let (mut min, mut max) = (m.min.iter().sum::<f32>() + chrome, m.max.iter().sum::<f32>() + chrome);
+        if let Length::Px(w) = self.styles[id].width {
+            min = min.max(w);
+            max = min;
+        }
+        (min, max.max(min))
+    }
+
+    /// Lay out one cell as a box of outer width `outer_w` at (x, y).
+    fn layout_cell(&mut self, table: NodeId, id: NodeId, x: f32, y: f32, outer_w: f32) -> CellOut {
+        let styles = self.styles;
+        let s = &styles[id];
+        let (pad, bw, color) = self.cell_box(table, id);
+        let content_w = (outer_w - pad[1] - pad[3] - bw[1] - bw[3]).max(0.0);
+        let bg_slot = self.items.len();
+        self.items.push(Item::Nop);
+        let (content_start, links_start) = (self.items.len(), self.links.len());
+
+        let (end_y, last_mb) = self.layout_children(id, x + bw[3] + pad[3], y + bw[0] + pad[0], content_w, false);
+        let content = (content_start, self.items.len());
+        let links = (links_start, self.links.len());
+
+        // a cell is its own formatting context: its last margin stays inside it
+        let inner_h = (end_y + last_mb) - (y + bw[0] + pad[0]);
+        let mut height = inner_h + pad[0] + pad[2] + bw[0] + bw[2];
+        if let Some(h) = s.height {
+            height = height.max(h + pad[0] + pad[2] + bw[0] + bw[2]);
+        }
+        let decor = self.emit_decor(s, bg_slot, x, y, outer_w, y + height, bw, color);
+        CellOut { height, decor, content, links }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn layout_table(
+        &mut self,
+        id: NodeId,
+        left: f32,
+        cursor: f32,
+        prev_mb: f32,
+        avail: f32,
+        top_collapsed: bool,
+        parent: NodeId,
+    ) -> (f32, f32) {
+        let styles = self.styles;
+        let s = &styles[id];
+        let mt = resolve(s.margin[0], avail).unwrap_or(0.0);
+        let mb = resolve(s.margin[2], avail).unwrap_or(0.0);
+        let (ml_opt, mr_opt) = (resolve(s.margin[3], avail), resolve(s.margin[1], avail));
+
+        let model = self.build_table(id);
+        if model.rows.is_empty() && model.captions.is_empty() {
+            let merged = if top_collapsed { mb } else { collapse(prev_mb, collapse(mt, mb)) };
+            return (cursor, merged);
+        }
+        let n = model.min.len();
+        let (spacing, bw) = (model.spacing, model.bw);
+        let chrome = spacing * (n as f32 + 1.0) + bw[1] + bw[3];
+        let (min_w, max_w) = (model.min.iter().sum::<f32>() + chrome, model.max.iter().sum::<f32>() + chrome);
+
+        // Table width: an explicit width (never below the min-content), otherwise
+        // shrink-to-fit: as wide as the contents want, but no wider than the space.
+        let pref = resolve(s.width, avail);
+        let mut table_w = match pref {
+            Some(w) => w.max(min_w),
+            None => max_w.min(avail).max(min_w),
+        };
+        if let Some(mw) = s.max_width {
+            table_w = table_w.min(mw.max(min_w));
+        }
+        let widths = distribute(&model.min, &model.max, &model.pct, (table_w - chrome).max(0.0));
+        let table_w = widths.iter().sum::<f32>() + chrome;
+
+        // Horizontal position: auto margins, the legacy `align` attribute, or a <center> parent.
+        let free = (avail - table_w).max(0.0);
+        let ml = match (ml_opt, mr_opt) {
+            (None, None) => free / 2.0,
+            (None, Some(r)) => (free - r).max(0.0),
+            (Some(l), _) if l != 0.0 => l,
+            _ => match self.dom.attr(id, "align").map(|a| a.trim().to_ascii_lowercase()).as_deref() {
+                Some("center") => free / 2.0,
+                Some("right") => free,
+                _ if self.dom.tag(parent) == Some("center") => free / 2.0,
+                _ => ml_opt.unwrap_or(0.0),
+            },
+        };
+        let bx = left + ml;
+        let top = if top_collapsed { cursor } else { cursor + collapse(prev_mb, mt) };
+        let bg_slot = self.items.len();
+        self.items.push(Item::Nop);
+
+        let content_x = bx + bw[3];
+        let mut y = top + bw[0];
+        for cap in &model.captions {
+            y = self.layout_block(*cap, bx, y, 0.0, table_w, None, true).0;
+        }
+
+        let mut y_row = y + spacing;
+        for row in &model.rows {
+            let rs = &styles[row.id];
+            let row_start = self.items.len();
+            let mut outs: Vec<(CellOut, f32, f32)> = vec![];
+            let mut row_h = 0.0f32;
+            for cell in &row.cells {
+                let x = content_x + spacing + widths[..cell.col].iter().sum::<f32>() + spacing * cell.col as f32;
+                let w = widths[cell.col..cell.col + cell.span].iter().sum::<f32>() + spacing * (cell.span as f32 - 1.0);
+                let out = self.layout_cell(id, cell.id, x, y_row, w);
+                row_h = row_h.max(out.height);
+                outs.push((out, x, w));
+            }
+            if let Some(h) = rs.height {
+                row_h = row_h.max(h);
+            }
+            for (cell, (out, _, _)) in row.cells.iter().zip(&outs) {
+                let va = styles[cell.id]
+                    .valign
+                    .or(rs.valign)
+                    .or(row.group.and_then(|g| styles[g].valign))
+                    .unwrap_or(VAlign::Middle);
+                let dy = match va {
+                    VAlign::Top => 0.0,
+                    VAlign::Middle => (row_h - out.height) / 2.0,
+                    VAlign::Bottom => row_h - out.height,
+                };
+                if dy != 0.0 {
+                    self.shift(out.content, out.links, dy);
+                }
+                self.stretch_decor(&out.decor, y_row + row_h);
+            }
+            // a row's own background sits behind its cells
+            if let (Some(color), Some(first), Some(last)) = (rs.background, outs.first(), outs.last()) {
+                let (x0, x1) = (first.1, last.1 + last.2);
+                self.items.insert(row_start, Item::Rect { x: x0, y: y_row, w: x1 - x0, h: row_h, color });
+            }
+            y_row += row_h + spacing;
+        }
+
+        let bottom = y_row + bw[2];
+        let color = if model.html_border { Some(Color { r: 128, g: 128, b: 128 }) } else { None };
+        self.emit_decor(s, bg_slot, bx, top, table_w, bottom, bw, color);
+        (bottom, mb)
+    }
 }
 
 #[cfg(test)]
@@ -659,19 +1182,32 @@ mod tests {
     use crate::page::Page;
     use url::Url;
 
-    fn render(body: &str) -> Page {
+    fn render_w(body: &str, width: f32) -> Page {
         let fonts = Fonts::load();
         let src = format!("<style>body{{margin:0}}</style>{body}");
         let mut p = Page::from_source(&Url::parse("file:///tmp/t.html").unwrap(), &src);
-        p.relayout(&fonts, 400.0);
+        p.relayout(&fonts, width);
         p
     }
 
-    fn texts(p: &Page) -> Vec<(String, f32)> {
+    fn render(body: &str) -> Page {
+        render_w(body, 400.0)
+    }
+
+    fn texts_full(p: &Page) -> Vec<(String, f32, f32)> {
         p.layout.items.iter().filter_map(|i| match i {
-            Item::Text { text, baseline, .. } => Some((text.clone(), *baseline)),
+            Item::Text { text, x, baseline, .. } => Some((text.clone(), *x, *baseline)),
             _ => None,
         }).collect()
+    }
+
+    fn texts(p: &Page) -> Vec<(String, f32)> {
+        texts_full(p).into_iter().map(|(t, _, b)| (t, b)).collect()
+    }
+
+    fn at(p: &Page, word: &str) -> (f32, f32) {
+        let (_, x, b) = texts_full(p).into_iter().find(|(t, _, _)| t == word).unwrap_or_else(|| panic!("no text {word}"));
+        (x, b)
     }
 
     fn rects(p: &Page) -> Vec<(f32, f32, f32, f32, Color)> {
@@ -680,6 +1216,8 @@ mod tests {
             _ => None,
         }).collect()
     }
+
+    const RED: Color = Color { r: 255, g: 0, b: 0 };
 
     #[test]
     fn blocks_inside_inline_elements_keep_their_boxes() {
@@ -713,7 +1251,7 @@ mod tests {
              <div style='margin:20px 0'></div>\
              <div style='height:20px;margin-top:20px;background:red'></div>",
         );
-        let red = rects(&p).into_iter().find(|r| r.4 == Color { r: 255, g: 0, b: 0 }).unwrap();
+        let red = rects(&p).into_iter().find(|r| r.4 == RED).unwrap();
         // 20 (grey) + one collapsed 20px gap = 40; it used to be 60
         assert_eq!(red.1, 40.0);
         // an empty <p> between paragraphs adds no extra space beyond one margin
@@ -791,5 +1329,172 @@ mod tests {
         let body = format!("{}text{}", "<span><div>".repeat(n), "</div></span>".repeat(n));
         let p = render(&body);
         assert!(texts(&p).iter().any(|(s, _)| s == "text"));
+    }
+
+    // ---------------------------------------------------------------- tables
+
+    #[test]
+    fn a_table_lays_cells_out_in_columns_and_rows() {
+        let p = render("<table><tr><td>one</td><td>two</td></tr><tr><td>three</td><td>four</td></tr></table>");
+        let (one, two, three, four) = (at(&p, "one"), at(&p, "two"), at(&p, "three"), at(&p, "four"));
+        assert_eq!(one.1, two.1, "cells of a row share a baseline");
+        assert_eq!(three.1, four.1);
+        assert!(three.1 > one.1 + 10.0, "the second row is below the first");
+        assert!(two.0 > one.0 + 10.0, "the second column is to the right");
+        assert!((one.0 - three.0).abs() < 0.01 && (two.0 - four.0).abs() < 0.01, "columns line up");
+        assert!(two.0 < 150.0, "an auto-width table is shrink-to-fit, not full width");
+    }
+
+    #[test]
+    fn column_widths_follow_content_and_table_width() {
+        // 100% width: the wordy column gets the extra space, the short one stays narrow
+        let p = render("<table width=100%><tr><td>a</td><td>a much longer cell of text that wants room</td></tr></table>");
+        let long = at(&p, "much");
+        assert!(long.0 < 80.0, "the short column stays narrow (long cell starts at {})", long.0);
+        // a table in a narrow container wraps text but never goes below the longest word
+        let p = render_w("<table><tr><td>supercalifragilistic and more words</td></tr></table>", 50.0);
+        let r = rects(&render_w("<table style='background:red'><tr><td>supercalifragilistic and more words</td></tr></table>", 50.0));
+        let table = r.iter().find(|r| r.4 == RED).unwrap();
+        assert!(table.2 > 100.0, "min-content (the long word) wins over a 50px container: {}", table.2);
+        assert!(texts(&p).len() >= 4);
+        // fixed column widths from the legacy width attribute
+        let p = render("<table><tr><td width=200>x</td><td>y</td></tr></table>");
+        assert!(at(&p, "y").0 > 200.0);
+        // percentage columns
+        let p = render_w("<table width=100%><tr><td width=75%>x</td><td>y</td></tr></table>", 400.0);
+        assert!((at(&p, "y").0 - 300.0).abs() < 8.0, "75% column puts the next at ~300, got {}", at(&p, "y").0);
+    }
+
+    #[test]
+    fn colspan_cells_span_columns() {
+        let p = render("<table width=300 style='border-spacing:0'><tr><td colspan=2 align=center>HEAD</td></tr><tr><td>left</td><td>right</td></tr></table>");
+        let (head, left) = (at(&p, "HEAD"), at(&p, "left"));
+        // centred across both columns: the ~44px-wide word starts near 150 - 22
+        assert!(head.0 > left.0 + 20.0 && (head.0 - 128.0).abs() < 12.0, "heading at {head:?}, left cell at {left:?}");
+        // a colspan wider than the table's columns still gets the room it needs
+        let p = render("<table><tr><td colspan=2>a quite long heading spanning both</td></tr><tr><td>x</td><td>y</td></tr></table>");
+        assert!(at(&p, "y").0 > 20.0);
+    }
+
+    #[test]
+    fn cell_backgrounds_and_borders_stretch_to_the_row_height() {
+        let p = render("<table style='border-spacing:0'><tr><td style='background:red;padding:0'>a</td><td style='padding:0'>b<br>b<br>b</td></tr></table>");
+        let red = rects(&p).into_iter().find(|r| r.4 == RED).unwrap();
+        let tall = at(&p, "b");
+        let (_, last_b) = texts(&p).into_iter().filter(|(t, _)| t == "b").last().unwrap();
+        assert!(red.3 > (last_b - tall.1), "red covers the whole three-line row: h={} span={}", red.3, last_b - tall.1);
+        // legacy border attribute draws a border box around every cell
+        let p = render("<table border=1><tr><td>a</td><td>b</td></tr></table>");
+        let borders = rects(&p).len();
+        assert!(borders >= 4 + 2 * 4, "table + 2 cells have borders: {borders}");
+    }
+
+    #[test]
+    fn cells_are_vertically_centred_unless_told_otherwise() {
+        let tall = "<td>t<br>t<br>t</td>";
+        let mid = render(&format!("<table><tr><td>m</td>{tall}</tr></table>"));
+        let top = render(&format!("<table><tr valign=top><td>m</td>{tall}</tr></table>"));
+        let bottom = render(&format!("<table><tr><td valign=bottom>m</td>{tall}</tr></table>"));
+        let first_t = |p: &Page| texts(p).into_iter().find(|(t, _)| t == "t").unwrap().1;
+        let m = |p: &Page| at(p, "m").1;
+        assert_eq!(m(&top), first_t(&top), "valign=top aligns with the first line");
+        assert!(m(&mid) > first_t(&mid) + 5.0, "middle sits lower than the first line");
+        assert!(m(&bottom) > m(&mid), "bottom sits lowest");
+        let css = render(&format!("<table><tr><td style='vertical-align:top'>m</td>{tall}</tr></table>"));
+        assert_eq!(m(&css), first_t(&css));
+    }
+
+    #[test]
+    fn captions_row_backgrounds_cellspacing_and_centering() {
+        let p = render("<table><caption>Title</caption><tr><td>cell</td></tr></table>");
+        assert!(at(&p, "Title").1 < at(&p, "cell").1, "the caption is above the rows");
+        // a row's bgcolor paints one rect behind its cells
+        let p = render("<table><tr bgcolor=red><td>a</td><td>b</td></tr></table>");
+        let red = rects(&p).into_iter().find(|r| r.4 == RED).expect("row background");
+        assert!(red.2 > 20.0);
+        // cellspacing and cellpadding attributes
+        let tight = render("<table cellspacing=0 cellpadding=0><tr><td>x</td></tr></table>");
+        let loose = render("<table cellspacing=10 cellpadding=10><tr><td>x</td></tr></table>");
+        assert!(loose.layout.height > tight.layout.height + 30.0);
+        assert!(at(&loose, "x").0 > at(&tight, "x").0 + 15.0);
+        // <center> and align=center centre a shrink-to-fit table
+        let c = render("<center><table><tr><td>mid</td></tr></table></center>");
+        assert!(at(&c, "mid").0 > 150.0, "centred in 400px: {}", at(&c, "mid").0);
+        let a = render("<table align=center><tr><td>mid</td></tr></table>");
+        assert!(at(&a, "mid").0 > 150.0);
+        let left = render("<table><tr><td>mid</td></tr></table>");
+        assert!(at(&left, "mid").0 < 20.0);
+    }
+
+    #[test]
+    fn nested_tables_lay_out_and_size_to_their_contents() {
+        let p = render("<table><tr><td><table><tr><td>in</td><td>ner</td></tr></table></td><td>out</td></tr></table>");
+        let (inner, ner, out) = (at(&p, "in"), at(&p, "ner"), at(&p, "out"));
+        assert!(ner.0 > inner.0 && out.0 > ner.0, "inner then outer cells, left to right");
+        // deep nesting stays fast and doesn't overflow the stack
+        let n = 25;
+        let body = format!("{}deep{}", "<table><tr><td>".repeat(n), "</td></tr></table>".repeat(n));
+        let t = std::time::Instant::now();
+        let p = render(&body);
+        assert!(texts(&p).iter().any(|(s, _)| s == "deep"));
+        assert!(t.elapsed().as_secs() < 5);
+    }
+
+    #[test]
+    fn hostile_tables_do_not_panic_or_explode() {
+        for body in [
+            "<table></table>",
+            "<table><tr></tr><tr></tr></table>",
+            "<table><tr><td colspan=999999999>x</td><td>y</td></tr></table>",
+            "<table><tr><td colspan=0>x</td><td colspan=-3>y</td><td colspan=abc>z</td></tr></table>",
+            "<table style='width:-50px;border-spacing:99999px'><tr><td style='width:-5px;padding:-9px'>x</td></tr></table>",
+            "<table cellpadding=99999 cellspacing=99999 border=99999><tr><td>x</td></tr></table>",
+            "<table width=1%><tr><td>unbreakable_unbreakable_unbreakable</td></tr></table>",
+            "<table><td>cell with no row</td></table>",
+            "<table>stray text<tr><td>x</td></tr>more stray text</table>",
+            "<tr><td>row with no table</td></tr>",
+            "<table><tr><td><table></table></td></tr></table>",
+            "<div style='display:table-cell'>x</div><div style='display:table-row'>y</div>",
+        ] {
+            let p = render(body);
+            assert!(p.layout.height.is_finite(), "{body}");
+        }
+        // a wide table is capped at MAX_COLS columns
+        let cells = "<td>x</td>".repeat(MAX_COLS + 500);
+        let p = render(&format!("<table><tr>{cells}</tr></table>"));
+        assert!(p.layout.height.is_finite());
+        // many rows stay quick
+        let rows = "<tr><td>row</td><td>data</td></tr>".repeat(3000);
+        let t = std::time::Instant::now();
+        let p = render(&format!("<table>{rows}</table>"));
+        assert!(p.layout.height > 3000.0 * 10.0);
+        assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn distribute_shares_space_sensibly() {
+        // everything fits: extra space is shared in proportion to max-content
+        let w = distribute(&[10.0, 10.0], &[50.0, 150.0], &[None, None], 400.0);
+        assert!((w.iter().sum::<f32>() - 400.0).abs() < 0.01);
+        assert!(w[1] > w[0] * 2.5);
+        // too narrow: columns collapse to their minimums
+        assert_eq!(distribute(&[30.0, 40.0], &[100.0, 100.0], &[None, None], 10.0), vec![30.0, 40.0]);
+        // in between: each column is between its min and max
+        let w = distribute(&[10.0, 10.0], &[100.0, 100.0], &[None, None], 120.0);
+        assert!(w.iter().all(|&v| (10.0..=100.0).contains(&v)) && (w[0] + w[1] - 120.0).abs() < 0.01);
+        // percentages
+        let w = distribute(&[10.0, 10.0], &[50.0, 50.0], &[Some(25.0), None], 200.0);
+        assert_eq!((w[0], w[1]), (50.0, 150.0));
+        // no columns at all
+        assert!(distribute(&[], &[], &[], 100.0).is_empty());
+    }
+
+    #[test]
+    fn pages_with_tables_paint_without_panicking() {
+        use crate::paint::Painter;
+        let fonts = Fonts::load();
+        let p = render("<table border=1 width=100%><caption>c</caption><tr bgcolor=red><td>a</td><td rowspan=2>b</td></tr><tr><td>c</td></tr></table>");
+        let (w, h) = (400usize, 200usize);
+        Painter::default().paint(&mut vec![0; w * h], w, h, &p.layout, &fonts, 0.0, 2.0);
     }
 }

@@ -1,4 +1,9 @@
 //! Resource loading for `file:`, `http:`, `https:` and `data:` URLs.
+//!
+//! All network requests go through one shared agent, which keeps a cookie jar
+//! for the life of the process: cookies are stored per host and path, sent back
+//! on later requests (including from the loader's worker threads), honour
+//! `Max-Age`/`Expires`, and are never written to disk.
 use std::io::Read;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -277,11 +282,21 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
 
     /// Serve one canned response per connection on a free local port.
     fn serve(responses: Vec<String>) -> (u16, std::thread::JoinHandle<()>) {
+        let (port, _heads, handle) = serve_recording(responses);
+        (port, handle)
+    }
+
+    /// Like `serve`, but also records the raw head of every request it receives
+    /// (lower-cased), so tests can check which headers the browser sent.
+    fn serve_recording(responses: Vec<String>) -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let seen_heads = heads.clone();
         let handle = std::thread::spawn(move || {
             for resp in responses {
                 let (mut sock, _) = listener.accept().unwrap();
@@ -294,10 +309,11 @@ mod tests {
                     }
                     seen.extend_from_slice(&buf[..n]);
                 }
+                seen_heads.lock().unwrap().push(String::from_utf8_lossy(&seen).to_ascii_lowercase());
                 sock.write_all(resp.as_bytes()).unwrap();
             }
         });
-        (port, handle)
+        (port, heads, handle)
     }
 
     fn http(status: &str, headers: &str, body: &str) -> String {
@@ -352,6 +368,89 @@ mod tests {
         assert!(fetch(&Url::parse("ftp://example.com/x").unwrap()).is_err());
         assert!(fetch(&Url::parse("mailto:a@b.c").unwrap()).is_err());
         assert!(fetch(&Url::parse("file:///definitely/not/here.html").unwrap()).is_err());
+    }
+
+    // ---------- cookies ----------
+    //
+    // The cookie jar is process-global, so tests running in parallel share it:
+    // each test uses its own cookie names, and assertions look for that
+    // test's `name=value` pair rather than the whole `Cookie:` header.
+
+    #[test]
+    fn cookies_set_by_a_response_are_sent_back_on_later_requests() {
+        let (port, heads, h) = serve_recording(vec![
+            http("200 OK", "Set-Cookie: rt_sid=abc123; Path=/\r\nContent-Type: text/plain\r\n", "logged in"),
+            http("200 OK", "Content-Type: text/plain\r\n", "next"),
+        ]);
+        let base = format!("http://127.0.0.1:{port}");
+        fetch(&Url::parse(&format!("{base}/login")).unwrap()).unwrap();
+        fetch(&Url::parse(&format!("{base}/account")).unwrap()).unwrap();
+        h.join().unwrap();
+        let heads = heads.lock().unwrap();
+        assert!(!heads[0].contains("rt_sid"), "no cookie before the server set one");
+        assert!(heads[1].contains("rt_sid=abc123"), "the cookie came back: {}", heads[1]);
+    }
+
+    #[test]
+    fn cookies_are_not_sent_to_other_hosts_or_other_paths() {
+        // set on 127.0.0.1 under /admin only
+        let (port, _heads, h) = serve_recording(vec![http("200 OK", "Set-Cookie: iso_ck=secret; Path=/admin\r\n", "set")]);
+        fetch(&Url::parse(&format!("http://127.0.0.1:{port}/admin/login")).unwrap()).unwrap();
+        h.join().unwrap();
+        // a different path on the same host
+        let (p2, heads2, h2) = serve_recording(vec![http("200 OK", "", "x"), http("200 OK", "", "x")]);
+        // (a second server on 127.0.0.1 shares the host, cookies aren't port-scoped)
+        fetch(&Url::parse(&format!("http://127.0.0.1:{p2}/admin/panel")).unwrap()).unwrap();
+        fetch(&Url::parse(&format!("http://127.0.0.1:{p2}/public")).unwrap()).unwrap();
+        h2.join().unwrap();
+        let heads2 = heads2.lock().unwrap();
+        assert!(heads2[0].contains("iso_ck=secret"), "path /admin matches: {}", heads2[0]);
+        assert!(!heads2[1].contains("iso_ck"), "path /public must not get it: {}", heads2[1]);
+        // a different host name entirely (localhost is not 127.0.0.1 to a cookie jar)
+        let (p3, heads3, h3) = serve_recording(vec![http("200 OK", "", "x")]);
+        fetch(&Url::parse(&format!("http://localhost:{p3}/admin/panel")).unwrap()).unwrap();
+        h3.join().unwrap();
+        assert!(!heads3.lock().unwrap()[0].contains("iso_ck"), "cookies are per host");
+    }
+
+    #[test]
+    fn expired_and_deleted_cookies_are_not_sent() {
+        let (port, heads, h) = serve_recording(vec![
+            http("200 OK", "Set-Cookie: exp_ck=1; Path=/\r\n", "set"),
+            http("200 OK", "", "check"),
+            http("200 OK", "Set-Cookie: exp_ck=; Path=/; Max-Age=0\r\n", "delete"),
+            http("200 OK", "", "check again"),
+        ]);
+        let get = |p: &str| fetch(&Url::parse(&format!("http://127.0.0.1:{port}{p}")).unwrap()).unwrap();
+        get("/a");
+        get("/b");
+        get("/c");
+        get("/d");
+        h.join().unwrap();
+        let heads = heads.lock().unwrap();
+        assert!(heads[1].contains("exp_ck=1"), "sent while valid");
+        assert!(!heads[3].contains("exp_ck"), "Max-Age=0 removes it: {}", heads[3]);
+    }
+
+    #[test]
+    fn the_cookie_jar_is_shared_between_threads_and_survives_redirects() {
+        // login sets a cookie then redirects; the redirect target (and a request from
+        // another thread, as the loader's workers make) must carry it
+        let (port, heads, h) = serve_recording(vec![
+            http("302 Found", "Set-Cookie: thr_ck=T; Path=/\r\nLocation: /home\r\n", ""),
+            http("200 OK", "Content-Type: text/plain\r\n", "home"),
+            http("200 OK", "Content-Type: text/plain\r\n", "other thread"),
+        ]);
+        let base = format!("http://127.0.0.1:{port}");
+        let f = fetch(&Url::parse(&format!("{base}/login")).unwrap()).unwrap();
+        assert_eq!(f.body, b"home");
+        let url = Url::parse(&format!("{base}/data")).unwrap();
+        std::thread::spawn(move || fetch(&url).unwrap()).join().unwrap();
+        h.join().unwrap();
+        let heads = heads.lock().unwrap();
+        // (request heads are lower-cased by the recorder, hence `thr_ck=t`)
+        assert!(heads[1].contains("thr_ck=t"), "redirect target carries the cookie: {}", heads[1]);
+        assert!(heads[2].contains("thr_ck=t"), "other threads share the jar: {}", heads[2]);
     }
 
     #[test]

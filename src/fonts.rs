@@ -21,6 +21,22 @@ impl Face {
     }
 }
 
+/// Zero-width and formatting characters that must take no space and draw
+/// nothing (the fonts have no glyph for them, so they would show as boxes or,
+/// for the soft hyphen, as a visible "-"). Layout and paint must both skip
+/// exactly these so measured and drawn widths agree.
+pub fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{AD}'
+            | '\u{FEFF}'
+    )
+}
+
 pub struct Fonts {
     fonts: Vec<Font>,
 }
@@ -55,7 +71,7 @@ impl Fonts {
 
     pub fn measure(&self, face: Face, size: f32, text: &str) -> f32 {
         let font = self.font(face);
-        text.chars().map(|c| font.metrics(c, size).advance_width).sum()
+        text.chars().filter(|c| !invisible(*c)).map(|c| font.metrics(c, size).advance_width).sum()
     }
 
     /// (ascent, descent) in pixels; descent includes line gap so
@@ -65,5 +81,21 @@ impl Fonts {
             Some(m) => (m.ascent, m.new_line_size - m.ascent),
             None => (size * 0.9, size * 0.3),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invisible_characters_take_no_space() {
+        let fonts = Fonts::load();
+        let face = Face { family: Family::Sans, bold: false, italic: false };
+        let plain = fonts.measure(face, 20.0, "ab");
+        for s in ["a\u{200B}b", "a\u{200D}b", "a\u{FE0F}b", "a\u{AD}b", "\u{FEFF}ab\u{200E}"] {
+            assert_eq!(fonts.measure(face, 20.0, s), plain, "{s:?}");
+        }
+        assert!(fonts.measure(face, 20.0, "a\u{00A0}b") > plain, "nbsp is a real space");
     }
 }

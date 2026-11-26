@@ -3,7 +3,7 @@
 use crate::css::{self, Rule};
 use crate::dom::{Dom, Kind, NodeId};
 use crate::fonts::Fonts;
-use crate::forms::FormState;
+use crate::forms::{self, FormState};
 use crate::html;
 use crate::images::{self, Image};
 use crate::layout::{self, Layout};
@@ -101,11 +101,12 @@ fn is_stylesheet_link(rel: Option<&str>) -> bool {
     tokens.iter().any(|t| t == "stylesheet") && !tokens.iter().any(|t| t == "alternate")
 }
 
-/// Fetch many URLs with a small pool of worker threads that pull from a shared
-/// queue, so one slow server only ever stalls one worker. No new request is
-/// started after `deadline`, and bodies stop being kept once `MAX_FETCHED_BYTES`
-/// is reached. Results are keyed by the URL string requested; failures are absent.
-fn fetch_parallel(urls: Vec<Url>, deadline: Duration) -> HashMap<String, Fetched> {
+/// Fetch many subresources of the page at `top` with a small pool of worker
+/// threads that pull from a shared queue, so one slow server only ever stalls
+/// one worker. No new request is started after `deadline`, and bodies stop being
+/// kept once `MAX_FETCHED_BYTES` is reached. Results are keyed by the URL string
+/// requested; failures are absent. Cross-site requests carry no cookies.
+fn fetch_parallel(urls: Vec<Url>, top: &Url, deadline: Duration) -> HashMap<String, Fetched> {
     let started = Instant::now();
     let next = AtomicUsize::new(0);
     let total = AtomicU64::new(0);
@@ -118,7 +119,7 @@ fn fetch_parallel(urls: Vec<Url>, deadline: Duration) -> HashMap<String, Fetched
                 }
                 let Some(u) = urls.get(next.fetch_add(1, Ordering::SeqCst)) else { break };
                 // a panic in one fetch must not take the whole page load down
-                let Ok(Ok(f)) = std::panic::catch_unwind(|| net::fetch(u)) else { continue };
+                let Ok(Ok(f)) = std::panic::catch_unwind(|| net::fetch_subresource(u, top)) else { continue };
                 let len = f.body.len() as u64;
                 if total.fetch_add(len, Ordering::SeqCst) + len > MAX_FETCHED_BYTES {
                     continue;
@@ -280,7 +281,7 @@ impl Page {
         }
 
         // Pass 2: fetch everything at once.
-        let mut fetched = fetch_parallel(to_fetch, SUBRESOURCE_DEADLINE);
+        let mut fetched = fetch_parallel(to_fetch, url, SUBRESOURCE_DEADLINE);
 
         // Stylesheets in cascade order: user agent, then document order.
         let mut rules: Vec<Rule> = vec![];
@@ -327,8 +328,9 @@ impl Page {
         self.layout = layout::layout_document(&self.dom, &self.styles, fonts, &self.images, &self.form, width);
     }
 
-    /// The form control under layout position `(x, y)`, if any. Later controls
-    /// win over earlier ones where they overlap.
+    /// The enabled form control under layout position `(x, y)`, if any. Later
+    /// controls win over earlier ones where they overlap. Disabled controls can't
+    /// be clicked, focused or hovered.
     pub fn control_at(&self, x: f32, y: f32) -> Option<NodeId> {
         self.layout
             .controls
@@ -336,6 +338,7 @@ impl Page {
             .rev()
             .find(|c| x >= c.x && x <= c.x + c.w && y >= c.y && y <= c.y + c.h)
             .map(|c| c.node)
+            .filter(|&id| !forms::is_disabled(&self.dom, id))
     }
 
     /// Type text into control `id` (the page's DOM and its form state live in
@@ -765,21 +768,22 @@ mod tests {
 
     #[test]
     fn parallel_fetching_is_bounded_and_survives_failures() {
+        let top = Url::parse("http://127.0.0.1/").unwrap();
         // many unreachable URLs finish quickly and yield nothing
         let dead = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let urls: Vec<Url> = (0..60).map(|i| Url::parse(&format!("http://127.0.0.1:{dead}/{i}")).unwrap()).collect();
         let t = Instant::now();
-        assert!(fetch_parallel(urls.clone(), Duration::from_secs(30)).is_empty());
+        assert!(fetch_parallel(urls.clone(), &top, Duration::from_secs(30)).is_empty());
         assert!(t.elapsed().as_secs() < 10);
         // a deadline of zero starts no requests at all
         let (port, server) = serve_routes(vec![("/x", "text/plain", b"hi".to_vec())], 0);
         let u = Url::parse(&format!("http://127.0.0.1:{port}/x")).unwrap();
-        assert!(fetch_parallel(vec![u; 5], Duration::ZERO).is_empty());
+        assert!(fetch_parallel(vec![u; 5], &top, Duration::ZERO).is_empty());
         server.join().unwrap();
         // results from a live server are keyed by the requested URL
         let (port, server) = serve_routes(vec![("/a", "text/plain", b"A".to_vec()), ("/b", "text/plain", b"B".to_vec())], 2);
         let (a, b) = (Url::parse(&format!("http://127.0.0.1:{port}/a")).unwrap(), Url::parse(&format!("http://127.0.0.1:{port}/b")).unwrap());
-        let got = fetch_parallel(vec![a.clone(), b.clone()], Duration::from_secs(30));
+        let got = fetch_parallel(vec![a.clone(), b.clone()], &top, Duration::from_secs(30));
         server.join().unwrap();
         assert_eq!(got[a.as_str()].body, b"A");
         assert_eq!(got[b.as_str()].body, b"B");
@@ -819,6 +823,18 @@ mod tests {
         assert_eq!(p.control_at(-5.0, -5.0), None);
         assert!(b.x > a.x + a.w + 1.0, "there is a gap to click in");
         assert_eq!(p.control_at(a.x + a.w + 0.5 * (b.x - a.x - a.w), a.y + 2.0), None, "the gap between two inputs");
+    }
+
+    #[test]
+    fn disabled_controls_cannot_be_clicked() {
+        // a disabled submit button used to submit the form anyway
+        let p = render("<style>body{margin:0}</style><form><input name=a disabled> <button disabled>Go</button> <input name=b></form>", 400.0);
+        assert_eq!(p.layout.controls.len(), 3);
+        for c in &p.layout.controls[..2] {
+            assert_eq!(p.control_at(c.x + 2.0, c.y + 2.0), None);
+        }
+        let b = &p.layout.controls[2];
+        assert_eq!(p.control_at(b.x + 2.0, b.y + 2.0), Some(b.node));
     }
 
     #[test]

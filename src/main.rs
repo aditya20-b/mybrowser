@@ -1,4 +1,5 @@
 mod chrome;
+mod cookies;
 mod css;
 mod dom;
 mod fonts;
@@ -516,8 +517,20 @@ impl App {
         self.request_redraw();
     }
 
+    /// Move keyboard focus to the address bar. A page field can't keep focus at
+    /// the same time (typing would otherwise go back to it once the bar is left).
+    fn focus_address_bar(&mut self) {
+        if self.page.form.focus.take().is_some() {
+            self.form_changed();
+        }
+        self.bar.focus();
+    }
+
     /// A click landed on control `id`.
     fn activate_control(&mut self, id: NodeId) {
+        if forms::is_disabled(&self.page.dom, id) {
+            return;
+        }
         let kind = forms::kind_of(&self.page.dom, id);
         let Page { dom, form, .. } = &mut self.page;
         match kind {
@@ -565,6 +578,14 @@ impl App {
         let kind = forms::kind_of(&self.page.dom, id);
         let text_like = kind.is_some_and(forms::is_text_like);
         let shift = self.modifiers.shift_key();
+        // Holding Enter or Space must not toggle a box or navigate over and over.
+        if event.repeat
+            && matches!(event.logical_key, Key::Named(NamedKey::Enter | NamedKey::Space))
+            && !matches!(kind, Some(ControlKind::Textarea))
+            && !matches!(event.logical_key, Key::Named(NamedKey::Space) if text_like)
+        {
+            return true;
+        }
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => {
                 self.page.form.focus = None;
@@ -641,7 +662,7 @@ impl App {
                     if self.bar.is_focused() {
                         self.bar.click_again();
                     } else {
-                        self.bar.focus();
+                        self.focus_address_bar();
                     }
                 }
                 None => {}
@@ -727,7 +748,7 @@ impl App {
         let alt_or_cmd = self.modifiers.alt_key() || self.modifiers.super_key();
         match &event.logical_key {
             Key::Character(c) if cmd => match c.as_str().to_ascii_lowercase().as_str() {
-                "l" => self.bar.focus(),
+                "l" => self.focus_address_bar(),
                 "r" => self.reload(),
                 "[" => self.go_back(),
                 "]" => self.go_forward(),

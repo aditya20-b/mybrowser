@@ -1,9 +1,10 @@
 //! Resource loading for `file:`, `http:`, `https:` and `data:` URLs.
 //!
-//! All network requests go through one shared agent, which keeps a cookie jar
-//! for the life of the process: cookies are stored per host and path, sent back
-//! on later requests (including from the loader's worker threads), honour
-//! `Max-Age`/`Expires`, and are never written to disk.
+//! All network requests go through one shared agent and the process-wide cookie
+//! jar in `cookies.rs`. Redirects are followed here, by hand, so that cookies set
+//! by a redirecting response are stored and sent on the next hop, and so that a
+//! redirect can never lead anywhere but http(s).
+use crate::cookies;
 use std::io::Read;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -11,6 +12,9 @@ use url::Url;
 
 /// Largest response body we will read (pages, stylesheets, images).
 pub const MAX_BODY: u64 = 32 * 1024 * 1024;
+
+/// Redirects followed before giving up.
+const MAX_REDIRECTS: usize = 10;
 
 pub struct Fetched {
     /// The final URL, after any redirects.
@@ -24,10 +28,22 @@ pub struct Fetched {
 
 const ACCEPT: &str = "text/html,application/xhtml+xml,text/css,image/png,*/*;q=0.8";
 
+/// Load a top-level document (what the user navigated to).
 pub fn fetch(url: &Url) -> Result<Fetched, String> {
+    fetch_in(url, None)
+}
+
+/// Load a subresource (stylesheet, image) of the page at `top`. Where it comes
+/// from a different site than the page, no cookies are sent or stored: a
+/// tracking pixel on another domain can't recognise you.
+pub fn fetch_subresource(url: &Url, top: &Url) -> Result<Fetched, String> {
+    fetch_in(url, Some(top))
+}
+
+fn fetch_in(url: &Url, top: Option<&Url>) -> Result<Fetched, String> {
     match url.scheme() {
         "file" => fetch_file(url),
-        "http" | "https" => fetch_http(url),
+        "http" | "https" => fetch_http(url, top),
         "data" => fetch_data(url),
         other => Err(format!("unsupported URL scheme '{other}:'")),
     }
@@ -72,7 +88,9 @@ fn agent() -> &'static ureq::Agent {
     AGENT.get_or_init(|| {
         ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(20)))
-            .max_redirects(10)
+            // Redirects are followed by `fetch_http` (see the module docs).
+            .max_redirects(0)
+            .max_redirects_will_error(false)
             .user_agent("Mozilla/5.0 (compatible; mybrowser/0.1)")
             // An HTTP error status still has a body worth showing (404 pages etc.).
             .http_status_as_error(false)
@@ -81,26 +99,52 @@ fn agent() -> &'static ureq::Agent {
     })
 }
 
-fn fetch_http(url: &Url) -> Result<Fetched, String> {
-    use ureq::ResponseExt;
-    let mut resp = agent()
-        .get(url.as_str())
-        .header("Accept", ACCEPT)
-        .header("Accept-Language", "en")
-        .call()
-        .map_err(|e| format!("{url}: {e}"))?;
-    let final_url = Url::parse(&resp.get_uri().to_string()).unwrap_or_else(|_| url.clone());
-    let status = resp.status().as_u16();
-    let content_type = resp.body().mime_type().unwrap_or("").to_ascii_lowercase();
-    let charset = resp.body().charset().map(|c| c.to_ascii_lowercase());
-    let body = resp
-        .body_mut()
-        .with_config()
-        .limit(MAX_BODY)
-        .read_to_vec()
-        .map_err(|e| format!("reading {url}: {e}"))?;
-    let content_type = if content_type.is_empty() { sniff(&body).to_string() } else { content_type };
-    Ok(Fetched { url: final_url, status, content_type, charset, body })
+fn fetch_http(start: &Url, top: Option<&Url>) -> Result<Fetched, String> {
+    let mut url = start.clone();
+    for _ in 0..=MAX_REDIRECTS {
+        // Each hop is judged on its own: a redirect to another site loses the cookies.
+        let use_cookies = top.is_none_or(|t| cookies::same_site(t, &url));
+        let mut req = agent().get(url.as_str()).header("Accept", ACCEPT).header("Accept-Language", "en");
+        if use_cookies {
+            if let Some(header) = cookies::global().header_for(&url) {
+                req = req.header("Cookie", header);
+            }
+        }
+        let mut resp = req.call().map_err(|e| format!("{url}: {e}"))?;
+        if use_cookies {
+            let sets: Vec<String> =
+                resp.headers().get_all("set-cookie").into_iter().filter_map(|v| v.to_str().ok()).map(String::from).collect();
+            if !sets.is_empty() {
+                let mut jar = cookies::global();
+                for s in &sets {
+                    jar.accept(&url, s);
+                }
+            }
+        }
+        let status = resp.status();
+        if status.is_redirection() {
+            let location = resp.headers().get("location").and_then(|v| v.to_str().ok()).map(String::from);
+            if let Some(loc) = location {
+                let next = url.join(loc.trim()).map_err(|e| format!("{url}: bad redirect '{loc}': {e}"))?;
+                if !matches!(next.scheme(), "http" | "https") {
+                    return Err(format!("{url}: refusing to follow a redirect to {}:", next.scheme()));
+                }
+                url = next;
+                continue;
+            }
+        }
+        let content_type = resp.body().mime_type().unwrap_or("").to_ascii_lowercase();
+        let charset = resp.body().charset().map(|c| c.to_ascii_lowercase());
+        let body = resp
+            .body_mut()
+            .with_config()
+            .limit(MAX_BODY)
+            .read_to_vec()
+            .map_err(|e| format!("reading {url}: {e}"))?;
+        let content_type = if content_type.is_empty() { sniff(&body).to_string() } else { content_type };
+        return Ok(Fetched { url, status: status.as_u16(), content_type, charset, body });
+    }
+    Err(format!("{start}: too many redirects"))
 }
 
 fn fetch_data(url: &Url) -> Result<Fetched, String> {
@@ -344,6 +388,23 @@ mod tests {
     }
 
     #[test]
+    fn a_redirect_loop_gives_up_instead_of_spinning() {
+        let loops: Vec<String> = (0..=MAX_REDIRECTS).map(|_| http("302 Found", "Location: /again\r\n", "")).collect();
+        let (port, h) = serve(loops);
+        let r = fetch(&Url::parse(&format!("http://127.0.0.1:{port}/again")).unwrap());
+        h.join().unwrap();
+        assert!(r.err().is_some_and(|e| e.contains("too many redirects")));
+    }
+
+    #[test]
+    fn a_redirect_status_without_a_location_is_just_a_response() {
+        let (port, h) = serve(vec![http("302 Found", "Content-Type: text/plain\r\n", "stay here")]);
+        let f = fetch(&Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap()).unwrap();
+        h.join().unwrap();
+        assert_eq!((f.status, f.body.as_slice()), (302, &b"stay here"[..]));
+    }
+
+    #[test]
     fn http_error_statuses_still_deliver_their_body() {
         let (port, h) = serve(vec![http("404 Not Found", "Content-Type: text/html\r\n", "<h1>nope</h1>")]);
         let f = fetch(&Url::parse(&format!("http://127.0.0.1:{port}/missing")).unwrap()).unwrap();
@@ -354,10 +415,12 @@ mod tests {
 
     #[test]
     fn redirects_to_local_files_are_not_followed_into_file_urls() {
-        let (port, h) = serve(vec![http("302 Found", "Location: file:///etc/hosts\r\n", "")]);
-        let r = fetch(&Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap());
-        h.join().unwrap();
-        assert!(r.is_err(), "http must never redirect into file:");
+        for target in ["file:///etc/hosts", "data:text/plain,hi", "ftp://example.com/x"] {
+            let (port, h) = serve(vec![http("302 Found", &format!("Location: {target}\r\n"), "")]);
+            let r = fetch(&Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap());
+            h.join().unwrap();
+            assert!(r.is_err(), "http must never redirect into {target}");
+        }
     }
 
     #[test]
@@ -451,6 +514,37 @@ mod tests {
         // (request heads are lower-cased by the recorder, hence `thr_ck=t`)
         assert!(heads[1].contains("thr_ck=t"), "redirect target carries the cookie: {}", heads[1]);
         assert!(heads[2].contains("thr_ck=t"), "other threads share the jar: {}", heads[2]);
+    }
+
+    #[test]
+    fn cross_site_subresources_neither_set_nor_receive_cookies() {
+        // The page is on 127.0.0.1; the "tracker" is localhost, a different site.
+        let page = Url::parse("http://127.0.0.1:1/index.html").unwrap();
+        let (port, heads, h) = serve_recording(vec![
+            http("200 OK", "Set-Cookie: tp_ck=track; Path=/\r\n", "pixel"),
+            http("200 OK", "", "later visit"),
+        ]);
+        let tracker = |p: &str| Url::parse(&format!("http://localhost:{port}{p}")).unwrap();
+        fetch_subresource(&tracker("/pixel.png"), &page).unwrap();
+        // visiting the tracker's own site afterwards must not find a cookie
+        fetch(&tracker("/home")).unwrap();
+        h.join().unwrap();
+        assert!(!heads.lock().unwrap()[1].contains("tp_ck"), "third-party Set-Cookie was stored");
+
+        // and a cookie the user already has for that site isn't sent along with the pixel
+        let (port2, heads2, h2) = serve_recording(vec![
+            http("200 OK", "Set-Cookie: fp_ck=mine; Path=/\r\n", "visit"),
+            http("200 OK", "", "pixel"),
+            http("200 OK", "", "same-site resource"),
+        ]);
+        let own = |p: &str| Url::parse(&format!("http://localhost:{port2}{p}")).unwrap();
+        fetch(&own("/visit")).unwrap();
+        fetch_subresource(&own("/pixel.png"), &page).unwrap();
+        fetch_subresource(&own("/style.css"), &own("/visit")).unwrap();
+        h2.join().unwrap();
+        let heads2 = heads2.lock().unwrap();
+        assert!(!heads2[1].contains("fp_ck"), "cookie leaked to a cross-site request: {}", heads2[1]);
+        assert!(heads2[2].contains("fp_ck=mine"), "same-site subresources keep their cookies: {}", heads2[2]);
     }
 
     #[test]

@@ -210,12 +210,71 @@ enum UserEvent {
     Loaded { ticket: u64, page: SendPage },
 }
 
+/// How a finished navigation changes the history stacks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Hist {
+    /// A new page: the one we leave goes on the back stack, forward is dropped.
+    Push,
+    /// Back button: step one entry back.
+    Back,
+    /// Forward button: step one entry forward.
+    Forward,
+    /// Reload: history doesn't change.
+    Replace,
+}
+
+/// The back and forward stacks. They only change when a navigation *lands*, never
+/// when it starts, so a load that is cancelled or superseded can't lose or
+/// duplicate entries.
+#[derive(Default, Debug, PartialEq)]
+struct History {
+    back: Vec<Url>,
+    forward: Vec<Url>,
+}
+
+impl History {
+    /// The page the Back / Forward button would go to.
+    fn back_target(&self) -> Option<&Url> {
+        self.back.last()
+    }
+
+    fn forward_target(&self) -> Option<&Url> {
+        self.forward.last()
+    }
+
+    /// A navigation finished: `from` is the page that was on screen, `landed` the
+    /// page that replaced it (after any redirects).
+    fn apply(&mut self, how: Hist, from: Url, landed: &Url) {
+        match how {
+            Hist::Push => {
+                // Landing on the very page we left (a redirect back to it, or a link to
+                // the current URL) is a replace, not a new entry.
+                if &from != landed {
+                    self.back.push(from);
+                    self.forward.clear();
+                }
+            }
+            Hist::Back => {
+                self.back.pop();
+                self.forward.push(from);
+            }
+            Hist::Forward => {
+                self.forward.pop();
+                self.back.push(from);
+            }
+            Hist::Replace => {}
+        }
+    }
+}
+
 /// A navigation that has started but not finished.
 #[derive(Debug, PartialEq)]
 struct Pending {
     ticket: u64,
-    /// Push the page we're leaving onto the back stack when this lands.
-    record: bool,
+    /// What is being loaded.
+    url: Url,
+    hist: Hist,
+    /// The page on screen when this started (the one a successful load replaces).
     from: Url,
     /// Restore this scroll offset when it lands (reload keeps your place).
     keep_scroll: Option<f32>,
@@ -231,9 +290,9 @@ struct Navigation {
 }
 
 impl Navigation {
-    fn start(&mut self, from: Url, record: bool, keep_scroll: Option<f32>) -> u64 {
+    fn start(&mut self, from: Url, url: Url, hist: Hist, keep_scroll: Option<f32>) -> u64 {
         self.ticket += 1;
-        self.pending = Some(Pending { ticket: self.ticket, record, from, keep_scroll });
+        self.pending = Some(Pending { ticket: self.ticket, url, hist, from, keep_scroll });
         self.ticket
     }
 
@@ -248,6 +307,10 @@ impl Navigation {
         self.pending.take().is_some()
     }
 
+    fn pending(&self) -> Option<&Pending> {
+        self.pending.as_ref()
+    }
+
     fn is_loading(&self) -> bool {
         self.pending.is_some()
     }
@@ -259,8 +322,7 @@ struct App {
     page: Page,
     bar: AddressBar,
     cwd: std::path::PathBuf,
-    back: Vec<Url>,
-    forward: Vec<Url>,
+    history: History,
     nav: Navigation,
     proxy: EventLoopProxy<UserEvent>,
     scroll: f32,
@@ -277,11 +339,11 @@ impl App {
         let page = Page::from_source(&start, "<p style='color:#666'>Loading…</p>");
         let bar = AddressBar::new(start.as_str());
         let mut app = App {
-            fonts, painter: Painter::default(), page, bar, cwd, back: vec![], forward: vec![],
+            fonts, painter: Painter::default(), page, bar, cwd, history: History::default(),
             nav: Navigation::default(), proxy, scroll: 0.0, laid_out_width: -1.0, cursor: (0.0, 0.0),
             hover: None, modifiers: ModifiersState::empty(), window: None, surface: None,
         };
-        app.begin_load(start, false, None);
+        app.begin_load(start, Hist::Replace, None);
         app
     }
 
@@ -353,16 +415,19 @@ impl App {
 
     /// Start loading `url` on a background thread. The current page stays on
     /// screen and responsive until the new one arrives; starting another load (or
-    /// pressing Escape) abandons this one.
-    fn begin_load(&mut self, url: Url, record: bool, keep_scroll: Option<f32>) {
-        let ticket = self.nav.start(self.page.url.clone(), record, keep_scroll);
+    /// pressing Escape) abandons this one. The history stacks are only touched
+    /// when the load lands (see `finish_load`).
+    fn begin_load(&mut self, url: Url, hist: Hist, keep_scroll: Option<f32>) {
+        let ticket = self.nav.start(self.page.url.clone(), url.clone(), hist, keep_scroll);
         self.bar.show(url.as_str());
         self.set_title();
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            // A panic while loading must still end the "Loading…" state.
+            // A panic while loading must still end the "Loading…" state, even if
+            // building the error page itself panics.
             let page = std::panic::catch_unwind(|| Page::load(&url))
-                .unwrap_or_else(|_| Page::error(&url, "internal error while loading this page"));
+                .or_else(|_| std::panic::catch_unwind(|| Page::error(&url, "internal error while loading this page")))
+                .unwrap_or_else(|_| Page::from_source(&url, "<p>Could not load this page.</p>"));
             let _ = proxy.send_event(UserEvent::Loaded { ticket, page: SendPage(page) });
         });
         self.request_redraw();
@@ -371,10 +436,7 @@ impl App {
     /// A loader thread delivered a page.
     fn finish_load(&mut self, ticket: u64, page: Page) {
         let Some(pending) = self.nav.finish(ticket) else { return }; // superseded or cancelled
-        if pending.record {
-            self.back.push(pending.from);
-            self.forward.clear();
-        }
+        self.history.apply(pending.hist, pending.from, &page.url);
         self.page = page;
         self.bar.show(self.page.url.as_str()); // the final URL, after redirects
         self.laid_out_width = -1.0; // force relayout on the next redraw
@@ -394,26 +456,31 @@ impl App {
         }
     }
 
-    fn open(&mut self, url: Url, record: bool) {
-        self.begin_load(url, record, None);
+    fn open(&mut self, url: Url) {
+        self.begin_load(url, Hist::Push, None);
     }
 
+    /// Reload. While a navigation is loading, that navigation is restarted (not
+    /// silently replaced by a reload of the page underneath it).
     fn reload(&mut self) {
-        let (url, keep) = (self.page.url.clone(), self.scroll);
-        self.begin_load(url, false, Some(keep));
+        if let Some(p) = self.nav.pending() {
+            let (url, hist) = (p.url.clone(), p.hist);
+            self.begin_load(url, hist, None);
+        } else {
+            let (url, keep) = (self.page.url.clone(), self.scroll);
+            self.begin_load(url, Hist::Replace, Some(keep));
+        }
     }
 
     fn go_back(&mut self) {
-        if let Some(prev) = self.back.pop() {
-            self.forward.push(self.page.url.clone());
-            self.open(prev, false);
+        if let Some(prev) = self.history.back_target().cloned() {
+            self.begin_load(prev, Hist::Back, None);
         }
     }
 
     fn go_forward(&mut self) {
-        if let Some(next) = self.forward.pop() {
-            self.back.push(self.page.url.clone());
-            self.open(next, false);
+        if let Some(next) = self.history.forward_target().cloned() {
+            self.begin_load(next, Hist::Forward, None);
         }
     }
 
@@ -421,7 +488,7 @@ impl App {
         match resolve_link(&self.page.url, href) {
             Link::Nothing => {} // in-page anchors aren't scrolled to yet
             Link::External(url) => eprintln!("not supported (yet): {url}"),
-            Link::Navigate(url) => self.open(url, true),
+            Link::Navigate(url) => self.open(url),
         }
     }
 
@@ -435,8 +502,8 @@ impl App {
     fn commit_address(&mut self) {
         let typed = self.bar.submit_text().to_string();
         match url_from_input(&typed, &self.cwd) {
-            Ok(url) if url == self.page.url => self.reload(),
-            Ok(url) => self.open(url, true),
+            Ok(url) if url == self.page.url && !self.nav.is_loading() => self.reload(),
+            Ok(url) => self.open(url),
             Err(e) => self.bar.error = Some(e),
         }
     }
@@ -575,7 +642,11 @@ impl App {
         let pixels: &mut [u32] = &mut buffer;
         // The page is painted into the rows below the toolbar, then the toolbar on top.
         self.painter.paint(&mut pixels[top * w_px..], w_px, h_px - top, &self.page.layout, &self.fonts, self.scroll, scale);
-        let view = ChromeView { bar: &self.bar, can_back: !self.back.is_empty(), can_forward: !self.forward.is_empty() };
+        let view = ChromeView {
+            bar: &self.bar,
+            can_back: self.history.back_target().is_some(),
+            can_forward: self.history.forward_target().is_some(),
+        };
         self.painter.paint_chrome(pixels, w_px, h_px, &self.fonts, scale, &view);
         buffer.present().unwrap();
     }
@@ -734,16 +805,16 @@ mod tests {
     fn only_the_newest_navigation_may_complete() {
         let mut nav = Navigation::default();
         assert!(!nav.is_loading());
-        let first = nav.start(u("https://a.test/"), true, None);
+        let first = nav.start(u("https://home.test/"), u("https://a.test/"), Hist::Push, None);
         assert!(nav.is_loading());
         // the user clicks something else before the first load finishes
-        let second = nav.start(u("https://b.test/"), true, Some(42.0));
+        let second = nav.start(u("https://home.test/"), u("https://b.test/"), Hist::Push, Some(42.0));
         assert_ne!(first, second);
         // the slow first load arrives late: it must be ignored, and not disturb the second
         assert_eq!(nav.finish(first), None);
         assert!(nav.is_loading(), "the second navigation is still pending");
         let done = nav.finish(second).expect("the newest load completes");
-        assert_eq!((done.record, done.from, done.keep_scroll), (true, u("https://b.test/"), Some(42.0)));
+        assert_eq!((done.hist, done.url, done.keep_scroll), (Hist::Push, u("https://b.test/"), Some(42.0)));
         assert!(!nav.is_loading());
         // a duplicate delivery of the same ticket completes nothing
         assert_eq!(nav.finish(second), None);
@@ -753,13 +824,93 @@ mod tests {
     fn cancelling_invalidates_the_load_in_flight() {
         let mut nav = Navigation::default();
         assert!(!nav.cancel(), "nothing to cancel");
-        let t = nav.start(u("https://a.test/"), false, None);
+        let t = nav.start(u("https://home.test/"), u("https://a.test/"), Hist::Replace, None);
         assert!(nav.cancel());
         assert!(!nav.is_loading());
         assert_eq!(nav.finish(t), None, "a cancelled load that still arrives is dropped");
         // and a new navigation after a cancel works normally
-        let t2 = nav.start(u("https://c.test/"), true, None);
+        let t2 = nav.start(u("https://home.test/"), u("https://c.test/"), Hist::Push, None);
         assert!(nav.finish(t2).is_some());
+    }
+
+    // ---------- history ----------
+
+    /// The user is on C, having come from A then B.
+    fn on_c() -> (History, Url) {
+        let h = History { back: vec![u("https://a.test/"), u("https://b.test/")], forward: vec![] };
+        (h, u("https://c.test/"))
+    }
+
+    #[test]
+    fn a_cancelled_back_navigation_leaves_history_untouched() {
+        // Back used to pop the stack and push the forward stack the moment it was pressed,
+        // so cancelling lost B and left Forward pointing at the page you were already on.
+        let (history, c) = on_c();
+        let mut nav = Navigation::default();
+        let before = History { back: history.back.clone(), forward: history.forward.clone() };
+        let target = history.back_target().cloned().unwrap();
+        assert_eq!(target, u("https://b.test/"));
+        let t = nav.start(c, target, Hist::Back, None);
+        assert!(nav.cancel());
+        assert_eq!(nav.finish(t), None); // nothing lands, so nothing is applied
+        assert_eq!(history, before);
+    }
+
+    #[test]
+    fn back_then_link_click_keeps_the_pages_you_came_from() {
+        // back (starts), then click a link before it lands: the link wins, and B must survive
+        let (mut history, c) = on_c();
+        let mut nav = Navigation::default();
+        let _back = nav.start(c.clone(), u("https://b.test/"), Hist::Back, None);
+        let link = nav.start(c.clone(), u("https://d.test/"), Hist::Push, None);
+        let done = nav.finish(link).unwrap();
+        history.apply(done.hist, done.from, &u("https://d.test/"));
+        assert_eq!(history.back, [u("https://a.test/"), u("https://b.test/"), c]);
+        assert!(history.forward.is_empty());
+    }
+
+    #[test]
+    fn back_and_forward_move_one_step_when_they_land() {
+        let (mut history, c) = on_c();
+        history.apply(Hist::Back, c.clone(), &u("https://b.test/")); // now on B
+        assert_eq!((history.back.clone(), history.forward.clone()), (vec![u("https://a.test/")], vec![c.clone()]));
+        history.apply(Hist::Back, u("https://b.test/"), &u("https://a.test/")); // now on A
+        assert_eq!((history.back.len(), history.forward.len()), (0, 2));
+        assert_eq!(history.back_target(), None);
+        history.apply(Hist::Forward, u("https://a.test/"), &u("https://b.test/")); // forward to B
+        assert_eq!(history.back, [u("https://a.test/")]);
+        assert_eq!(history.forward_target(), Some(&c));
+        // a fresh navigation drops the forward stack
+        history.apply(Hist::Push, u("https://b.test/"), &u("https://z.test/"));
+        assert!(history.forward.is_empty());
+        assert_eq!(history.back, [u("https://a.test/"), u("https://b.test/")]);
+    }
+
+    #[test]
+    fn landing_on_the_page_you_left_is_a_replace_not_a_new_entry() {
+        // typing X when the page is X/final (X redirects there) used to push a duplicate each time
+        let mut history = History { back: vec![u("https://a.test/")], forward: vec![u("https://f.test/")] };
+        let here = u("https://x.test/final");
+        for _ in 0..3 {
+            history.apply(Hist::Push, here.clone(), &here);
+        }
+        assert_eq!(history.back, [u("https://a.test/")], "no duplicates");
+        assert_eq!(history.forward, [u("https://f.test/")], "forward survives a replace");
+        // and reload never changes history
+        history.apply(Hist::Replace, here.clone(), &here);
+        assert_eq!(history.back.len(), 1);
+    }
+
+    #[test]
+    fn reload_during_a_navigation_restarts_that_navigation() {
+        // the load being restarted is the pending one, with its original history behaviour
+        let mut nav = Navigation::default();
+        nav.start(u("https://home.test/"), u("https://b.test/"), Hist::Push, None);
+        let p = nav.pending().unwrap();
+        let (url, hist) = (p.url.clone(), p.hist);
+        assert_eq!((url.as_str(), hist), ("https://b.test/", Hist::Push));
+        nav.start(u("https://home.test/"), url, hist, None);
+        assert_eq!(nav.pending().unwrap().from, u("https://home.test/"), "still replacing the page on screen");
     }
 
     #[test]

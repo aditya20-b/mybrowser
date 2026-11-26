@@ -14,10 +14,13 @@ const RAW_TEXT: &[&str] = &["script", "style", "title", "textarea"];
 /// Opening one of these while a <p> is open implicitly closes the <p>.
 const CLOSES_P: &[&str] = &[
     "p", "div", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "table", "pre", "blockquote",
-    "hr", "li", "dl", "section", "article", "header", "footer", "nav", "form", "aside", "main",
+    "hr", "li", "dl", "dt", "dd", "section", "article", "header", "footer", "nav", "form",
+    "aside", "main", "fieldset", "address", "details", "figure", "figcaption", "center",
+    "menu", "summary", "hgroup",
 ];
 
 pub fn parse(src: &str) -> Dom {
+    let src = src.strip_prefix('\u{feff}').unwrap_or(src); // a byte-order mark is not content
     let mut dom = Dom::new();
     let mut stack: Vec<NodeId> = vec![0];
     let lower = src.to_ascii_lowercase(); // same byte offsets as `src`
@@ -29,18 +32,24 @@ pub fn parse(src: &str) -> Dom {
             i = rest.find("-->").map_or(src.len(), |e| i + e + 3);
             continue;
         }
-        if rest.starts_with("<!") {
+        // doctype, CDATA-ish `<!`, and `<?xml ...?>` are all skipped like bogus comments
+        if rest.starts_with("<!") || rest.starts_with("<?") {
             i = rest.find('>').map_or(src.len(), |e| i + e + 1);
             continue;
         }
         if rest.starts_with('<') {
-            if let Some(end) = tag_end(src, i) {
-                let inner = &src[i + 1..end];
-                i = end + 1;
-                handle_tag(&mut dom, &mut stack, inner, &lower, &mut i, src);
-                continue;
+            match scan_tag(src, i) {
+                Scan::Tag(end) => {
+                    let inner = &src[i + 1..end];
+                    i = end + 1;
+                    handle_tag(&mut dom, &mut stack, inner, &lower, &mut i, src);
+                    continue;
+                }
+                // Like HTML5: EOF inside a tag drops the tag. (Re-scanning from
+                // every later `<` instead would be quadratic on adversarial input.)
+                Scan::Eof => break,
+                Scan::NotATag => {} // stray '<': fall through and treat as text
             }
-            // stray '<': fall through and treat as text
         }
         // Skip the first *character* (not byte!) so a stray '<' or a multi-byte
         // char can't make us slice inside a UTF-8 sequence.
@@ -75,29 +84,103 @@ fn ensure_body(dom: &mut Dom, stack: &mut Vec<NodeId>) {
     }
 }
 
-/// If a real tag starts at `start` (`<` followed by a letter or `/letter`),
-/// return the index of its closing `>` (respecting quoted attribute values).
-fn tag_end(src: &str, start: usize) -> Option<usize> {
+enum Scan {
+    /// Index of the closing `>`.
+    Tag(usize),
+    /// A tag starts here but the input ends before it closes.
+    Eof,
+    /// `<` not followed by a letter or `/letter`: plain text.
+    NotATag,
+}
+
+/// Find the end of the tag starting at `start`. As in HTML5, a quote only
+/// opens a quoted attribute value when it directly follows `=` — so
+/// `<div class=don't>` is a normal tag.
+fn scan_tag(src: &str, start: usize) -> Scan {
     let b = src.as_bytes();
     let mut j = start + 1;
     if j < b.len() && b[j] == b'/' {
         j += 1;
     }
     if j >= b.len() || !b[j].is_ascii_alphabetic() {
-        return None;
+        return Scan::NotATag;
     }
     let mut quote: Option<u8> = None;
+    let mut last = 0u8; // last non-whitespace byte seen outside a quoted value
     while j < b.len() {
-        match (quote, b[j]) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), _) => {}
-            (None, b'"') | (None, b'\'') => quote = Some(b[j]),
-            (None, b'>') => return Some(j),
-            _ => {}
+        let c = b[j];
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                    last = c;
+                }
+            }
+            None => match c {
+                b'>' => return Scan::Tag(j),
+                b'"' | b'\'' if last == b'=' => quote = Some(c),
+                c if c.is_ascii_whitespace() => {}
+                _ => last = c,
+            },
         }
         j += 1;
     }
-    None
+    Scan::Eof
+}
+
+/// Pop the open-element stack back to (and including) the nearest element
+/// named in `targets`, unless an element in `stop` (a scope boundary) is hit first.
+fn pop_to(dom: &Dom, stack: &mut Vec<NodeId>, targets: &[&str], stop: &[&str]) {
+    for ix in (1..stack.len()).rev() {
+        let t = dom.tag(stack[ix]).unwrap_or("");
+        if targets.contains(&t) {
+            stack.truncate(ix);
+            return;
+        }
+        if stop.contains(&t) {
+            return;
+        }
+    }
+}
+
+/// Implied end tags: opening `tag` may implicitly close elements that are
+/// still open (an unclosed <p>, <li>, <td>, ...), however deep they are.
+fn close_implied(dom: &Dom, stack: &mut Vec<NodeId>, tag: &str) {
+    if CLOSES_P.contains(&tag) {
+        pop_to(dom, stack, &["p"], &["table", "td", "th", "caption", "button", "object"]);
+    }
+    match tag {
+        "li" => pop_to(dom, stack, &["li"], &["ul", "ol", "menu"]),
+        "dt" | "dd" => pop_to(dom, stack, &["dt", "dd"], &["dl"]),
+        "tr" => pop_to(dom, stack, &["tr"], &["table"]),
+        "td" | "th" => pop_to(dom, stack, &["td", "th"], &["tr", "table"]),
+        "thead" | "tbody" | "tfoot" => pop_to(dom, stack, &["thead", "tbody", "tfoot"], &["table"]),
+        "option" => pop_to(dom, stack, &["option"], &["select", "datalist"]),
+        "a" => pop_to(dom, stack, &["a"], &[]),
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            let top = dom.tag(*stack.last().unwrap()).unwrap_or("");
+            if matches!(top, "h1" | "h2" | "h3" | "h4" | "h5" | "h6") && stack.len() > 1 {
+                stack.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Byte offset of the `</tag` that ends a raw-text element (must be followed by
+/// whitespace, `/` or `>`, so `</scriptx>` doesn't count), or the end of input.
+fn find_end_tag(lower: &str, from: usize, tag: &str) -> usize {
+    let needle = format!("</{tag}");
+    let mut from = from;
+    while let Some(e) = lower[from..].find(&needle) {
+        let at = from + e;
+        match lower.as_bytes().get(at + needle.len()) {
+            None | Some(b'>') | Some(b'/') => return at,
+            Some(c) if c.is_ascii_whitespace() => return at,
+            _ => from = at + needle.len(),
+        }
+    }
+    lower.len()
 }
 
 fn handle_tag(
@@ -117,6 +200,24 @@ fn handle_tag(
     let attr_src = &body[name_len..];
 
     if closing {
+        match tag.as_str() {
+            // Browsers ignore these: anything after them still belongs to <body>.
+            "body" | "html" => return,
+            // `</br>` means `<br>`; a stray `</p>` makes an empty paragraph.
+            "br" => {
+                ensure_body(dom, stack);
+                let parent = *stack.last().unwrap();
+                dom.add(parent, Kind::Element { tag: "br".into(), attrs: HashMap::new() });
+                return;
+            }
+            "p" if !stack.iter().any(|&n| dom.tag(n) == Some("p")) => {
+                ensure_body(dom, stack);
+                let parent = *stack.last().unwrap();
+                dom.add(parent, Kind::Element { tag: "p".into(), attrs: HashMap::new() });
+                return;
+            }
+            _ => {}
+        }
         if let Some(idx) = stack.iter().rposition(|&n| dom.tag(n) == Some(tag.as_str())) {
             if idx > 0 {
                 stack.truncate(idx);
@@ -126,7 +227,9 @@ fn handle_tag(
     }
     if tag == "html" {
         if let Kind::Element { attrs, .. } = &mut dom.nodes[0].kind {
-            attrs.extend(parse_attrs(attr_src));
+            for (k, v) in parse_attrs(attr_src) {
+                attrs.entry(k).or_insert(v);
+            }
         }
         return;
     }
@@ -137,7 +240,9 @@ fn handle_tag(
         stack.truncate(1);
         if let Some(b) = body_of(dom) {
             if let Kind::Element { attrs, .. } = &mut dom.nodes[b].kind {
-                attrs.extend(parse_attrs(attr_src));
+                for (k, v) in parse_attrs(attr_src) {
+                    attrs.entry(k).or_insert(v);
+                }
             }
             stack.push(b);
             return;
@@ -146,27 +251,18 @@ fn handle_tag(
         ensure_body(dom, stack);
     }
 
-    // Implied end tags.
-    let top = dom.tag(*stack.last().unwrap()).unwrap_or("");
-    let pop = (top == "p" && CLOSES_P.contains(&tag.as_str()))
-        || (top == "li" && tag == "li")
-        || ((top == "dt" || top == "dd") && (tag == "dt" || tag == "dd"))
-        || (top == "tr" && tag == "tr")
-        || ((top == "td" || top == "th") && (tag == "td" || tag == "th" || tag == "tr"));
-    if pop && stack.len() > 1 {
-        stack.pop();
-    }
+    close_implied(dom, stack, &tag);
 
-    let self_closing = attr_src.trim_end().ends_with('/');
     let parent = *stack.last().unwrap();
     let id = dom.add(parent, Kind::Element { tag: tag.clone(), attrs: parse_attrs(attr_src) });
 
-    if VOID.contains(&tag.as_str()) || self_closing {
+    // Per HTML5 a trailing `/` only means something on void elements; `<div/>`
+    // is just an opening tag.
+    if VOID.contains(&tag.as_str()) {
         return;
     }
     if RAW_TEXT.contains(&tag.as_str()) {
-        let needle = format!("</{tag}");
-        let end = lower[*pos..].find(&needle).map_or(src.len(), |e| *pos + e);
+        let end = find_end_tag(lower, *pos, &tag);
         if end > *pos {
             let raw = &src[*pos..end];
             let text = if tag == "script" || tag == "style" { raw.to_string() } else { decode_entities(raw) };
@@ -225,7 +321,8 @@ fn parse_attrs(s: &str) -> HashMap<String, String> {
                 value = c[vs..i].iter().collect();
             }
         }
-        attrs.insert(name, decode_entities(&value));
+        // Duplicate attributes: the first one wins, as in browsers.
+        attrs.entry(name).or_insert_with(|| decode_entities(&value));
     }
     attrs
 }
@@ -239,12 +336,10 @@ pub fn decode_entities(s: &str) -> String {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         rest = &rest[amp..];
-        let semi = rest.find(';').filter(|&e| e <= 10);
-        let decoded = semi.and_then(|e| entity(&rest[1..e]).map(|c| (c, e)));
-        match decoded {
-            Some((c, e)) => {
+        match decode_one(rest) {
+            Some((c, consumed)) => {
                 out.push(c);
-                rest = &rest[e + 1..];
+                rest = &rest[consumed..];
             }
             None => {
                 out.push('&');
@@ -256,20 +351,57 @@ pub fn decode_entities(s: &str) -> String {
     out
 }
 
+/// Entities that browsers also decode without a trailing `;`.
+const LEGACY: &[(&str, char)] =
+    &[("amp", '&'), ("lt", '<'), ("gt", '>'), ("quot", '"'), ("nbsp", '\u{a0}'), ("copy", '©'), ("reg", '®')];
+
+/// Decode the entity at the start of `rest` (which begins with `&`).
+/// Returns the character and how many bytes it used. Only a small bounded
+/// window is searched for the `;`, so a long run of `&` stays linear.
+fn decode_one(rest: &str) -> Option<(char, usize)> {
+    let b = rest.as_bytes();
+    let window = &b[1..b.len().min(34)];
+    if let Some(semi) = window.iter().position(|&c| c == b';') {
+        if let Some(c) = entity(&rest[1..1 + semi]) {
+            return Some((c, semi + 2));
+        }
+    }
+    for (name, c) in LEGACY {
+        if rest[1..].starts_with(name) && !b.get(1 + name.len()).is_some_and(|n| n.is_ascii_alphanumeric()) {
+            return Some((*c, 1 + name.len()));
+        }
+    }
+    None
+}
+
 fn entity(name: &str) -> Option<char> {
     if let Some(num) = name.strip_prefix('#') {
-        let code = match num.strip_prefix(['x', 'X']) {
-            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-            None => num.parse().ok()?,
+        let (digits, radix) = match num.strip_prefix(['x', 'X']) {
+            Some(h) => (h, 16),
+            None => (num, 10),
         };
-        return char::from_u32(code);
+        // from_str_radix would also accept a leading '+', which browsers don't.
+        if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+            return None;
+        }
+        let code = u32::from_str_radix(digits, radix).unwrap_or(u32::MAX);
+        // NUL, surrogates and out-of-range values become U+FFFD, as in HTML5.
+        return Some(if code == 0 { '\u{FFFD}' } else { char::from_u32(code).unwrap_or('\u{FFFD}') });
     }
     Some(match name {
         "amp" => '&', "lt" => '<', "gt" => '>', "quot" => '"', "apos" => '\'',
-        "nbsp" => '\u{a0}', "copy" => '©', "reg" => '®', "mdash" => '—', "ndash" => '–',
-        "hellip" => '…', "lsquo" => '‘', "rsquo" => '’', "ldquo" => '“', "rdquo" => '”',
-        "bull" => '•', "middot" => '·', "laquo" => '«', "raquo" => '»', "times" => '×',
-        "rarr" => '→', "larr" => '←', "euro" => '€', "pound" => '£', "deg" => '°',
+        "nbsp" => '\u{a0}', "copy" => '©', "reg" => '®', "trade" => '™', "mdash" => '—',
+        "ndash" => '–', "hellip" => '…', "lsquo" => '‘', "rsquo" => '’', "ldquo" => '“',
+        "rdquo" => '”', "bull" => '•', "middot" => '·', "laquo" => '«', "raquo" => '»',
+        "times" => '×', "divide" => '÷', "rarr" => '→', "larr" => '←', "uarr" => '↑',
+        "darr" => '↓', "euro" => '€', "pound" => '£', "yen" => '¥', "cent" => '¢',
+        "deg" => '°', "plusmn" => '±', "frac12" => '½', "frac14" => '¼', "frac34" => '¾',
+        "sect" => '§', "para" => '¶', "dagger" => '†', "infin" => '∞', "ne" => '≠',
+        "le" => '≤', "ge" => '≥', "hearts" => '♥', "check" => '✓', "thinsp" => '\u{2009}',
+        "ensp" => '\u{2002}', "emsp" => '\u{2003}', "iexcl" => '¡', "iquest" => '¿',
+        "eacute" => 'é', "egrave" => 'è', "aacute" => 'á', "agrave" => 'à', "iacute" => 'í',
+        "oacute" => 'ó', "uacute" => 'ú', "ntilde" => 'ñ', "ccedil" => 'ç', "szlig" => 'ß',
+        "auml" => 'ä', "ouml" => 'ö', "uuml" => 'ü', "Auml" => 'Ä', "Ouml" => 'Ö', "Uuml" => 'Ü',
         _ => return None,
     })
 }
@@ -377,5 +509,106 @@ mod tests {
         assert_eq!(bodies, 1);
         assert_eq!(dom.attr(body(&dom), "class"), Some("x"));
         assert_eq!(dom.text_content(body(&dom)), "textmore");
+    }
+
+    // ---------- regressions from the adversarial review ----------
+
+    fn time_it(f: impl FnOnce()) -> std::time::Duration {
+        let t = std::time::Instant::now();
+        f();
+        t.elapsed()
+    }
+
+    #[test]
+    fn adversarial_inputs_are_linear_time() {
+        // These used to take 5-30s (quadratic).
+        for input in ["&".repeat(300_000), "&a".repeat(150_000), "<a ".repeat(100_000), "<a \"".repeat(80_000), "<div ".repeat(60_000)] {
+            let d = time_it(|| { parse(&input); });
+            assert!(d.as_secs_f32() < 2.0, "{:?} on {:?}...", d, &input[..6]);
+        }
+    }
+
+    #[test]
+    fn eof_inside_a_tag_drops_the_tag() {
+        let dom = parse("<p>kept</p><div class=\"never closed");
+        assert_eq!(dom.text_content(0), "kept");
+    }
+
+    #[test]
+    fn bom_and_xml_declaration_are_ignored() {
+        let dom = parse("\u{feff}<?xml version=\"1.0\"?><!doctype html><html><head><title>t</title></head><body><p>hi</p></body></html>");
+        assert_eq!(tags(&dom, 0), ["head", "body"]);
+        assert_eq!(dom.text_content(body(&dom)), "hi");
+    }
+
+    #[test]
+    fn implied_end_tags_close_through_nested_elements() {
+        // rows and cells become siblings
+        let dom = parse("<table><tr><td>a<tr><td>b</table>");
+        let table = dom.nodes[body(&dom)].children[0];
+        assert_eq!(tags(&dom, table), ["tr", "tr"]);
+        // <li><p> ... <li>
+        let dom = parse("<ul><li><p>a<li><p>b</ul>");
+        let ul = dom.nodes[body(&dom)].children[0];
+        assert_eq!(tags(&dom, ul), ["li", "li"]);
+        // a block closes an open <p> even with an inline element in between
+        let dom = parse("<p><b>x<div>y</div></b>");
+        assert_eq!(tags(&dom, body(&dom)), ["p", "div"]);
+        // headings and anchors don't nest
+        let dom = parse("<h1>a<h2>b");
+        assert_eq!(tags(&dom, body(&dom)), ["h1", "h2"]);
+        let dom = parse("<a href=1>x<a href=2>y");
+        assert_eq!(tags(&dom, body(&dom)), ["a", "a"]);
+        // but a nested list's <li> doesn't close the outer one
+        let dom = parse("<ul><li>a<ul><li>b</ul></ul>");
+        let ul = dom.nodes[body(&dom)].children[0];
+        assert_eq!(tags(&dom, ul), ["li"]);
+    }
+
+    #[test]
+    fn content_after_end_body_and_end_html_stays_in_body() {
+        let dom = parse("<body><p>a</p></body></html><p>after</p>text");
+        assert_eq!(tags(&dom, 0), ["body"]);
+        assert_eq!(tags(&dom, body(&dom)), ["p", "p"]);
+        assert_eq!(dom.text_content(body(&dom)), "aaftertext");
+    }
+
+    #[test]
+    fn trailing_slash_only_self_closes_void_elements() {
+        let dom = parse("<div/>after");
+        assert_eq!(dom.text_content(dom.nodes[body(&dom)].children[0]), "after");
+        let dom = parse("<script src=x/>y</script><p>z</p>");
+        assert_eq!(dom.text_content(body(&dom)), "z");
+        let dom = parse("<br/><img src=a.png/>");
+        assert_eq!(tags(&dom, body(&dom)), ["br", "img"]);
+    }
+
+    #[test]
+    fn quote_inside_unquoted_value_does_not_open_a_string() {
+        let dom = parse("<div class=don't>x</div><p>y</p>");
+        assert_eq!(tags(&dom, body(&dom)), ["div", "p"]);
+        let dom = parse("<a title = \"a > b\" href=x>t</a>");
+        assert_eq!(dom.text_content(body(&dom)), "t");
+    }
+
+    #[test]
+    fn entity_edge_cases() {
+        assert_eq!(decode_entities("&amp &copy &lt;b&gt"), "& © <b>");
+        assert_eq!(decode_entities("&copyright"), "&copyright"); // not a legacy match
+        assert_eq!(decode_entities("&#0;|&#xD800;|&#x110000;|&#99999999999;"), "\u{fffd}|\u{fffd}|\u{fffd}|\u{fffd}");
+        assert_eq!(decode_entities("&#x+41;|&#+65;|&#;|&#x;"), "&#x+41;|&#+65;|&#;|&#x;");
+        assert_eq!(decode_entities("&eacute;&trade;&hearts;"), "é™♥");
+    }
+
+    #[test]
+    fn nits_duplicate_attrs_br_end_tag_script_boundary() {
+        let dom = parse("<p class=a class=b>x</p>");
+        assert_eq!(dom.attr(dom.nodes[body(&dom)].children[0], "class"), Some("a"));
+        let dom = parse("a</br>b");
+        assert_eq!(tags(&dom, body(&dom)), ["br"]);
+        let dom = parse("</p>x");
+        assert_eq!(tags(&dom, body(&dom)), ["p"]);
+        let dom = parse("<script>var a = '</scriptx>';</script><p>z</p>");
+        assert_eq!(dom.text_content(dom.nodes[body(&dom)].children[0]), "z");
     }
 }

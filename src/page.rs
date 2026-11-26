@@ -63,7 +63,7 @@ impl Page {
 
         // Stylesheets in cascade order: user agent, then document order.
         let mut rules: Vec<Rule> = vec![];
-        css::parse_stylesheet(style::USER_AGENT_CSS, &mut rules);
+        css::parse_stylesheet_origin(style::USER_AGENT_CSS, &mut rules, true);
         let mut title = String::new();
         for id in 0..dom.nodes.len() {
             let Kind::Element { tag, .. } = &dom.nodes[id].kind else { continue };

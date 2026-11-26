@@ -127,7 +127,7 @@ impl<'a> Ctx<'a> {
         let s = &styles[id];
 
         let pad = s.padding.map(|l| resolve(l, avail).unwrap_or(0.0).max(0.0));
-        let bw = s.border_w;
+        let bw = s.borders();
         let mb = resolve(s.margin[2], avail).unwrap_or(0.0);
         let (ml_opt, mr_opt) = (resolve(s.margin[3], avail), resolve(s.margin[1], avail));
         let extras = pad[1] + pad[3] + bw[1] + bw[3];
@@ -201,18 +201,19 @@ impl<'a> Ctx<'a> {
         if let Some(color) = s.background {
             self.items[bg_slot] = Item::Rect { x: bx, y: top, w: border_w, h: bottom - top, color };
         }
-        let bc = |i: usize| s.border_c[i].unwrap_or(s.color);
-        if bw[0] > 0.0 {
-            self.items.push(Item::Rect { x: bx, y: top, w: border_w, h: bw[0], color: bc(0) });
+        // None = transparent border: it still takes space but draws nothing
+        let bc = |i: usize| match s.border_c[i] { None => Some(s.color), Some(c) => c };
+        if let (true, Some(color)) = (bw[0] > 0.0, bc(0)) {
+            self.items.push(Item::Rect { x: bx, y: top, w: border_w, h: bw[0], color });
         }
-        if bw[2] > 0.0 {
-            self.items.push(Item::Rect { x: bx, y: bottom - bw[2], w: border_w, h: bw[2], color: bc(2) });
+        if let (true, Some(color)) = (bw[2] > 0.0, bc(2)) {
+            self.items.push(Item::Rect { x: bx, y: bottom - bw[2], w: border_w, h: bw[2], color });
         }
-        if bw[3] > 0.0 {
-            self.items.push(Item::Rect { x: bx, y: top, w: bw[3], h: bottom - top, color: bc(3) });
+        if let (true, Some(color)) = (bw[3] > 0.0, bc(3)) {
+            self.items.push(Item::Rect { x: bx, y: top, w: bw[3], h: bottom - top, color });
         }
-        if bw[1] > 0.0 {
-            self.items.push(Item::Rect { x: bx + border_w - bw[1], y: top, w: bw[1], h: bottom - top, color: bc(1) });
+        if let (true, Some(color)) = (bw[1] > 0.0, bc(1)) {
+            self.items.push(Item::Rect { x: bx + border_w - bw[1], y: top, w: bw[1], h: bottom - top, color });
         }
         (bottom, eff_mb)
     }
@@ -277,7 +278,7 @@ impl<'a> Ctx<'a> {
         let s = &self.styles[id];
         let mt = resolve(s.margin[0], avail).unwrap_or(0.0);
         let pad_top = resolve(s.padding[0], avail).unwrap_or(0.0);
-        if pad_top + s.border_w[0] == 0.0 {
+        if pad_top + s.borders()[0] == 0.0 {
             if let Some(c) = self.first_block_child(id) {
                 return collapse(mt, self.collapsed_top(c, avail));
             }

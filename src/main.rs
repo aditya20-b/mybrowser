@@ -4,6 +4,7 @@ mod fonts;
 mod html;
 mod images;
 mod layout;
+mod net;
 mod page;
 mod paint;
 mod style;
@@ -12,16 +13,17 @@ use fonts::Fonts;
 use page::Page;
 use paint::Painter;
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
+use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
-const USAGE: &str = "usage: mybrowser [page.html]\n       mybrowser --screenshot OUT.png [--width PX] [--scale N] [page.html]";
+const USAGE: &str = "usage: mybrowser [URL or file]\n       mybrowser --screenshot OUT.png [--width PX] [--scale N] [URL or file]";
 
 fn die(msg: &str) -> ! {
     eprintln!("mybrowser: {msg}\n{USAGE}");
@@ -48,6 +50,41 @@ fn parse_number(name: &str, value: &str, min: f32, max: f32) -> Result<f32, Stri
     Ok(n)
 }
 
+/// Turn whatever the user typed (or passed on the command line) into a URL:
+/// a full http/https/file/data URL, an existing file path, or a bare host such
+/// as `example.com/page` (which gets `https://`, or `http://` for localhost).
+fn url_from_input(input: &str, cwd: &Path) -> Result<Url, String> {
+    let s = input.trim();
+    if s.is_empty() {
+        return Err("empty address".into());
+    }
+    if let Ok(u) = Url::parse(s) {
+        if matches!(u.scheme(), "http" | "https" | "file" | "data") {
+            return Ok(u);
+        }
+    }
+    let path = cwd.join(s);
+    if path.exists() {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        return Url::from_file_path(&path).map_err(|_| format!("bad path {}", path.display()));
+    }
+    // A bare host: must look like one (a dot or localhost, an optional numeric
+    // port, no credentials), so `mailto:a@b.c` is rejected instead of being
+    // misread as https://b.c with a username.
+    let authority = s.split(['/', '?', '#']).next().unwrap_or("");
+    let port_ok = authority.rsplit_once(':').is_none_or(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    let looks_like_host = !authority.contains('@')
+        && !authority.contains(' ')
+        && (authority.contains('.') || authority.starts_with("localhost"))
+        && port_ok;
+    if looks_like_host {
+        let local = authority.starts_with("localhost") || authority.starts_with("127.");
+        let scheme = if local { "http" } else { "https" };
+        return Url::parse(&format!("{scheme}://{s}")).map_err(|e| format!("{s}: {e}"));
+    }
+    Err(format!("'{s}' is not a URL or an existing file"))
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let screenshot = take_flag(&mut args, "--screenshot").unwrap_or_else(|e| die(&e));
@@ -62,24 +99,26 @@ fn main() {
     if let Some(unknown) = args.iter().find(|a| a.starts_with("--")) {
         die(&format!("unknown option {unknown}"));
     }
-    let path = PathBuf::from(args.first().map(|s| s.as_str()).unwrap_or("pages/index.html"));
+    let cwd = std::env::current_dir().unwrap_or_else(|e| die(&format!("cannot read the current directory: {e}")));
+    let start = url_from_input(args.first().map(|s| s.as_str()).unwrap_or("pages/index.html"), &cwd)
+        .unwrap_or_else(|e| die(&e));
 
     let fonts = Fonts::load();
     if let Some(out) = screenshot {
-        screenshot_to_png(&path, &fonts, width, scale, Path::new(&out));
+        screenshot_to_png(&start, &fonts, width, scale, Path::new(&out));
         return;
     }
 
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(fonts, path);
+    let mut app = App::new(fonts, start, cwd);
     event_loop.run_app(&mut app).unwrap();
 }
 
 /// Headless mode: render the whole page to a PNG (handy for testing).
-fn screenshot_to_png(path: &Path, fonts: &Fonts, width: f32, scale: f32, out: &Path) {
+fn screenshot_to_png(url: &Url, fonts: &Fonts, width: f32, scale: f32, out: &Path) {
     let t0 = std::time::Instant::now();
-    let mut page = Page::load(path);
+    let mut page = Page::load(url);
     let t_load = t0.elapsed();
     page.relayout(fonts, width);
     let t_layout = t0.elapsed() - t_load;
@@ -91,7 +130,7 @@ fn screenshot_to_png(path: &Path, fonts: &Fonts, width: f32, scale: f32, out: &P
     let mut buf = vec![0u32; w * h];
     Painter::default().paint(&mut buf, w, h, &page.layout, fonts, 0.0, scale);
     let t_paint = t0.elapsed() - t_load - t_layout;
-    eprintln!("parse+style {t_load:?}, layout {t_layout:?}, paint {t_paint:?}");
+    eprintln!("fetch+parse+style {t_load:?}, layout {t_layout:?}, paint {t_paint:?}");
     let rgb: Vec<u8> = buf.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8]).collect();
     let file = std::fs::File::create(out).unwrap_or_else(|e| {
         eprintln!("mybrowser: cannot create {}: {e}", out.display());
@@ -111,45 +150,63 @@ fn screenshot_to_png(path: &Path, fonts: &Fonts, width: f32, scale: f32, out: &P
 /// What a clicked `href` means.
 #[derive(Debug, PartialEq)]
 enum Link {
-    /// Nothing to do: empty href or an in-page `#anchor`.
+    /// Nothing to do: empty href, an in-page `#anchor`, or an unparseable URL.
     Nothing,
-    /// A scheme (`http:`, `mailto:`, `javascript:` ...) or `//host/...`: not supported.
+    /// A scheme we don't handle (`mailto:`, `javascript:`, `tel:`, ...) or
+    /// something a page isn't allowed to open (a web page linking to `file:`).
     External(String),
-    File(PathBuf),
+    Navigate(Url),
 }
 
-fn resolve_link(base_dir: &Path, href: &str) -> Link {
-    let target = href.split(['#', '?']).next().unwrap_or("").trim();
-    if target.is_empty() {
+fn strip_fragment(u: &Url) -> Url {
+    let mut u = u.clone();
+    u.set_fragment(None);
+    u
+}
+
+fn resolve_link(base: &Url, href: &str) -> Link {
+    let href = href.trim();
+    if href.is_empty() || href.starts_with('#') {
         return Link::Nothing;
     }
-    // A colon in the first path segment means a URL scheme, as in browsers.
-    let has_scheme = target.split('/').next().is_some_and(|seg| seg.contains(':'));
-    if has_scheme || target.starts_with("//") {
-        return Link::External(href.to_string());
+    let Ok(target) = base.join(href) else { return Link::Nothing };
+    match target.scheme() {
+        // web pages must not be able to send you to local files
+        "file" if matches!(base.scheme(), "http" | "https") => Link::External(target.to_string()),
+        "http" | "https" | "file" => {
+            if strip_fragment(&target) == strip_fragment(base) {
+                Link::Nothing // same document, different fragment: no reload
+            } else {
+                Link::Navigate(target)
+            }
+        }
+        _ => Link::External(target.to_string()),
     }
-    Link::File(base_dir.join(page::percent_decode(target)))
 }
 
 struct App {
     fonts: Fonts,
     painter: Painter,
     page: Page,
-    history: Vec<PathBuf>,
+    cwd: std::path::PathBuf,
+    back: Vec<Url>,
+    forward: Vec<Url>,
     scroll: f32,
     laid_out_width: f32,
     cursor: (f32, f32), // physical pixels
     hover: Option<String>,
+    modifiers: ModifiersState,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
 }
 
 impl App {
-    fn new(fonts: Fonts, path: PathBuf) -> App {
-        let page = Page::load(&path);
+    fn new(fonts: Fonts, start: Url, cwd: std::path::PathBuf) -> App {
+        let page = Page::load(&start);
         App {
-            fonts, painter: Painter::default(), page, history: vec![], scroll: 0.0,
-            laid_out_width: -1.0, cursor: (0.0, 0.0), hover: None, window: None, surface: None,
+            fonts, painter: Painter::default(), page, cwd, back: vec![], forward: vec![], scroll: 0.0,
+            laid_out_width: -1.0, cursor: (0.0, 0.0), hover: None, modifiers: ModifiersState::empty(),
+            window: None, surface: None,
         }
     }
 
@@ -185,35 +242,42 @@ impl App {
         }
     }
 
-    fn open(&mut self, path: PathBuf, push_history: bool) {
-        if push_history {
-            self.history.push(self.page.path.clone());
+    /// Load `url` into the current tab. `record` pushes the page we're leaving
+    /// onto the back stack (and drops the forward stack, as browsers do).
+    fn open(&mut self, url: Url, record: bool) {
+        if record {
+            self.back.push(self.page.url.clone());
+            self.forward.clear();
         }
-        self.page = Page::load(&path);
+        self.page = Page::load(&url);
         self.laid_out_width = -1.0; // force relayout on the next redraw
         self.scroll = 0.0;
         self.update_hover();
         if let Some(w) = &self.window {
-            w.set_title(&format!("{} — mybrowser", if self.page.title.is_empty() { "untitled" } else { &self.page.title }));
+            w.set_title(&format!("{} — mybrowser", self.page.display_title()));
             w.request_redraw();
         }
     }
 
+    fn go_back(&mut self) {
+        if let Some(prev) = self.back.pop() {
+            self.forward.push(self.page.url.clone());
+            self.open(prev, false);
+        }
+    }
+
+    fn go_forward(&mut self) {
+        if let Some(next) = self.forward.pop() {
+            self.back.push(self.page.url.clone());
+            self.open(next, false);
+        }
+    }
+
     fn follow(&mut self, href: &str) {
-        let dir = self.page.path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        match resolve_link(&dir, href) {
-            Link::Nothing => {} // in-page anchors aren't supported yet
-            Link::External(url) => eprintln!("only local files are supported so far: {url}"),
-            Link::File(path) => {
-                if path == self.page.path {
-                    return; // already here: don't push a duplicate history entry
-                }
-                if !path.is_file() {
-                    eprintln!("no such file: {}", path.display());
-                    return; // keep the current page instead of replacing it with an error page
-                }
-                self.open(path, true);
-            }
+        match resolve_link(&self.page.url, href) {
+            Link::Nothing => {} // in-page anchors aren't scrolled to yet
+            Link::External(url) => eprintln!("not supported (yet): {url}"),
+            Link::Navigate(url) => self.open(url, true),
         }
     }
 
@@ -251,7 +315,7 @@ impl ApplicationHandler for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title(format!("{} — mybrowser", self.page.title))
+            .with_title(format!("{} — mybrowser", self.page.display_title()))
             .with_inner_size(LogicalSize::new(960.0, 720.0));
         let window = Rc::new(el.create_window(attrs).unwrap());
         let context = softbuffer::Context::new(window.clone()).unwrap();
@@ -268,6 +332,7 @@ impl ApplicationHandler for App {
                     w.request_redraw();
                 }
             }
+            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => -y * 48.0,
@@ -288,6 +353,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let page = self.view_height() * 0.9;
+                let alt_or_cmd = self.modifiers.alt_key() || self.modifiers.super_key();
                 match &event.logical_key {
                     Key::Named(NamedKey::ArrowDown) => self.scroll_by(48.0),
                     Key::Named(NamedKey::ArrowUp) => self.scroll_by(-48.0),
@@ -295,18 +361,19 @@ impl ApplicationHandler for App {
                     Key::Named(NamedKey::PageUp) => self.scroll_by(-page),
                     Key::Named(NamedKey::Home) => self.scroll_by(-1e9),
                     Key::Named(NamedKey::End) => self.scroll_by(1e9),
-                    Key::Named(NamedKey::Backspace) => {
-                        if let Some(prev) = self.history.pop() {
-                            self.open(prev, false);
-                        }
-                    }
+                    Key::Named(NamedKey::ArrowLeft) if alt_or_cmd => self.go_back(),
+                    Key::Named(NamedKey::ArrowRight) if alt_or_cmd => self.go_forward(),
+                    Key::Named(NamedKey::Backspace) if self.modifiers.shift_key() => self.go_forward(),
+                    Key::Named(NamedKey::Backspace) => self.go_back(),
                     Key::Character(c) if c.eq_ignore_ascii_case("r") => {
-                        let path = self.page.path.clone();
+                        let url = self.page.url.clone();
                         let keep = self.scroll;
-                        self.open(path, false);
+                        self.open(url, false);
                         self.scroll = keep; // clamped on the next redraw
                     }
-                    _ => {}
+                    _ => {
+                        let _ = &self.cwd; // used by the address bar
+                    }
                 }
             }
             _ => {}
@@ -320,6 +387,10 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn u(s: &str) -> Url {
+        Url::parse(s).unwrap()
     }
 
     #[test]
@@ -344,17 +415,49 @@ mod tests {
     }
 
     #[test]
+    fn address_parsing() {
+        let dir = std::env::temp_dir().join(format!("mybrowser-addr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("page.html"), "x").unwrap();
+        let go = |s: &str| url_from_input(s, &dir);
+
+        assert_eq!(go("https://example.com/a?b=1#c"), Ok(u("https://example.com/a?b=1#c")));
+        assert_eq!(go("  http://example.com  "), Ok(u("http://example.com/")));
+        assert_eq!(go("example.com/path"), Ok(u("https://example.com/path")));
+        assert_eq!(go("localhost:8080/x"), Ok(u("http://localhost:8080/x")));
+        assert_eq!(go("127.0.0.1:3000"), Ok(u("http://127.0.0.1:3000/")));
+        assert_eq!(go("data:text/html,hi"), Ok(u("data:text/html,hi")));
+        let file = go("page.html").unwrap();
+        assert_eq!(file.scheme(), "file");
+        assert!(file.path().ends_with("/page.html"));
+        assert_eq!(go(file.as_str()), Ok(file));
+
+        // things that are not addresses must not be navigated anywhere surprising
+        for bad in ["", "   ", "javascript:alert(1)", "mailto:a@b.c", "user:pw@evil.com", "ftp://x.com/y", "nosuchfile", "two words.com", "host:notaport.com"] {
+            assert!(go(bad).is_err(), "{bad:?} -> {:?}", go(bad));
+        }
+    }
+
+    #[test]
     fn link_resolution() {
-        let base = Path::new("/site/pages");
-        assert_eq!(resolve_link(base, "about.html"), Link::File("/site/pages/about.html".into()));
-        assert_eq!(resolve_link(base, "a%20b.html?x=1#top"), Link::File("/site/pages/a b.html".into()));
-        assert_eq!(resolve_link(base, "../up.html"), Link::File("/site/pages/../up.html".into()));
-        assert_eq!(resolve_link(base, "sub/dir:odd.html"), Link::File("/site/pages/sub/dir:odd.html".into()));
-        for nothing in ["", "#section", "  ", "?q=1"] {
-            assert_eq!(resolve_link(base, nothing), Link::Nothing, "{nothing:?}");
+        let page = u("https://example.com/dir/page.html?q=1");
+        assert_eq!(resolve_link(&page, "other.html"), Link::Navigate(u("https://example.com/dir/other.html")));
+        assert_eq!(resolve_link(&page, "../up.html#frag"), Link::Navigate(u("https://example.com/up.html#frag")));
+        assert_eq!(resolve_link(&page, "/root"), Link::Navigate(u("https://example.com/root")));
+        assert_eq!(resolve_link(&page, "//cdn.test/x"), Link::Navigate(u("https://cdn.test/x")));
+        assert_eq!(resolve_link(&page, "?q=2"), Link::Navigate(u("https://example.com/dir/page.html?q=2")));
+        assert_eq!(resolve_link(&page, "http://other.test/"), Link::Navigate(u("http://other.test/")));
+        // same document
+        for nothing in ["", "  ", "#section", "page.html?q=1#other"] {
+            assert_eq!(resolve_link(&page, nothing), Link::Nothing, "{nothing:?}");
         }
-        for external in ["https://example.com", "mailto:a@b.c", "javascript:void(0)", "tel:123", "file:///etc/passwd", "//host/x", "data:text/html,hi"] {
-            assert!(matches!(resolve_link(base, external), Link::External(_)), "{external}");
+        // schemes we don't handle, and web -> local file are refused
+        for external in ["mailto:a@b.c", "javascript:void(0)", "tel:123", "data:text/html,hi", "file:///etc/passwd", "ftp://x.test/y"] {
+            assert!(matches!(resolve_link(&page, external), Link::External(_)), "{external}");
         }
+        // local pages can link to local files, with percent-encoding handled by the URL parser
+        let local = u("file:///site/pages/index.html");
+        assert_eq!(resolve_link(&local, "a%20b.html?x=1#top"), Link::Navigate(u("file:///site/pages/a%20b.html?x=1#top")));
+        assert_eq!(resolve_link(&local, "file:///other.html"), Link::Navigate(u("file:///other.html")));
     }
 }

@@ -142,11 +142,15 @@ fn fill_rect(buf: &mut [u32], w: usize, h: usize, x0: i32, y0: i32, x1: i32, y1:
 mod tests {
     use super::*;
     use crate::page::Page;
-    use std::path::Path;
+    use url::Url;
+
+    fn page_url() -> Url {
+        Url::parse("file:///tmp/t.html").unwrap()
+    }
 
     fn paint_page(src: &str, w: usize, h: usize, scroll: f32, scale: f32) -> Vec<u32> {
         let fonts = Fonts::load();
-        let mut page = Page::from_source(Path::new("t.html"), src);
+        let mut page = Page::from_source(&page_url(), src);
         page.relayout(&fonts, 300.0);
         let mut buf = vec![0u32; w * h];
         Painter::default().paint(&mut buf, w, h, &page.layout, &fonts, scroll, scale);
@@ -183,7 +187,7 @@ mod tests {
     #[test]
     fn glyph_cache_stays_bounded() {
         let fonts = Fonts::load();
-        let mut page = Page::from_source(Path::new("t.html"), "<p>abcdefghijklmnopqrstuvwxyz</p>");
+        let mut page = Page::from_source(&page_url(), "<p>abcdefghijklmnopqrstuvwxyz</p>");
         page.relayout(&fonts, 300.0);
         let mut painter = Painter::default();
         let mut buf = vec![0u32; 200 * 60];

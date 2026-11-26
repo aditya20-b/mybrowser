@@ -1,7 +1,5 @@
 //! Image decoding (PNG only for now, via the `png` crate).
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
+use std::io::Cursor;
 
 pub struct Image {
     pub w: u32,
@@ -14,9 +12,19 @@ pub struct Image {
 /// (a decompression-bomb guard: 64M pixels = 256 MB of RGBA).
 const MAX_PIXELS: u64 = 64 * 1024 * 1024;
 
-pub fn load_png(path: &Path) -> Option<Image> {
-    let file = File::open(path).ok()?;
-    let mut decoder = png::Decoder::new(BufReader::new(file));
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// Decode an image from its bytes, sniffing the format from the content
+/// rather than trusting a file name or Content-Type. Only PNG so far.
+pub fn decode(bytes: &[u8]) -> Option<Image> {
+    if bytes.starts_with(PNG_SIGNATURE) {
+        return decode_png(bytes);
+    }
+    None
+}
+
+fn decode_png(bytes: &[u8]) -> Option<Image> {
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
     // Expand palettes/low bit depths and strip 16-bit so we only see 8-bit Gray/GrayA/RGB/RGBA.
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().ok()?;
@@ -72,5 +80,40 @@ impl Image {
             out[k] = top + (bot - top) * ty;
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode(w: u32, h: u32, color: png::ColorType, data: &[u8]) -> Vec<u8> {
+        let mut out = vec![];
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(color);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(data).unwrap();
+        out
+    }
+
+    #[test]
+    fn decodes_each_color_type_to_rgba() {
+        let rgba = decode(&encode(1, 1, png::ColorType::Rgba, &[1, 2, 3, 4])).unwrap();
+        assert_eq!(rgba.rgba, [1, 2, 3, 4]);
+        let rgb = decode(&encode(1, 1, png::ColorType::Rgb, &[1, 2, 3])).unwrap();
+        assert_eq!(rgb.rgba, [1, 2, 3, 255]);
+        let gray = decode(&encode(2, 1, png::ColorType::Grayscale, &[9, 200])).unwrap();
+        assert_eq!(gray.rgba, [9, 9, 9, 255, 200, 200, 200, 255]);
+        let ga = decode(&encode(1, 1, png::ColorType::GrayscaleAlpha, &[7, 128])).unwrap();
+        assert_eq!(ga.rgba, [7, 7, 7, 128]);
+    }
+
+    #[test]
+    fn rejects_garbage_truncated_and_non_png() {
+        assert!(decode(b"").is_none());
+        assert!(decode(b"GIF89a....").is_none());
+        assert!(decode(b"\x89PNG\r\n\x1a\nnot really").is_none());
+        let good = encode(4, 4, png::ColorType::Rgb, &[0; 48]);
+        assert!(decode(&good[..good.len() / 2]).is_none());
     }
 }

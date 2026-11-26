@@ -21,7 +21,7 @@ use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
@@ -119,9 +119,9 @@ fn main() {
         return;
     }
 
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(fonts, start, cwd);
+    let mut app = App::new(fonts, start, cwd, event_loop.create_proxy());
     event_loop.run_app(&mut app).unwrap();
 }
 
@@ -195,6 +195,64 @@ fn resolve_link(base: &Url, href: &str) -> Link {
     }
 }
 
+/// A fully built page on its way from a loader thread to the UI thread.
+///
+/// `Page` holds `Rc<Image>`s, which are not `Send`. That is only a problem if
+/// two threads could touch the same reference count, and here they can't: every
+/// clone of every `Rc` lives inside this one `Page` (the loader's temporary
+/// caches are dropped before it returns), and the loader thread gives the whole
+/// value away through a channel without keeping anything. Ownership moves as a
+/// unit, so the counts are only ever touched by one thread at a time.
+struct SendPage(Page);
+unsafe impl Send for SendPage {}
+
+enum UserEvent {
+    Loaded { ticket: u64, page: SendPage },
+}
+
+/// A navigation that has started but not finished.
+#[derive(Debug, PartialEq)]
+struct Pending {
+    ticket: u64,
+    /// Push the page we're leaving onto the back stack when this lands.
+    record: bool,
+    from: Url,
+    /// Restore this scroll offset when it lands (reload keeps your place).
+    keep_scroll: Option<f32>,
+}
+
+/// Bookkeeping for the one navigation in flight. Each start gets a ticket;
+/// only the newest ticket may complete, so a slow, superseded load can never
+/// replace a page the user has since moved on to.
+#[derive(Default)]
+struct Navigation {
+    ticket: u64,
+    pending: Option<Pending>,
+}
+
+impl Navigation {
+    fn start(&mut self, from: Url, record: bool, keep_scroll: Option<f32>) -> u64 {
+        self.ticket += 1;
+        self.pending = Some(Pending { ticket: self.ticket, record, from, keep_scroll });
+        self.ticket
+    }
+
+    /// A load finished: returns its details if it is still the current one.
+    fn finish(&mut self, ticket: u64) -> Option<Pending> {
+        if ticket == self.ticket { self.pending.take() } else { None }
+    }
+
+    /// Abandon whatever is loading. Returns whether something was.
+    fn cancel(&mut self) -> bool {
+        self.ticket += 1;
+        self.pending.take().is_some()
+    }
+
+    fn is_loading(&self) -> bool {
+        self.pending.is_some()
+    }
+}
+
 struct App {
     fonts: Fonts,
     painter: Painter,
@@ -203,6 +261,8 @@ struct App {
     cwd: std::path::PathBuf,
     back: Vec<Url>,
     forward: Vec<Url>,
+    nav: Navigation,
+    proxy: EventLoopProxy<UserEvent>,
     scroll: f32,
     laid_out_width: f32,
     cursor: (f32, f32), // physical pixels
@@ -213,14 +273,16 @@ struct App {
 }
 
 impl App {
-    fn new(fonts: Fonts, start: Url, cwd: std::path::PathBuf) -> App {
-        let page = Page::load(&start);
-        let bar = AddressBar::new(page.url.as_str());
-        App {
-            fonts, painter: Painter::default(), page, bar, cwd, back: vec![], forward: vec![], scroll: 0.0,
-            laid_out_width: -1.0, cursor: (0.0, 0.0), hover: None, modifiers: ModifiersState::empty(),
-            window: None, surface: None,
-        }
+    fn new(fonts: Fonts, start: Url, cwd: std::path::PathBuf, proxy: EventLoopProxy<UserEvent>) -> App {
+        let page = Page::from_source(&start, "<p style='color:#666'>Loading…</p>");
+        let bar = AddressBar::new(start.as_str());
+        let mut app = App {
+            fonts, painter: Painter::default(), page, bar, cwd, back: vec![], forward: vec![],
+            nav: Navigation::default(), proxy, scroll: 0.0, laid_out_width: -1.0, cursor: (0.0, 0.0),
+            hover: None, modifiers: ModifiersState::empty(), window: None, surface: None,
+        };
+        app.begin_load(start, false, None);
+        app
     }
 
     fn scale(&self) -> f32 {
@@ -244,6 +306,13 @@ impl App {
     fn request_redraw(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
+        }
+    }
+
+    fn set_title(&self) {
+        if let Some(w) = &self.window {
+            let title = if self.nav.is_loading() { "Loading…".to_string() } else { self.page.display_title() };
+            w.set_title(&format!("{title} — mybrowser"));
         }
     }
 
@@ -282,28 +351,56 @@ impl App {
         self.request_redraw();
     }
 
-    /// Load `url` into the current tab. `record` pushes the page we're leaving
-    /// onto the back stack (and drops the forward stack, as browsers do).
-    fn open(&mut self, url: Url, record: bool) {
-        if record {
-            self.back.push(self.page.url.clone());
+    /// Start loading `url` on a background thread. The current page stays on
+    /// screen and responsive until the new one arrives; starting another load (or
+    /// pressing Escape) abandons this one.
+    fn begin_load(&mut self, url: Url, record: bool, keep_scroll: Option<f32>) {
+        let ticket = self.nav.start(self.page.url.clone(), record, keep_scroll);
+        self.bar.show(url.as_str());
+        self.set_title();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            // A panic while loading must still end the "Loading…" state.
+            let page = std::panic::catch_unwind(|| Page::load(&url))
+                .unwrap_or_else(|_| Page::error(&url, "internal error while loading this page"));
+            let _ = proxy.send_event(UserEvent::Loaded { ticket, page: SendPage(page) });
+        });
+        self.request_redraw();
+    }
+
+    /// A loader thread delivered a page.
+    fn finish_load(&mut self, ticket: u64, page: Page) {
+        let Some(pending) = self.nav.finish(ticket) else { return }; // superseded or cancelled
+        if pending.record {
+            self.back.push(pending.from);
             self.forward.clear();
         }
-        self.page = Page::load(&url);
-        self.bar.show(self.page.url.as_str());
+        self.page = page;
+        self.bar.show(self.page.url.as_str()); // the final URL, after redirects
         self.laid_out_width = -1.0; // force relayout on the next redraw
-        self.scroll = 0.0;
+        self.scroll = pending.keep_scroll.unwrap_or(0.0); // clamped on the next redraw
         self.update_hover();
-        if let Some(w) = &self.window {
-            w.set_title(&format!("{} — mybrowser", self.page.display_title()));
-        }
+        self.set_title();
         self.request_redraw();
+    }
+
+    /// Give up on the load in flight and show the current page's address again.
+    fn cancel_load(&mut self) {
+        if self.nav.cancel() {
+            let url = self.page.url.to_string();
+            self.bar.show(&url);
+            self.set_title();
+            self.request_redraw();
+        }
+    }
+
+    fn open(&mut self, url: Url, record: bool) {
+        self.begin_load(url, record, None);
     }
 
     fn reload(&mut self) {
         let (url, keep) = (self.page.url.clone(), self.scroll);
-        self.open(url, false);
-        self.scroll = keep; // clamped on the next redraw
+        self.begin_load(url, false, Some(keep));
     }
 
     fn go_back(&mut self) {
@@ -365,7 +462,7 @@ impl App {
         } else {
             // clicking the page ends address editing
             if self.bar.is_focused() {
-                let url = self.page.url.to_string();
+                let url = if self.nav.is_loading() { self.bar.submit_text().to_string() } else { self.page.url.to_string() };
                 self.bar.show(&url);
             }
             self.update_hover(); // hit-test at release time rather than trusting a stale hover
@@ -383,6 +480,7 @@ impl App {
             Key::Named(NamedKey::Escape) => {
                 let url = self.page.url.to_string();
                 self.bar.show(&url);
+                self.cancel_load();
             }
             Key::Named(NamedKey::Backspace) if cmd => self.bar.clear(),
             Key::Named(NamedKey::Backspace) => self.bar.backspace(),
@@ -433,8 +531,10 @@ impl App {
                 "r" => self.reload(),
                 "[" => self.go_back(),
                 "]" => self.go_forward(),
+                "." => self.cancel_load(),
                 _ => {}
             },
+            Key::Named(NamedKey::Escape) => self.cancel_load(),
             Key::Named(NamedKey::ArrowDown) => self.scroll_by(48.0),
             Key::Named(NamedKey::ArrowUp) => self.scroll_by(-48.0),
             Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => self.scroll_by(page),
@@ -481,18 +581,25 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title(format!("{} — mybrowser", self.page.display_title()))
+            .with_title("Loading… — mybrowser")
             .with_inner_size(LogicalSize::new(960.0, 720.0));
         let window = Rc::new(el.create_window(attrs).unwrap());
         let context = softbuffer::Context::new(window.clone()).unwrap();
         self.surface = Some(softbuffer::Surface::new(&context, window.clone()).unwrap());
         self.window = Some(window);
+        self.set_title();
+    }
+
+    fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Loaded { ticket, page } => self.finish_load(ticket, page.0),
+        }
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
@@ -619,5 +726,76 @@ mod tests {
         let local = u("file:///site/pages/index.html");
         assert_eq!(resolve_link(&local, "a%20b.html?x=1#top"), Link::Navigate(u("file:///site/pages/a%20b.html?x=1#top")));
         assert_eq!(resolve_link(&local, "file:///other.html"), Link::Navigate(u("file:///other.html")));
+    }
+
+    // ---------- background loading ----------
+
+    #[test]
+    fn only_the_newest_navigation_may_complete() {
+        let mut nav = Navigation::default();
+        assert!(!nav.is_loading());
+        let first = nav.start(u("https://a.test/"), true, None);
+        assert!(nav.is_loading());
+        // the user clicks something else before the first load finishes
+        let second = nav.start(u("https://b.test/"), true, Some(42.0));
+        assert_ne!(first, second);
+        // the slow first load arrives late: it must be ignored, and not disturb the second
+        assert_eq!(nav.finish(first), None);
+        assert!(nav.is_loading(), "the second navigation is still pending");
+        let done = nav.finish(second).expect("the newest load completes");
+        assert_eq!((done.record, done.from, done.keep_scroll), (true, u("https://b.test/"), Some(42.0)));
+        assert!(!nav.is_loading());
+        // a duplicate delivery of the same ticket completes nothing
+        assert_eq!(nav.finish(second), None);
+    }
+
+    #[test]
+    fn cancelling_invalidates_the_load_in_flight() {
+        let mut nav = Navigation::default();
+        assert!(!nav.cancel(), "nothing to cancel");
+        let t = nav.start(u("https://a.test/"), false, None);
+        assert!(nav.cancel());
+        assert!(!nav.is_loading());
+        assert_eq!(nav.finish(t), None, "a cancelled load that still arrives is dropped");
+        // and a new navigation after a cancel works normally
+        let t2 = nav.start(u("https://c.test/"), true, None);
+        assert!(nav.finish(t2).is_some());
+    }
+
+    #[test]
+    fn a_page_built_on_another_thread_arrives_intact() {
+        // What the loader thread does, end to end: build a page with images and styles
+        // on one thread, hand it over whole, and use it on this one.
+        let dir = std::env::temp_dir().join(format!("mybrowser-bg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut png = vec![];
+        let mut enc = png::Encoder::new(&mut png, 3, 2);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&[255u8; 24]).unwrap();
+        std::fs::write(dir.join("a.png"), &png).unwrap();
+        std::fs::write(dir.join("p.html"), "<title>Threaded</title><style>p{color:red}</style><p>hi</p><img src=a.png><img src=a.png>").unwrap();
+        let url = Url::from_file_path(dir.join("p.html")).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, SendPage)>();
+        let handles: Vec<_> = (0..4u64)
+            .map(|i| {
+                let (tx, url) = (tx.clone(), url.clone());
+                std::thread::spawn(move || tx.send((i, SendPage(Page::load(&url)))).unwrap())
+            })
+            .collect();
+        drop(tx);
+        for h in handles {
+            h.join().unwrap();
+        }
+        let fonts = Fonts::load();
+        let mut seen = 0;
+        for (_, SendPage(mut page)) in rx {
+            seen += 1;
+            assert_eq!((page.title.as_str(), page.images.len()), ("Threaded", 2));
+            page.relayout(&fonts, 300.0); // lays out and clones the Rc'd images, on this thread
+            assert!(page.layout.items.iter().any(|i| matches!(i, layout::Item::Image { .. })));
+        }
+        assert_eq!(seen, 4);
     }
 }

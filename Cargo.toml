@@ -5,6 +5,7 @@ edition = "2024"
 description = "A browser written from scratch in Rust: networking, HTML/CSS engine, layout, and a software rasterizer"
 
 [dependencies]
+cookie = { version = "0.18", default-features = false }
 cookie_store = { version = "0.22", default-features = false }
 fontdue = "0.9.5"
 png = "0.18.1"

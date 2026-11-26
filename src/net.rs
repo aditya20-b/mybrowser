@@ -5,6 +5,7 @@
 //! by a redirecting response are stored and sent on the next hop, and so that a
 //! redirect can never lead anywhere but http(s).
 use crate::cookies;
+use std::cell::RefCell;
 use std::io::Read;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -18,6 +19,21 @@ pub const MAX_POST_BODY: usize = 8 * 1024 * 1024;
 
 /// Redirects followed before giving up.
 const MAX_REDIRECTS: usize = 10;
+
+thread_local! {
+    /// The page a top-level navigation on this thread was started from (a clicked
+    /// link, a submitted form). `None` means the user typed the address or used
+    /// history. It decides which `SameSite` cookies go along.
+    static INITIATOR: RefCell<Option<Url>> = const { RefCell::new(None) };
+}
+
+/// Run `f` (a top-level load) as a navigation started from `initiator`.
+pub fn with_initiator<T>(initiator: Option<Url>, f: impl FnOnce() -> T) -> T {
+    let previous = INITIATOR.with(|i| i.replace(initiator));
+    let result = f();
+    INITIATOR.with(|i| *i.borrow_mut() = previous);
+    result
+}
 
 pub struct Fetched {
     /// The final URL, after any redirects.
@@ -38,7 +54,8 @@ pub fn fetch(url: &Url) -> Result<Fetched, String> {
 
 /// Submit a form: POST `body` (already `application/x-www-form-urlencoded`) to
 /// `url`. Only http(s) can be posted to. A redirect after the POST is followed
-/// with a plain GET (as browsers do for 301, 302 and 303).
+/// with a plain GET (as browsers do for 301, 302 and 303); 307 and 308 send the
+/// same body again, but never from https to http.
 pub fn fetch_post(url: &Url, body: &str) -> Result<Fetched, String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!("can't submit a form to {}: URLs", url.scheme()));
@@ -118,10 +135,13 @@ fn agent() -> &'static ureq::Agent {
 fn fetch_http(start: &Url, top: Option<&Url>, post: Option<&str>) -> Result<Fetched, String> {
     let mut url = start.clone();
     let mut post = post;
+    // Only a top-level navigation has an initiating page; subresources are judged against `top`.
+    let initiator = if top.is_none() { INITIATOR.with(|i| i.borrow().clone()) } else { None };
     for _ in 0..=MAX_REDIRECTS {
         // Each hop is judged on its own: a redirect to another site loses the cookies.
         let use_cookies = top.is_none_or(|t| cookies::same_site(t, &url));
-        let cookie_header = if use_cookies { cookies::global().header_for(&url) } else { None };
+        let ctx = cookies::context(initiator.as_ref(), &url, post.is_some());
+        let cookie_header = if use_cookies { cookies::global().header_for(&url, ctx) } else { None };
         let result = match post {
             Some(body) => {
                 let mut req = agent()
@@ -155,14 +175,20 @@ fn fetch_http(start: &Url, top: Option<&Url>, post: Option<&str>) -> Result<Fetc
         }
         let status = resp.status();
         if status.is_redirection() {
-            let location = resp.headers().get("location").and_then(|v| v.to_str().ok()).map(String::from);
+            // (servers send raw UTF-8 or Latin-1 here; Url::join percent-encodes whatever arrives)
+            let location = resp.headers().get("location").map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
             if let Some(loc) = location {
                 let next = url.join(loc.trim()).map_err(|e| format!("{url}: bad redirect '{loc}': {e}"))?;
                 if !matches!(next.scheme(), "http" | "https") {
                     return Err(format!("{url}: refusing to follow a redirect to {}:", next.scheme()));
                 }
+                // 307 and 308 repeat the same POST; the rest become a GET. Form data is never
+                // re-sent from https to plain http.
+                let repeat = matches!(status.as_u16(), 307 | 308) && !(url.scheme() == "https" && next.scheme() == "http");
+                if !repeat {
+                    post = None;
+                }
                 url = next;
-                post = None; // the redirected request is a GET
                 continue;
             }
         }
@@ -440,6 +466,19 @@ mod tests {
     }
 
     #[test]
+    fn a_redirect_with_a_non_ascii_location_is_followed() {
+        // the header value isn't ASCII, so reading it as text used to fail and the 302 was shown as the page
+        let (port, heads, h) = serve_recording(vec![
+            http("302 Found", "Location: /caf\u{e9}?x=\u{65e5}\r\n", "moved"),
+            http("200 OK", "Content-Type: text/plain\r\n", "arrived"),
+        ]);
+        let f = fetch(&Url::parse(&format!("http://127.0.0.1:{port}/start")).unwrap()).unwrap();
+        h.join().unwrap();
+        assert_eq!(f.body, b"arrived");
+        assert!(heads.lock().unwrap()[1].starts_with("get /caf%c3%a9?x=%e6%97%a5"), "{}", heads.lock().unwrap()[1]);
+    }
+
+    #[test]
     fn a_redirect_loop_gives_up_instead_of_spinning() {
         let loops: Vec<String> = (0..=MAX_REDIRECTS).map(|_| http("302 Found", "Location: /again\r\n", "")).collect();
         let (port, h) = serve(loops);
@@ -519,6 +558,23 @@ mod tests {
         assert!(heads[0].starts_with("post /submit"), "{}", heads[0]);
         assert!(heads[1].starts_with("get /done"), "{}", heads[1]);
         assert!(!heads[1].contains("a=1"), "the body is not re-sent");
+    }
+
+    #[test]
+    fn a_307_or_308_redirect_repeats_the_post() {
+        // they used to be followed with a GET, so the form data was silently dropped
+        for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
+            let (port, heads, h) = serve_recording(vec![
+                http(status, "Location: /again\r\n", ""),
+                http("200 OK", "Content-Type: text/plain\r\n", "ok"),
+            ]);
+            let f = fetch_post(&Url::parse(&format!("http://127.0.0.1:{port}/first")).unwrap(), "a=1&b=2").unwrap();
+            h.join().unwrap();
+            assert_eq!((f.url.path(), f.body.as_slice()), ("/again", &b"ok"[..]));
+            let heads = heads.lock().unwrap();
+            assert!(heads[1].starts_with("post /again"), "{status}: {}", heads[1]);
+            assert!(heads[1].ends_with("\r\n\r\na=1&b=2"), "{status}: {}", heads[1]);
+        }
     }
 
     #[test]
@@ -610,6 +666,28 @@ mod tests {
         // (request heads are lower-cased by the recorder, hence `thr_ck=t`)
         assert!(heads[1].contains("thr_ck=t"), "redirect target carries the cookie: {}", heads[1]);
         assert!(heads[2].contains("thr_ck=t"), "other threads share the jar: {}", heads[2]);
+    }
+
+    #[test]
+    fn samesite_keeps_cookies_off_requests_that_another_site_starts() {
+        // The page the user is on is 127.0.0.1; the target is localhost, a different site.
+        let evil_page = Url::parse("http://127.0.0.1:1/evil.html").unwrap();
+        let (port, heads, h) = serve_recording(vec![
+            http("200 OK", "Set-Cookie: ss_strict=1; SameSite=Strict; Path=/\r\nSet-Cookie: ss_lax=2; Path=/\r\n", "login"),
+            http("200 OK", "", "from a link"),
+            http("200 OK", "", "from a form"),
+            http("200 OK", "", "typed"),
+        ]);
+        let target = |p: &str| Url::parse(&format!("http://localhost:{port}{p}")).unwrap();
+        fetch(&target("/login")).unwrap();
+        with_initiator(Some(evil_page.clone()), || fetch(&target("/link")).unwrap());
+        with_initiator(Some(evil_page.clone()), || fetch_post(&target("/transfer"), "to=mallory").unwrap());
+        fetch(&target("/typed")).unwrap(); // the initiator is back to None
+        h.join().unwrap();
+        let heads = heads.lock().unwrap();
+        assert!(heads[1].contains("ss_lax=2") && !heads[1].contains("ss_strict"), "a link carries Lax but not Strict: {}", heads[1]);
+        assert!(!heads[2].contains("ss_lax") && !heads[2].contains("ss_strict"), "a cross-site POST carries neither: {}", heads[2]);
+        assert!(heads[3].contains("ss_strict=1") && heads[3].contains("ss_lax=2"), "typed addresses carry everything: {}", heads[3]);
     }
 
     #[test]

@@ -8,9 +8,13 @@
 //! * `Secure` cookies are only accepted from https (or loopback), never sent over
 //!   plain http, and can't be overwritten by a plain-http response
 //! * `__Secure-` and `__Host-` prefixes are enforced
+//! * `SameSite`: cookies without the attribute behave as `Lax`, so a request that
+//!   another site starts (a link, a form POST) doesn't carry them unless it is a
+//!   plain top-level GET; `Strict` cookies never go cross-site; `None` needs `Secure`
 //! * size and count limits, so one site can't make every later request to a host fail;
 //!   when a site goes over, *its own* oldest cookies are evicted, never another site's
 //! * cross-site subresources (a tracking pixel on another domain) neither send nor set cookies
+use cookie::SameSite;
 use cookie_store::{Cookie, CookieDomain, CookieStore};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -30,6 +34,17 @@ const MAX_HEADER: usize = 8000;
 
 /// (domain, path, name): how the store identifies a cookie.
 type Key = (String, String, String);
+
+/// Who started a request, which decides which cookies may go with it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Ctx {
+    /// The user typed the address, or the request is from the same site.
+    SameSite,
+    /// Another site started a top-level GET (the user followed a link from elsewhere).
+    CrossSiteGet,
+    /// Another site started a POST (a form on a different site).
+    CrossSitePost,
+}
 
 pub struct Jar {
     store: CookieStore,
@@ -72,6 +87,28 @@ pub fn same_site(a: &Url, b: &Url) -> bool {
     !site.is_empty() && site == site_of(b)
 }
 
+/// How a request from `initiator` (the page the user was on) to `target` relates
+/// to cookies. No initiator means the user typed the address or used history.
+pub fn context(initiator: Option<&Url>, target: &Url, is_post: bool) -> Ctx {
+    match initiator {
+        Some(from) if !same_site(from, target) => {
+            if is_post { Ctx::CrossSitePost } else { Ctx::CrossSiteGet }
+        }
+        _ => Ctx::SameSite,
+    }
+}
+
+/// May a cookie with this `SameSite` attribute go with a request in `ctx`?
+fn same_site_allows(attr: Option<SameSite>, ctx: Ctx) -> bool {
+    match (ctx, attr) {
+        (Ctx::SameSite, _) => true,
+        (Ctx::CrossSiteGet, Some(SameSite::Strict)) => false,
+        (Ctx::CrossSiteGet, _) => true, // Lax, which is also the default
+        (Ctx::CrossSitePost, Some(SameSite::None)) => true,
+        (Ctx::CrossSitePost, _) => false,
+    }
+}
+
 /// Is this a name or value we are willing to send back in a `Cookie:` header?
 fn sendable(s: &str, allow_empty: bool) -> bool {
     (allow_empty || !s.is_empty())
@@ -100,6 +137,9 @@ impl Jar {
         let secure = cookie.secure() == Some(true);
         if secure && !https && !is_loopback(url) {
             return false; // a network attacker could have forged it
+        }
+        if cookie.same_site() == Some(SameSite::None) && !secure {
+            return false; // SameSite=None is only for Secure cookies
         }
         let lower = cookie.name().to_ascii_lowercase();
         if lower.starts_with("__secure-") && !(secure && https) {
@@ -141,10 +181,11 @@ impl Jar {
         true
     }
 
-    /// The value of the `Cookie:` header for a request to `url`, if any cookies apply.
-    /// Longer paths come first, then older cookies (RFC 6265).
-    pub fn header_for(&self, url: &Url) -> Option<String> {
+    /// The value of the `Cookie:` header for a request to `url` started in `ctx`, if any
+    /// cookies apply. Longer paths come first, then older cookies (RFC 6265).
+    pub fn header_for(&self, url: &Url, ctx: Ctx) -> Option<String> {
         let mut matching = self.store.matches(url);
+        matching.retain(|c| same_site_allows(c.same_site(), ctx));
         matching.sort_by_cached_key(|c| {
             let key = key_of(c);
             let age = self.seq.get(&key).copied().unwrap_or(0);
@@ -241,7 +282,11 @@ mod tests {
     }
 
     fn header(jar: &Jar, url: &str) -> String {
-        jar.header_for(&u(url)).unwrap_or_default()
+        jar.header_for(&u(url), Ctx::SameSite).unwrap_or_default()
+    }
+
+    fn header_in(jar: &Jar, url: &str, ctx: Ctx) -> String {
+        jar.header_for(&u(url), ctx).unwrap_or_default()
     }
 
     #[test]
@@ -266,6 +311,39 @@ mod tests {
             }
             assert_eq!(header(&jar, "https://example.com/a/b/c"), "deep=2; mid=3; first=1; second=4");
         }
+    }
+
+    #[test]
+    fn samesite_decides_which_cookies_cross_sites() {
+        let mut jar = Jar::new();
+        let url = u("https://example.com/");
+        for set in [
+            "strict=1; SameSite=Strict; Path=/",
+            "lax=2; SameSite=Lax; Path=/",
+            "plain=3; Path=/", // no attribute: behaves as Lax
+            "none=4; SameSite=None; Secure; Path=/",
+        ] {
+            assert!(jar.accept(&url, set), "{set}");
+        }
+        assert_eq!(header_in(&jar, "https://example.com/", Ctx::SameSite), "strict=1; lax=2; plain=3; none=4");
+        // a link from another site: everything but Strict
+        assert_eq!(header_in(&jar, "https://example.com/", Ctx::CrossSiteGet), "lax=2; plain=3; none=4");
+        // a form POST from another site (CSRF): only SameSite=None
+        assert_eq!(header_in(&jar, "https://example.com/", Ctx::CrossSitePost), "none=4");
+        // SameSite=None without Secure is refused outright
+        assert!(!jar.accept(&url, "bad=1; SameSite=None; Path=/"));
+    }
+
+    #[test]
+    fn request_context_depends_on_who_started_it() {
+        let page = u("https://shop.example.com/cart");
+        let same = u("https://api.example.com/pay");
+        let other = u("https://evil.test/");
+        assert_eq!(context(None, &same, true), Ctx::SameSite, "typed addresses and history are not cross-site");
+        assert_eq!(context(Some(&page), &same, true), Ctx::SameSite, "subdomains are the same site");
+        assert_eq!(context(Some(&page), &other, false), Ctx::CrossSiteGet);
+        assert_eq!(context(Some(&page), &other, true), Ctx::CrossSitePost);
+        assert_eq!(context(Some(&u("file:///a.html")), &other, false), Ctx::CrossSiteGet);
     }
 
     #[test]

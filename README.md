@@ -45,13 +45,13 @@ One heads-up: fonts are loaded from the macOS system font folder (see `src/fonts
 
 ## What it can do
 
-**Networking.** It loads `http://` and `https://` pages (TLS through rustls, gzip, timeouts, a size limit), as well as local files and `data:` URLs. It sends `GET` requests and form `POST`s. Redirects are followed by hand so cookies carry across each hop and a redirect can never lead to a `file:` or `data:` URL; a redirect after a `POST` is followed with a `GET`, like in other browsers. Stylesheets and images are fetched in parallel by a small worker pool with a deadline. It honours `<base href>`, decodes UTF-8, UTF-16, Latin-1 and Windows-1252 text, and shows readable pages for plain text, images and errors (including HTTP 404s with their bodies). A web page can't load local files or send you to one.
+**Networking.** It loads `http://` and `https://` pages (TLS through rustls, gzip, timeouts, a size limit), as well as local files and `data:` URLs. It sends `GET` requests and form `POST`s. Redirects are followed by hand so cookies carry across each hop and a redirect can never lead to a `file:` or `data:` URL; after a `POST`, 301/302/303 redirects are followed with a `GET` and 307/308 repeat the `POST` (never from https down to http), like in other browsers. Stylesheets and images are fetched in parallel by a small worker pool with a deadline. It honours `<base href>`, decodes UTF-8, UTF-16, Latin-1 and Windows-1252 text, and shows readable pages for plain text, images and errors (including HTTP 404s with their bodies). A web page can't load local files or send you to one.
 
-**Cookies and privacy.** One in-memory cookie jar is shared by every request and never written to disk. Beyond the usual host, path and expiry rules it refuses a `Domain` that is a public suffix (so `Domain=co.uk` can't make a supercookie), refuses `Secure` cookies from plain http, never sends them over it and doesn't let a plain-http response overwrite one, enforces the `__Secure-` and `__Host-` prefixes, and caps cookie size and count. When a site goes over its limit it loses its own oldest cookies, never another site's. Images and stylesheets from a different site than the page get no cookies at all, in either direction, so a tracking pixel can't recognise you. No `Referer` is sent.
+**Cookies and privacy.** One in-memory cookie jar is shared by every request and never written to disk. Beyond the usual host, path and expiry rules it refuses a `Domain` that is a public suffix (so `Domain=co.uk` can't make a supercookie), refuses `Secure` cookies from plain http, never sends them over it and doesn't let a plain-http response overwrite one, enforces the `__Secure-` and `__Host-` prefixes, and caps cookie size and count. When a site goes over its limit it loses its own oldest cookies, never another site's. `SameSite` works the way browsers now do it: cookies without the attribute count as `Lax`, so a form on another site can't POST with your login cookie (no CSRF), `Strict` cookies never leave their site, and `SameSite=None` needs `Secure`. Images and stylesheets from a different site than the page get no cookies at all, in either direction, so a tracking pixel can't recognise you. No `Referer` is sent.
 
 **Browsing.** Pages load on a background thread, so the window never freezes; only the newest navigation can land, so a slow load can't replace a page you've moved on from. Back and forward history changes only when a navigation actually lands, so cancelling or superseding a load never loses or duplicates entries, and typing the address you're already on reloads instead of adding an entry.
 
-**Forms.** Text, password, checkbox, radio, submit and button inputs, `<button>`, `<textarea>` and `<select>` draw as native-looking boxes that sit on the text baseline. Click to focus, type, toggle and cycle options; `Tab` and `Enter` work. Disabled controls can't be clicked. Submitting builds a properly URL-encoded body (only the clicked button, only checked boxes, no disabled or nameless controls, hidden fields included) and either navigates with it as a query (`GET`) or sends it (`POST`), with the same safety checks as links. Password text is never drawn.
+**Forms.** Text, password, checkbox, radio, submit and button inputs, `<button>`, `<textarea>` and `<select>` draw as native-looking boxes that sit on the text baseline. Click to focus, type, toggle and cycle options; `Tab` and `Enter` work. Disabled controls (including those in a `<fieldset disabled>`) can't be clicked, `readonly` and `maxlength` are honoured, and `hidden` controls skip the Tab order. Submitting builds a properly URL-encoded body (only the clicked button, only checked boxes, no disabled or nameless controls, hidden fields included, textarea line breaks as CRLF) and either navigates with it as a query (`GET`) or sends it (`POST`). `form="id"` ties a control to a form elsewhere on the page, and `formaction`/`formmethod` on the clicked button override the form's. The target goes through the same safety checks as links, and a form on an https page refuses to send its data to plain http. Pressing Enter twice doesn't send a `POST` twice. Password text is never drawn.
 
 **HTML.** Entities, void tags, messy markup (unclosed `<p>` and `<li>`, misnested tags, stray end tags, implied table rows and cells), and a synthesized `<head>` and `<body>` when a page leaves them out. The parser runs in linear time, even on hostile input.
 
@@ -90,6 +90,7 @@ A few choices worth explaining:
 - Table cells are laid out once and then stretched: a row's height isn't known until every cell is done, so backgrounds and borders are patched afterwards instead of laying each cell out twice (which would be exponential for nested tables).
 - Form controls are drawn by the engine from plain rects and text, so they need no new paint code, and a control's size never depends on what's typed in it, so typing doesn't reflow the page.
 - The HTTP client's built-in cookie handling and redirect following are switched off. I wanted every cookie to pass through my own rules first, and a redirect to be checked before it's followed, so both happen in `net.rs` and `cookies.rs`.
+- `SameSite` needs to know which page started a navigation (a clicked link or submitted form, as opposed to a typed address). That is passed to the loader thread through a thread-local, so the page-loading code didn't have to change.
 - A page is built whole on a loader thread and handed to the UI thread in one piece. It contains `Rc`s (not `Send`), so the handoff uses a tiny `unsafe impl Send` whose safety argument (every clone lives inside the one value being moved) is written next to it and was reviewed independently.
 - The address bar logic, the form logic, the cookie policy, and the navigation and history bookkeeping are plain state with no windowing in them, so they're unit-tested.
 
@@ -101,7 +102,7 @@ The engine itself is hand-written. I only used crates for the parts that talk to
 - `softbuffer` to put a pixel buffer on screen
 - `fontdue` to turn a TrueType glyph into a bitmap and report its metrics
 - `ureq` (with rustls) for HTTP and TLS, and `url` for parsing and resolving URLs
-- `cookie_store` to parse and match cookies, and `psl` (the public suffix list) to know which domains cookies must never be shared across
+- `cookie_store` and `cookie` to parse and match cookies, and `psl` (the public suffix list) to know which domains cookies must never be shared across
 - `png` to decode PNG images and save screenshots
 
 ## Tests
@@ -110,7 +111,7 @@ The engine itself is hand-written. I only used crates for the parts that talk to
 cargo test
 ```
 
-There are about two hundred tests. They cover the parsers, selector matching, the cascade, layout, tables and form controls, address editing, URL handling, history, form submission, the cookie rules, and networking (against throwaway local HTTP servers, so no internet is needed). Many are regression tests for real bugs found by throwing nasty input at the engine and by independent review passes: quadratic-time parsing, exponential selector matching, crashes on odd Unicode and huge values, unbounded memory use, history desyncs, and so on. The tests load system fonts, so they also need macOS for now.
+There are over two hundred tests. They cover the parsers, selector matching, the cascade, layout, tables and form controls, address editing, URL handling, history, form submission, the cookie rules, and networking (against throwaway local HTTP servers, so no internet is needed). Many are regression tests for real bugs found by throwing nasty input at the engine and by independent review passes: quadratic-time parsing, exponential selector matching, crashes on odd Unicode and huge values, unbounded memory use, history desyncs, and so on. The tests load system fonts, so they also need macOS for now.
 
 ## What's missing
 
@@ -119,14 +120,14 @@ The honest list, roughly by how much it matters for a real browser:
 - **JavaScript.** None. Pages that build their content with scripts will be blank or broken.
 - **Layout.** No flexbox, grid, floats or positioning, no inline padding or margins, and no `vh`/`vw`/`calc()`. A lot of the modern web depends on these.
 - **Selectors.** No pseudo-classes (even `:link` and `:first-child`), attribute selectors or `@media`, so many stylesheets lose rules.
-- **Forms.** No `multipart/form-data` (so no file uploads; a form asking for it is sent urlencoded). Reloading or going back to a page a `POST` produced fetches its URL with a `GET`. No caret movement or selection inside fields (typing appends, backspace deletes), no `readonly`, `maxlength`, `hidden`, `form=` or `<label>` clicks, no file, date or colour inputs, radio buttons draw as squares, and selects cycle on click instead of opening a menu. Hidden (`display:none`) controls can still be tabbed to.
-- **Cookies.** The `SameSite` attribute is ignored (only the cross-site subresource rule applies), and nothing persists between runs.
+- **Forms.** No `multipart/form-data` (so no file uploads; a form asking for it is sent urlencoded), no `<select multiple>`, and `<label>` clicks don't focus their control. Reloading or going back to a page a `POST` produced fetches its URL with a `GET`. No caret movement or selection inside fields (typing appends, backspace deletes), no file, date or colour inputs, radio buttons draw as squares, and selects cycle on click instead of opening a menu. Controls hidden with CSS (`display:none`) can still be tabbed to.
+- **Cookies.** Nothing persists between runs, and there's no UI to see or clear them.
 - **Browser features.** No tabs, caching, bookmarks or find-in-page.
 - **Media.** PNG only: no JPEG, GIF, WebP or SVG. No fonts from the web (`@font-face`).
 - **Text.** No shaping, so no kerning, ligatures or complex scripts, and no right-to-left text.
 - **Platform.** macOS fonts only, for now.
 
-The order I'm tackling things in: form fixes, `SameSite`, tabs, the CSS gaps above (pseudo-classes, inline boxes, viewport units), a flexbox subset, more image formats, and eventually a JavaScript engine. Until then it's best at documents, blogs, articles and older table-based sites.
+The order I'm tackling things in: tabs, the CSS gaps above (pseudo-classes, inline boxes, viewport units), a flexbox subset, more image formats, and eventually a JavaScript engine. Until then it's best at documents, blogs, articles and older table-based sites.
 
 ## Where to learn more
 

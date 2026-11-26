@@ -199,6 +199,20 @@ fn resolve_link(base: &Url, href: &str) -> Link {
     }
 }
 
+/// May a form on `from` send its data to `target`? Data isn't sent from an https
+/// page to plain http (it would travel in the clear, passwords included, unless
+/// the server is on this machine), and only http(s) servers can receive a POST.
+fn form_target_allowed(from: &Url, target: &Url, post: bool) -> Result<(), String> {
+    if post && !matches!(target.scheme(), "http" | "https") {
+        return Err(format!("can't submit a form to {}: URLs", target.scheme()));
+    }
+    let local = target.host_str().is_some_and(is_loopback_host);
+    if from.scheme() == "https" && target.scheme() == "http" && !local {
+        return Err("blocked: this secure page tried to send form data over plain http".into());
+    }
+    Ok(())
+}
+
 /// A fully built page on its way from a loader thread to the UI thread.
 ///
 /// `Page` holds `Rc<Image>`s, which are not `Send`. That is only a problem if
@@ -333,6 +347,10 @@ struct App {
     /// Form data of the navigation in flight, so restarting it (reload while
     /// loading) POSTs again instead of silently turning into a GET.
     inflight_post: Option<String>,
+    /// The page the next `begin_load` was started from (a clicked link or a
+    /// submitted form); `None` for typed addresses and history. Decides `SameSite` cookies.
+    next_initiator: Option<Url>,
+    inflight_initiator: Option<Url>,
     proxy: EventLoopProxy<UserEvent>,
     scroll: f32,
     laid_out_width: f32,
@@ -349,9 +367,9 @@ impl App {
         let bar = AddressBar::new(start.as_str());
         let mut app = App {
             fonts, painter: Painter::default(), page, bar, cwd, history: History::default(),
-            nav: Navigation::default(), next_post: None, inflight_post: None, proxy, scroll: 0.0,
-            laid_out_width: -1.0, cursor: (0.0, 0.0), hover: None, modifiers: ModifiersState::empty(),
-            window: None, surface: None,
+            nav: Navigation::default(), next_post: None, inflight_post: None, next_initiator: None,
+            inflight_initiator: None, proxy, scroll: 0.0, laid_out_width: -1.0, cursor: (0.0, 0.0),
+            hover: None, modifiers: ModifiersState::empty(), window: None, surface: None,
         };
         app.begin_load(start, Hist::Replace, None);
         app
@@ -434,22 +452,26 @@ impl App {
     /// screen and responsive until the new one arrives; starting another load (or
     /// pressing Escape) abandons this one. The history stacks are only touched
     /// when the load lands (see `finish_load`). If `next_post` is set, the load
-    /// is a form POST with that body.
+    /// is a form POST with that body; `next_initiator` names the page it came from.
     fn begin_load(&mut self, url: Url, hist: Hist, keep_scroll: Option<f32>) {
         let ticket = self.nav.start(self.page.url.clone(), url.clone(), hist, keep_scroll);
         let post = self.next_post.take();
+        let initiator = self.next_initiator.take();
         self.inflight_post = post.clone();
+        self.inflight_initiator = initiator.clone();
         self.bar.show(url.as_str());
         self.set_title();
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let load = || match &post {
-                Some(body) => Page::load_post(&url, body),
-                None => Page::load(&url),
+            let load = || {
+                net::with_initiator(initiator.clone(), || match &post {
+                    Some(body) => Page::load_post(&url, body),
+                    None => Page::load(&url),
+                })
             };
             // A panic while loading must still end the "Loading…" state, even if
             // building the error page itself panics.
-            let page = std::panic::catch_unwind(load)
+            let page = std::panic::catch_unwind(std::panic::AssertUnwindSafe(load))
                 .or_else(|_| std::panic::catch_unwind(|| Page::error(&url, "internal error while loading this page")))
                 .unwrap_or_else(|_| Page::from_source(&url, "<p>Could not load this page.</p>"));
             let _ = proxy.send_event(UserEvent::Loaded { ticket, page: SendPage(page) });
@@ -461,6 +483,7 @@ impl App {
     fn finish_load(&mut self, ticket: u64, page: Page) {
         let Some(pending) = self.nav.finish(ticket) else { return }; // superseded or cancelled
         self.inflight_post = None;
+        self.inflight_initiator = None;
         self.history.apply(pending.hist, pending.from, &page.url);
         self.page = page;
         self.bar.show(self.page.url.as_str()); // the final URL, after redirects
@@ -475,6 +498,7 @@ impl App {
     fn cancel_load(&mut self) {
         if self.nav.cancel() {
             self.inflight_post = None;
+            self.inflight_initiator = None;
             let url = self.page.url.to_string();
             self.bar.show(&url);
             self.set_title();
@@ -493,6 +517,7 @@ impl App {
         if let Some(p) = self.nav.pending() {
             let (url, hist) = (p.url.clone(), p.hist);
             self.next_post = self.inflight_post.clone();
+            self.next_initiator = self.inflight_initiator.clone();
             self.begin_load(url, hist, None);
         } else {
             let (url, keep) = (self.page.url.clone(), self.scroll);
@@ -516,7 +541,10 @@ impl App {
         match resolve_link(&self.page.url, href) {
             Link::Nothing => {} // in-page anchors aren't scrolled to yet
             Link::External(url) => eprintln!("not supported (yet): {url}"),
-            Link::Navigate(url) => self.open(url),
+            Link::Navigate(url) => {
+                self.next_initiator = Some(self.page.url.clone());
+                self.open(url);
+            }
         }
     }
 
@@ -572,27 +600,37 @@ impl App {
 
     /// Submit the form that contains `control`, as if `submitter` (a button) was clicked.
     /// The target goes through the same safety checks as a link (a web page's form
-    /// can't send you to `file:` or `javascript:`).
+    /// can't send you to `file:` or `javascript:`), plus `form_target_allowed`.
     fn submit_form(&mut self, control: NodeId, submitter: Option<NodeId>) {
         let Some(form_el) = forms::form_of(&self.page.dom, control) else { return };
         let Some(sub) = self.page.form.submit(&self.page.dom, form_el, submitter, &self.page.url) else { return };
         let post = matches!(sub.method, forms::Method::Post);
-        match resolve_link(&self.page.url, sub.url.as_str()) {
-            Link::Navigate(url) => {
-                if post {
-                    self.next_post = Some(sub.body);
-                }
-                self.open(url);
+        // pressing Enter twice must not send a POST twice (a duplicate order, say)
+        if post && self.nav.is_loading() && self.inflight_post.is_some() {
+            return;
+        }
+        let from = self.page.url.clone();
+        let target = match resolve_link(&from, sub.url.as_str()) {
+            Link::Navigate(url) => url,
+            Link::Nothing => from.clone(), // submitting to the page you're already on
+            Link::External(url) => {
+                eprintln!("not supported (yet): {url}");
+                return;
             }
-            // submitting to the page you're already on: a GET reloads it; a POST
-            // sends the data and replaces the page in place
-            Link::Nothing if post => {
-                self.next_post = Some(sub.body);
-                let url = self.page.url.clone();
-                self.begin_load(url, Hist::Replace, None);
-            }
-            Link::Nothing => self.reload(),
-            Link::External(url) => eprintln!("not supported (yet): {url}"),
+        };
+        if let Err(why) = form_target_allowed(&from, &target, post) {
+            self.bar.error = Some(why);
+            return;
+        }
+        self.next_initiator = Some(from.clone());
+        if post {
+            self.next_post = Some(sub.body);
+        }
+        if target == from {
+            // replace the page in place (not `reload`, which might restart a different pending load)
+            self.begin_load(target, Hist::Replace, None);
+        } else {
+            self.open(target);
         }
     }
 
@@ -998,6 +1036,28 @@ mod tests {
         // and a GET form to the same URL is "nothing new", which the window turns into a reload
         assert_eq!(resolve_link(&page, "https://example.com/form.html"), Link::Nothing);
         assert_eq!(resolve_link(&page, "https://example.com/form.html?q=rust"), Link::Navigate(u("https://example.com/form.html?q=rust")));
+    }
+
+    #[test]
+    fn forms_never_downgrade_to_plain_http_or_post_to_non_http() {
+        // an https login page whose form action is http:// sent the password in the clear
+        let secure = u("https://bank.test/login");
+        assert!(form_target_allowed(&secure, &u("https://bank.test/auth"), true).is_ok());
+        for post in [true, false] {
+            assert!(form_target_allowed(&secure, &u("http://bank.test/auth"), post).is_err());
+            assert!(form_target_allowed(&secure, &u("http://other.test/"), post).is_err());
+            // a server on this machine isn't "the network"
+            assert!(form_target_allowed(&secure, &u("http://localhost:8080/x"), post).is_ok());
+            assert!(form_target_allowed(&secure, &u("http://127.0.0.1/x"), post).is_ok());
+        }
+        // plain-http pages may submit anywhere http(s)
+        let plain = u("http://old.test/form");
+        assert!(form_target_allowed(&plain, &u("http://old.test/go"), true).is_ok());
+        assert!(form_target_allowed(&plain, &u("https://new.test/go"), true).is_ok());
+        // a POST to a file: URL is an error up front, not an error page in your history
+        let local = u("file:///site/form.html");
+        assert!(form_target_allowed(&local, &u("file:///site/x.html"), true).is_err());
+        assert!(form_target_allowed(&local, &u("file:///site/x.html"), false).is_ok(), "GET to a file is a normal navigation");
     }
 
     // ---------- background loading ----------

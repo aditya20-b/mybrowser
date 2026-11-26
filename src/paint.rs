@@ -34,6 +34,16 @@ impl Painter {
                     let y1 = (((y - scroll + rh) * scale).round() as i32).max(y0 + 1);
                     fill_rect(buf, w, h, x0, y0, x1, y1, *color);
                 }
+                Item::Image { x, y, w: iw, h: ih, img } => {
+                    if y + ih < scroll || *y > scroll + view_h {
+                        continue;
+                    }
+                    let x0 = (x * scale).round() as i32;
+                    let y0 = ((y - scroll) * scale).round() as i32;
+                    let dw = ((iw * scale).round() as i32).max(1);
+                    let dh = ((ih * scale).round() as i32).max(1);
+                    draw_image(buf, w, h, (x0, y0, dw, dh), img);
+                }
                 Item::Text { x, baseline, text, size, face, color } => {
                     let by = (baseline - scroll) * scale;
                     if by < -size * scale * 2.0 || by > h as f32 + size * scale {
@@ -79,6 +89,29 @@ impl Painter {
             let bar_w = (8.0 * scale) as i32;
             fill_rect(buf, w, h, w as i32 - bar_w - 2, thumb_y as i32, w as i32 - 2, (thumb_y + thumb_h) as i32,
                 Color { r: 150, g: 150, b: 150 });
+        }
+    }
+}
+
+/// Draw `img` scaled into the device-pixel rect `(x0, y0, dw, dh)` with bilinear
+/// filtering and alpha blending. Only visible pixels are visited, so a huge
+/// destination rect costs no more than the buffer itself.
+fn draw_image(buf: &mut [u32], w: usize, h: usize, rect: (i32, i32, i32, i32), img: &crate::images::Image) {
+    let (x0, y0, dw, dh) = rect;
+    let (cx0, cx1) = (x0.max(0), (x0 + dw).min(w as i32));
+    let (cy0, cy1) = (y0.max(0), (y0 + dh).min(h as i32));
+    let (sx, sy) = (img.w as f32 / dw as f32, img.h as f32 / dh as f32);
+    for py in cy0..cy1 {
+        let fy = ((py - y0) as f32 + 0.5) * sy;
+        for px in cx0..cx1 {
+            let fx = ((px - x0) as f32 + 0.5) * sx;
+            let [r, g, b, a] = img.sample(fx, fy);
+            if a < 0.5 {
+                continue;
+            }
+            let c = Color { r: r as u8, g: g as u8, b: b as u8 };
+            let p = &mut buf[py as usize * w + px as usize];
+            *p = if a >= 254.5 { c.to_u32() } else { blend(*p, c, a as u32) };
         }
     }
 }

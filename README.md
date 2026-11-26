@@ -35,7 +35,7 @@ On the HTML side, it handles entities, void tags like `<br>` and `<img>`, messy 
 
 For CSS, it reads `<style>` blocks, linked stylesheets and inline `style` attributes. Selectors can be tags, classes, IDs, `*`, and the descendant and child combinators. Specificity, source order, `!important` and inheritance all work. Most of the box model is there too: width, max-width, height, padding, borders, auto margins for centering, `box-sizing`, and margin collapsing, including the awkward cases like a parent and its first child, or negative margins.
 
-Text is wrapped using real glyph widths, with alignment, bold and italic, monospace, underlines, highlighted spans and clickable links. Lists and `<pre>` blocks work as well.
+Text is wrapped using real glyph widths, with alignment, bold and italic, monospace, underlines, highlighted spans and clickable links. Lists and `<pre>` blocks work as well, and local PNG images flow inline with the text (scaled with bilinear filtering, with alt text as the fallback).
 
 ## How it works
 
@@ -77,13 +77,13 @@ The engine itself is hand-written. I only used crates for the parts that talk to
 cargo test
 ```
 
-There are 36 tests covering the parsers, selector matching, the cascade and layout. A few of them are regression tests for real bugs I found by throwing nasty input at the engine: text starting with a non-ASCII character crashing the tokenizer, a huge `font-size` killing the process, negative widths, an unclosed `<head>` hiding the whole page, and absurdly deep nesting. The tests load system fonts, so they also need macOS for now.
+There are 41 tests covering the parsers, selector matching, the cascade and layout. A few of them are regression tests for real bugs I found by throwing nasty input at the engine: text starting with a non-ASCII character crashing the tokenizer, a huge `font-size` killing the process, negative widths, an unclosed `<head>` hiding the whole page, and absurdly deep nesting. The tests load system fonts, so they also need macOS for now.
 
 ## What's missing
 
-Quite a lot. There are no images, tables, flexbox, grid, floats or positioning. No pseudo-classes, attribute selectors, `@media`, `var()` or `calc()`. Text goes through no shaping, so no kerning or ligatures and no complex scripts. Pages load from local files only, with no `http://` yet, and there's no JavaScript.
+Quite a lot. There are no JPEG/GIF/SVG images (PNG only), tables, flexbox, grid, floats or positioning. No pseudo-classes, attribute selectors, `@media`, `var()` or `calc()`. Text goes through no shaping, so no kerning or ligatures and no complex scripts. Pages load from local files only, with no `http://` yet, and there's no JavaScript.
 
-What I'd like to do next, roughly in this order: images, loading pages over HTTP, table layout, a flexbox subset, an address bar, and eventually replacing `fontdue` with my own glyph rasterizer.
+What I'd like to do next, roughly in this order: loading pages over HTTP, table layout, a flexbox subset, an address bar, and eventually replacing `fontdue` with my own glyph rasterizer.
 
 ## Where to learn more
 

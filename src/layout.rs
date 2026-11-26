@@ -7,13 +7,17 @@
 use crate::css::{Color, Length};
 use crate::dom::{Dom, Kind, NodeId};
 use crate::fonts::{Face, Fonts};
+use crate::images::Image;
 use crate::style::{Align, Display, Style};
+use std::collections::HashMap;
+use std::rc::Rc;
 
 pub enum Item {
     Nop,
     Rect { x: f32, y: f32, w: f32, h: f32, color: Color },
     /// `baseline` is the y of the text baseline.
     Text { x: f32, baseline: f32, text: String, size: f32, face: Face, color: Color },
+    Image { x: f32, y: f32, w: f32, h: f32, img: Rc<Image> },
 }
 
 pub struct LinkRegion {
@@ -31,8 +35,14 @@ pub struct Layout {
     pub canvas_bg: Option<Color>,
 }
 
-pub fn layout_document(dom: &Dom, styles: &[Style], fonts: &Fonts, width: f32) -> Layout {
-    let mut cx = Ctx { dom, styles, fonts, items: vec![], links: vec![] };
+pub fn layout_document(
+    dom: &Dom,
+    styles: &[Style],
+    fonts: &Fonts,
+    images: &HashMap<NodeId, Rc<Image>>,
+    width: f32,
+) -> Layout {
+    let mut cx = Ctx { dom, styles, fonts, images, items: vec![], links: vec![] };
     let (bottom, mb) = cx.layout_block(0, 0.0, 0.0, 0.0, width, None, false);
 
     // The canvas takes the background of <html>, or else of <body>.
@@ -45,6 +55,7 @@ struct Ctx<'a> {
     dom: &'a Dom,
     styles: &'a [Style],
     fonts: &'a Fonts,
+    images: &'a HashMap<NodeId, Rc<Image>>,
     items: Vec<Item>,
     links: Vec<LinkRegion>,
 }
@@ -74,6 +85,8 @@ enum Inl {
     Word { text: String, node: NodeId, pre: bool },
     Space(NodeId),
     Break(NodeId),
+    /// A decoded image sitting on the baseline, already sized in CSS pixels.
+    Image { node: NodeId, w: f32, h: f32 },
 }
 
 struct Placed {
@@ -82,6 +95,8 @@ struct Placed {
     x: f32,
     w: f32,
     href: Option<String>,
+    /// Some(height) if this is an image rather than a word.
+    image_h: Option<f32>,
 }
 
 struct Line {
@@ -341,11 +356,17 @@ impl<'a> Ctx<'a> {
                 }
                 match tag.as_str() {
                     "br" => out.push(Inl::Break(id)),
-                    "img" => {
-                        // Images aren't supported yet: show the alt text.
-                        let alt = self.dom.attr(id, "alt").unwrap_or("image");
-                        out.push(Inl::Word { text: format!("[{alt}]"), node: id, pre: false });
-                    }
+                    "img" => match self.images.get(&id) {
+                        Some(img) => {
+                            let (w, h) = self.image_size(id, img);
+                            out.push(Inl::Image { node: id, w, h });
+                        }
+                        None => {
+                            // Missing or undecodable image: fall back to its alt text.
+                            let alt = self.dom.attr(id, "alt").unwrap_or("image");
+                            out.push(Inl::Word { text: format!("[{alt}]"), node: id, pre: false });
+                        }
+                    },
                     _ => {
                         for &c in &self.dom.nodes[id].children {
                             self.flatten(c, out);
@@ -354,6 +375,28 @@ impl<'a> Ctx<'a> {
                 }
             }
         }
+    }
+
+    /// Used size of an <img> in CSS px: CSS `width`/`height` win over the
+    /// attributes; a single given dimension keeps the aspect ratio.
+    fn image_size(&self, id: NodeId, img: &Image) -> (f32, f32) {
+        let attr = |name: &str| {
+            let v = self.dom.attr(id, name)?;
+            let digits: String = v.trim().chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+            digits.parse::<f32>().ok().filter(|v| *v > 0.0)
+        };
+        let s = &self.styles[id];
+        let w = match s.width { Length::Px(v) => Some(v), _ => attr("width") };
+        let h = s.height.or_else(|| attr("height"));
+        let (nw, nh) = (img.w as f32, img.h as f32);
+        let (w, h) = match (w, h) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => (w, w * nh / nw),
+            (None, Some(h)) => (h * nw / nh, h),
+            (None, None) => (nw, nh),
+        };
+        // Keep sizes finite and sane so later arithmetic can't blow up.
+        (w.clamp(0.0, 20_000.0), h.clamp(0.0, 20_000.0))
     }
 
     fn href_of(&self, mut id: NodeId) -> Option<String> {
@@ -376,8 +419,12 @@ impl<'a> Ctx<'a> {
         let mut pending_space: Option<NodeId> = None;
 
         for it in items {
-            match it {
-                Inl::Space(n) => pending_space = Some(*n),
+            // Everything placeable (a word or an image) reduces to the same tuple.
+            let (text, node, w, a, d, pre, image_h) = match it {
+                Inl::Space(n) => {
+                    pending_space = Some(*n);
+                    continue;
+                }
                 Inl::Break(n) => {
                     let s = &styles[*n];
                     let (a, d) = fonts.vmetrics(s.face(), s.font_size);
@@ -387,32 +434,34 @@ impl<'a> Ctx<'a> {
                     lines.push(new_line());
                     cx = 0.0;
                     pending_space = None;
+                    continue;
                 }
                 Inl::Word { text, node, pre } => {
                     let s = &styles[*node];
-                    let w = fonts.measure(s.face(), s.font_size, text);
-                    let mut sp = match pending_space {
-                        Some(sn) if !lines.last().unwrap().words.is_empty() => {
-                            let ss = &styles[sn];
-                            fonts.measure(ss.face(), ss.font_size, " ")
-                        }
-                        _ => 0.0,
-                    };
-                    if !*pre && !lines.last().unwrap().words.is_empty() && cx + sp + w > width {
-                        lines.push(new_line());
-                        cx = 0.0;
-                        sp = 0.0;
-                    }
                     let (a, d) = fonts.vmetrics(s.face(), s.font_size);
-                    let href = self.href_of(*node);
-                    let line = lines.last_mut().unwrap();
-                    line.asc = line.asc.max(a);
-                    line.desc = line.desc.max(d);
-                    line.words.push(Placed { text: text.clone(), node: *node, x: cx + sp, w, href });
-                    cx += sp + w;
-                    pending_space = None;
+                    (text.clone(), *node, fonts.measure(s.face(), s.font_size, text), a, d, *pre, None)
                 }
+                Inl::Image { node, w, h } => (String::new(), *node, *w, *h, 0.0, false, Some(*h)),
+            };
+            let mut sp = match pending_space {
+                Some(sn) if !lines.last().unwrap().words.is_empty() => {
+                    let ss = &styles[sn];
+                    fonts.measure(ss.face(), ss.font_size, " ")
+                }
+                _ => 0.0,
+            };
+            if !pre && !lines.last().unwrap().words.is_empty() && cx + sp + w > width {
+                lines.push(new_line());
+                cx = 0.0;
+                sp = 0.0;
             }
+            let href = self.href_of(node);
+            let line = lines.last_mut().unwrap();
+            line.asc = line.asc.max(a);
+            line.desc = line.desc.max(d);
+            line.words.push(Placed { text, node, x: cx + sp, w, href, image_h });
+            cx += sp + w;
+            pending_space = None;
         }
 
         // ---- emit
@@ -433,6 +482,13 @@ impl<'a> Ctx<'a> {
                 let s = &styles[w.node];
                 let face = s.face();
                 let ax = x + off + w.x;
+                if let (Some(h), Some(img)) = (w.image_h, self.images.get(&w.node)) {
+                    self.items.push(Item::Image { x: ax, y: baseline - h, w: w.w, h, img: img.clone() });
+                    if let Some(href) = &w.href {
+                        self.links.push(LinkRegion { x: ax, y: baseline - h, w: w.w, h, href: href.clone() });
+                    }
+                    continue;
+                }
                 // Decorations extend across the space to the next word if it matches.
                 let joined = line.words.get(i + 1).filter(|n| {
                     n.href == w.href && styles[n.node].underline == s.underline

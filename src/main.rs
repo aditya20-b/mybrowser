@@ -2,6 +2,7 @@ mod css;
 mod dom;
 mod fonts;
 mod html;
+mod images;
 mod layout;
 mod page;
 mod paint;
@@ -67,26 +68,6 @@ fn screenshot_to_png(path: &Path, fonts: &Fonts, width: f32, scale: f32, out: &P
     println!("wrote {} ({w}x{h}); {} display items", out.display(), page.layout.items.len());
 }
 
-/// Decode `%20`-style escapes in a URL path (invalid escapes are left as-is).
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            let hex = |c: u8| (c as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 struct App {
     fonts: Fonts,
     painter: Painter,
@@ -147,7 +128,7 @@ impl App {
             return;
         }
         let dir = self.page.path.parent().unwrap_or(Path::new("."));
-        self.open(dir.join(percent_decode(target)), true);
+        self.open(dir.join(page::percent_decode(target)), true);
     }
 
     fn link_at(&self, x: f32, y: f32) -> Option<String> {

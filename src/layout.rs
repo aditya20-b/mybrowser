@@ -5,10 +5,12 @@
 //! margins collapse. Inline layout: text is flattened into words and
 //! greedily wrapped into lines, then aligned. Tables use the classic
 //! auto-layout idea: measure each column's min/max content width, fit the
-//! table to the available space, then lay the cells out row by row.
+//! table to the available space, then lay the cells out row by row. Form
+//! controls are inline boxes drawn from rects and text.
 use crate::css::{Color, Length};
 use crate::dom::{Dom, Kind, NodeId};
-use crate::fonts::{Face, Fonts};
+use crate::fonts::{Face, Family, Fonts};
+use crate::forms::{self, ControlKind, FormState};
 use crate::images::Image;
 use crate::style::{Align, Display, Style, VAlign};
 use std::collections::HashMap;
@@ -17,6 +19,19 @@ use std::rc::Rc;
 /// A table never has more columns than this (cells beyond it are dropped), so
 /// `colspan=999999999` can't allocate gigabytes.
 const MAX_COLS: usize = 1000;
+
+/// Form controls use a fixed 13.333px sans-serif, like a browser's default.
+const CTL_FONT: f32 = 13.333;
+const CTL_BORDER: Color = Color { r: 118, g: 118, b: 118 };
+const CTL_FOCUS: Color = Color { r: 26, g: 115, b: 232 };
+const CTL_FACE: Color = Color { r: 239, g: 239, b: 239 };
+const CTL_TEXT: Color = Color { r: 32, g: 32, b: 32 };
+const CTL_PLACEHOLDER: Color = Color { r: 117, g: 117, b: 117 };
+const CTL_DISABLED: Color = Color { r: 150, g: 150, b: 150 };
+
+fn ctl_face() -> Face {
+    Face { family: Family::Sans, bold: false, italic: false }
+}
 
 pub enum Item {
     Nop,
@@ -34,9 +49,19 @@ pub struct LinkRegion {
     pub href: String,
 }
 
+/// The area a form control occupies, for hit-testing clicks.
+pub struct ControlRegion {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub node: NodeId,
+}
+
 pub struct Layout {
     pub items: Vec<Item>,
     pub links: Vec<LinkRegion>,
+    pub controls: Vec<ControlRegion>,
     pub height: f32,
     pub canvas_bg: Option<Color>,
 }
@@ -46,6 +71,7 @@ pub fn layout_document(
     styles: &[Style],
     fonts: &Fonts,
     images: &HashMap<NodeId, Rc<Image>>,
+    form: &FormState,
     width: f32,
 ) -> Layout {
     // Which inline elements contain block-level descendants? Children come
@@ -58,13 +84,13 @@ pub fn layout_document(
             _ => true,
         });
     }
-    let mut cx = Ctx { dom, styles, fonts, images, has_block, items: vec![], links: vec![] };
+    let mut cx = Ctx { dom, styles, fonts, images, form, has_block, items: vec![], links: vec![], controls: vec![] };
     let (bottom, mb) = cx.layout_block(0, 0.0, 0.0, 0.0, width, None, false);
 
     // The canvas takes the background of <html>, or else of <body>.
     let body = dom.nodes[0].children.iter().copied().find(|&c| dom.tag(c) == Some("body"));
     let canvas_bg = styles[0].background.or(body.and_then(|b| styles[b].background));
-    Layout { items: cx.items, links: cx.links, height: bottom + mb, canvas_bg }
+    Layout { items: cx.items, links: cx.links, controls: cx.controls, height: bottom + mb, canvas_bg }
 }
 
 struct Ctx<'a> {
@@ -72,10 +98,12 @@ struct Ctx<'a> {
     styles: &'a [Style],
     fonts: &'a Fonts,
     images: &'a HashMap<NodeId, Rc<Image>>,
+    form: &'a FormState,
     /// `has_block[i]`: element `i` is inline but contains block-level boxes.
     has_block: Vec<bool>,
     items: Vec<Item>,
     links: Vec<LinkRegion>,
+    controls: Vec<ControlRegion>,
 }
 
 fn resolve(l: Length, base: f32) -> Option<f32> {
@@ -105,6 +133,8 @@ enum Inl {
     Break(NodeId),
     /// A decoded image sitting on the baseline, already sized in CSS pixels.
     Image { node: NodeId, w: f32, h: f32 },
+    /// A form control: `asc` above the text baseline, `desc` below it.
+    Control { node: NodeId, w: f32, asc: f32, desc: f32 },
 }
 
 struct Placed {
@@ -115,6 +145,8 @@ struct Placed {
     href: Option<String>,
     /// Some(height) if this is an image rather than a word.
     image_h: Option<f32>,
+    /// Some((ascent, descent)) if this is a form control.
+    control: Option<(f32, f32)>,
 }
 
 struct Line {
@@ -137,9 +169,10 @@ struct Decor {
 struct CellOut {
     height: f32,
     decor: Decor,
-    /// Range of display items / link regions that make up the cell's content.
+    /// Range of display items / link regions / controls that make up the cell's content.
     content: (usize, usize),
     links: (usize, usize),
+    controls: (usize, usize),
 }
 
 struct Cell {
@@ -400,7 +433,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// Move a range of already-emitted content down by `dy`.
-    fn shift(&mut self, items: (usize, usize), links: (usize, usize), dy: f32) {
+    fn shift(&mut self, items: (usize, usize), links: (usize, usize), controls: (usize, usize), dy: f32) {
         for it in &mut self.items[items.0..items.1] {
             match it {
                 Item::Rect { y, .. } | Item::Image { y, .. } => *y += dy,
@@ -410,6 +443,9 @@ impl<'a> Ctx<'a> {
         }
         for l in &mut self.links[links.0..links.1] {
             l.y += dy;
+        }
+        for c in &mut self.controls[controls.0..controls.1] {
+            c.y += dy;
         }
     }
 
@@ -602,6 +638,13 @@ impl<'a> Ctx<'a> {
                 }
                 match tag.as_str() {
                     "br" => out.push(Inl::Break(id)),
+                    // Form controls are drawn by the engine; their children (a
+                    // <button>'s label, <option>s, <textarea> text) aren't flowed.
+                    "input" | "button" | "textarea" | "select" => {
+                        if let Some((w, asc, desc)) = self.control_metrics(id) {
+                            out.push(Inl::Control { node: id, w, asc, desc });
+                        }
+                    }
                     "img" => match self.images.get(&id) {
                         Some(img) => {
                             let (w, h) = self.image_size(id, img);
@@ -691,6 +734,172 @@ impl<'a> Ctx<'a> {
         out
     }
 
+    // ---------------------------------------------------------------- form controls
+
+    /// (width, ascent, descent) of a control's box relative to the text baseline,
+    /// or None for controls that draw nothing (`type=hidden`).
+    fn control_metrics(&self, id: NodeId) -> Option<(f32, f32, f32)> {
+        let kind = forms::kind_of(self.dom, id)?;
+        let face = ctl_face();
+        let (a, d) = self.fonts.vmetrics(face, CTL_FONT);
+        let ch = self.fonts.measure(face, CTL_FONT, "0");
+        // a legacy numeric attribute (`size`, `cols`, `rows`), at least 1
+        let num = |name: &str, default: f32, max: f32| self.attr_num(id, name).filter(|n| *n >= 1.0).unwrap_or(default).min(max);
+        Some(match kind {
+            ControlKind::Hidden => return None,
+            ControlKind::Text | ControlKind::Password => (num("size", 20.0, 100.0) * ch + 10.0, 3.0 + a, d + 3.0),
+            ControlKind::Textarea => {
+                let rows = num("rows", 2.0, 30.0).round();
+                // a textarea's baseline is its bottom edge
+                (num("cols", 20.0, 100.0) * ch + 10.0, rows * (a + d) + 6.0, 0.0)
+            }
+            ControlKind::Checkbox | ControlKind::Radio => (13.0, 13.0, 0.0),
+            ControlKind::Submit | ControlKind::Button => {
+                (self.fonts.measure(face, CTL_FONT, &self.control_label(id)) + 20.0, 4.0 + a, d + 4.0)
+            }
+            ControlKind::Select => {
+                let widest = forms::options(self.dom, id)
+                    .iter()
+                    .map(|(_, label)| self.fonts.measure(face, CTL_FONT, label))
+                    .fold(0.0f32, f32::max);
+                (widest + 30.0, 3.0 + a, d + 3.0)
+            }
+        })
+    }
+
+    /// The text on a button.
+    fn control_label(&self, id: NodeId) -> String {
+        if self.dom.tag(id) == Some("button") {
+            let text = self.dom.text_content(id).split_whitespace().collect::<Vec<_>>().join(" ");
+            if !text.is_empty() {
+                return text;
+            }
+        }
+        let value = self.form.value(self.dom, id);
+        if !value.is_empty() && self.dom.tag(id) != Some("button") {
+            return value;
+        }
+        let ty = self.dom.attr(id, "type").unwrap_or("").trim().to_ascii_lowercase();
+        match (forms::kind_of(self.dom, id), ty.as_str()) {
+            (_, "reset") => "Reset".into(),
+            (Some(ControlKind::Submit), _) => "Submit".into(),
+            _ => String::new(),
+        }
+    }
+
+    /// As much of `text` as fits in `max_w`: from the start, or (`tail`) the end,
+    /// which keeps the caret visible while typing in a long field.
+    fn clip(&self, text: &str, max_w: f32, tail: bool) -> String {
+        let face = ctl_face();
+        let (mut out, mut used) = (Vec::new(), 0.0f32);
+        let chars: Box<dyn Iterator<Item = char>> = if tail { Box::new(text.chars().rev()) } else { Box::new(text.chars()) };
+        for c in chars {
+            let cw = self.fonts.measure(face, CTL_FONT, c.encode_utf8(&mut [0; 4]));
+            if used + cw > max_w {
+                break;
+            }
+            used += cw;
+            out.push(c);
+        }
+        if tail {
+            out.reverse();
+        }
+        out.into_iter().collect()
+    }
+
+    /// A bordered box: `border` all round, `fill` inside.
+    #[allow(clippy::too_many_arguments)]
+    fn push_box(&mut self, x: f32, y: f32, w: f32, h: f32, bw: f32, border: Color, fill: Color) {
+        self.items.push(Item::Rect { x, y, w, h, color: border });
+        self.items.push(Item::Rect { x: x + bw, y: y + bw, w: (w - 2.0 * bw).max(0.0), h: (h - 2.0 * bw).max(0.0), color: fill });
+    }
+
+    fn push_text(&mut self, x: f32, baseline: f32, text: String, size: f32, color: Color) {
+        if !text.is_empty() {
+            self.items.push(Item::Text { x, baseline, text, size, face: ctl_face(), color });
+        }
+    }
+
+    /// Draw a form control whose box has its text baseline at `baseline`.
+    fn emit_control(&mut self, id: NodeId, x: f32, baseline: f32, w: f32, asc: f32, desc: f32) {
+        let Some(kind) = forms::kind_of(self.dom, id) else { return };
+        let (top, h) = (baseline - asc, asc + desc);
+        let (a, d) = self.fonts.vmetrics(ctl_face(), CTL_FONT);
+        let focused = self.form.focus == Some(id);
+        let disabled = forms::is_disabled(self.dom, id);
+        let (border, bw) = if focused { (CTL_FOCUS, 2.0) } else { (CTL_BORDER, 1.0) };
+        let ink = if disabled { CTL_DISABLED } else { CTL_TEXT };
+
+        match kind {
+            ControlKind::Hidden => return,
+            ControlKind::Checkbox | ControlKind::Radio => {
+                self.push_box(x, top, w, h, bw, border, Color::WHITE);
+                if self.form.is_checked(self.dom, id) {
+                    let inset = if kind == ControlKind::Radio { 4.0 } else { 3.0 };
+                    self.items.push(Item::Rect { x: x + inset, y: top + inset, w: w - 2.0 * inset, h: h - 2.0 * inset, color: ink });
+                }
+            }
+            ControlKind::Submit | ControlKind::Button => {
+                self.push_box(x, top, w, h, bw, border, CTL_FACE);
+                let label = self.control_label(id);
+                let tw = self.fonts.measure(ctl_face(), CTL_FONT, &label);
+                self.push_text(x + (w - tw) / 2.0, baseline, label, CTL_FONT, ink);
+            }
+            ControlKind::Text | ControlKind::Password => {
+                self.push_box(x, top, w, h, bw, border, Color::WHITE);
+                let value = self.form.value(self.dom, id);
+                let shown = if kind == ControlKind::Password { "•".repeat(value.chars().count()) } else { value };
+                let inner = w - 10.0;
+                let (text, color) = if shown.is_empty() {
+                    (self.clip(self.dom.attr(id, "placeholder").unwrap_or(""), inner, false), CTL_PLACEHOLDER)
+                } else {
+                    (self.clip(&shown, inner, focused), ink)
+                };
+                let tw = self.fonts.measure(ctl_face(), CTL_FONT, &text);
+                self.push_text(x + 5.0, baseline, text, CTL_FONT, color);
+                if focused {
+                    // the caret sits after the typed text, not after placeholder text
+                    let caret_x = x + 5.0 + if shown.is_empty() { 0.0 } else { tw };
+                    self.items.push(Item::Rect { x: caret_x, y: top + 3.0, w: 1.0, h: a + d, color: CTL_TEXT });
+                }
+            }
+            ControlKind::Textarea => {
+                self.push_box(x, top, w, h, bw, border, Color::WHITE);
+                let value = self.form.value(self.dom, id);
+                let line_h = a + d;
+                let rows = (((h - 6.0) / line_h).floor() as usize).max(1);
+                let inner = w - 10.0;
+                let (lines, color): (Vec<String>, Color) = if value.is_empty() {
+                    (vec![self.dom.attr(id, "placeholder").unwrap_or("").to_string()], CTL_PLACEHOLDER)
+                } else {
+                    (value.split('\n').map(String::from).collect(), ink)
+                };
+                // show the last `rows` lines, so what's being typed stays visible
+                let skip = lines.len().saturating_sub(rows);
+                let last = lines.len() - 1;
+                for (i, line) in lines.iter().skip(skip).enumerate() {
+                    let b = top + 3.0 + a + i as f32 * line_h;
+                    let clipped = self.clip(line, inner, focused && skip + i == last);
+                    if focused && skip + i == last && !value.is_empty() {
+                        let tw = self.fonts.measure(ctl_face(), CTL_FONT, &clipped);
+                        self.items.push(Item::Rect { x: x + 5.0 + tw, y: b - a, w: 1.0, h: line_h, color: CTL_TEXT });
+                    }
+                    self.push_text(x + 5.0, b, clipped, CTL_FONT, color);
+                }
+                if focused && value.is_empty() {
+                    self.items.push(Item::Rect { x: x + 5.0, y: top + 3.0, w: 1.0, h: line_h, color: CTL_TEXT });
+                }
+            }
+            ControlKind::Select => {
+                self.push_box(x, top, w, h, bw, border, Color::WHITE);
+                let label = self.clip(&self.form.selected_label(self.dom, id), w - 25.0, false);
+                self.push_text(x + 5.0, baseline, label, CTL_FONT, ink);
+                self.push_text(x + w - 16.0, baseline, "▼".to_string(), 8.0, ink);
+            }
+        }
+        self.controls.push(ControlRegion { x, y: top, w, h, node: id });
+    }
+
     /// Greedy line breaking. Returns the height consumed. `parent` is the block
     /// whose font gives every line its minimum height (the "strut").
     fn layout_inline(&mut self, items: &[Inl], x: f32, y: f32, width: f32, align: Align, parent: NodeId) -> f32 {
@@ -703,8 +912,8 @@ impl<'a> Ctx<'a> {
         let mut pending_space: Option<NodeId> = None;
 
         for it in items {
-            // Everything placeable (a word or an image) reduces to the same tuple.
-            let (text, node, w, a, d, pre, image_h) = match it {
+            // Everything placeable (a word, an image or a control) reduces to the same tuple.
+            let (text, node, w, a, d, pre, image_h, control) = match it {
                 Inl::Space(n) => {
                     pending_space = Some(*n);
                     continue;
@@ -724,9 +933,10 @@ impl<'a> Ctx<'a> {
                 Inl::Word { text, node, pre } => {
                     let s = &styles[*node];
                     let (a, d) = fonts.vmetrics(s.face(), s.font_size);
-                    (text.clone(), *node, fonts.measure(s.face(), s.font_size, text), a, d, *pre, None)
+                    (text.clone(), *node, fonts.measure(s.face(), s.font_size, text), a, d, *pre, None, None)
                 }
-                Inl::Image { node, w, h } => (String::new(), *node, *w, *h, 0.0, false, Some(*h)),
+                Inl::Image { node, w, h } => (String::new(), *node, *w, *h, 0.0, false, Some(*h), None),
+                Inl::Control { node, w, asc, desc } => (String::new(), *node, *w, *asc, *desc, false, None, Some((*asc, *desc))),
             };
             let mut sp = match pending_space {
                 Some(sn) if !lines.last().unwrap().words.is_empty() => {
@@ -745,7 +955,7 @@ impl<'a> Ctx<'a> {
             line.asc = line.asc.max(a);
             line.desc = line.desc.max(d);
             line.content = true;
-            line.words.push(Placed { text, node, x: cx + sp, w, href, image_h });
+            line.words.push(Placed { text, node, x: cx + sp, w, href, image_h, control });
             cx += sp + w;
             pending_space = None;
         }
@@ -774,6 +984,10 @@ impl<'a> Ctx<'a> {
                     if let Some(href) = &w.href {
                         self.links.push(LinkRegion { x: ax, y: baseline - h, w: w.w, h, href: href.clone() });
                     }
+                    continue;
+                }
+                if let Some((asc, desc)) = w.control {
+                    self.emit_control(w.node, ax, baseline, w.w, asc, desc);
                     continue;
                 }
                 // A link or underline continues across the space to the next word
@@ -832,7 +1046,7 @@ impl<'a> Ctx<'a> {
                     let s = &self.styles[*node];
                     self.fonts.measure(s.face(), s.font_size, text)
                 }
-                Inl::Image { w, .. } => *w,
+                Inl::Image { w, .. } | Inl::Control { w, .. } => *w,
             };
             if line > 0.0 {
                 if let Some(sn) = space {
@@ -1109,11 +1323,12 @@ impl<'a> Ctx<'a> {
         let content_w = (outer_w - pad[1] - pad[3] - bw[1] - bw[3]).max(0.0);
         let bg_slot = self.items.len();
         self.items.push(Item::Nop);
-        let (content_start, links_start) = (self.items.len(), self.links.len());
+        let (content_start, links_start, controls_start) = (self.items.len(), self.links.len(), self.controls.len());
 
         let (end_y, last_mb) = self.layout_children(id, x + bw[3] + pad[3], y + bw[0] + pad[0], content_w, false);
         let content = (content_start, self.items.len());
         let links = (links_start, self.links.len());
+        let controls = (controls_start, self.controls.len());
 
         // a cell is its own formatting context: its last margin stays inside it
         let inner_h = (end_y + last_mb) - (y + bw[0] + pad[0]);
@@ -1122,7 +1337,7 @@ impl<'a> Ctx<'a> {
             height = height.max(h + pad[0] + pad[2] + bw[0] + bw[2]);
         }
         let decor = self.emit_decor(s, bg_slot, x, y, outer_w, y + height, bw, color);
-        CellOut { height, decor, content, links }
+        CellOut { height, decor, content, links, controls }
     }
 
     /// Vertically align a laid-out cell inside the box `[top, bottom]` and stretch
@@ -1135,7 +1350,7 @@ impl<'a> Ctx<'a> {
             VAlign::Bottom => free,
         };
         if dy != 0.0 {
-            self.shift(out.content, out.links, dy);
+            self.shift(out.content, out.links, out.controls, dy);
         }
         self.stretch_decor(&out.decor, bottom);
     }
@@ -1668,5 +1883,157 @@ mod tests {
         let p = render("<style>table{border-collapse:collapse} td{border:2px solid red;padding:2px}</style><table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>");
         let thickest = rects(&p).into_iter().filter(|r| r.4 == RED).map(|r| r.2.min(r.3)).fold(0.0f32, f32::max);
         assert!(thickest <= 1.01, "each cell draws half of a 2px edge, got {thickest}");
+    }
+
+    // ---------------------------------------------------------------- form controls
+
+    #[test]
+    fn a_text_input_is_an_inline_box_sitting_on_the_text_baseline() {
+        let p = render("<p style='margin:0'>name <input name=q> end</p>");
+        assert_eq!(p.layout.controls.len(), 1);
+        let c = &p.layout.controls[0];
+        let (name, end) = (at(&p, "name"), at(&p, "end"));
+        assert_eq!(name.1, end.1, "text on both sides shares a baseline");
+        assert!(c.y < name.1 && name.1 < c.y + c.h, "the baseline runs through the box: {} not in {}..{}", name.1, c.y, c.y + c.h);
+        assert!(c.x > name.0 + 20.0 && end.0 > c.x + c.w, "the box sits between the words");
+        assert!(c.w > 100.0 && c.h > 14.0, "a default input is about 20 characters wide");
+        // the box is drawn: a grey border rect with a white fill inside it
+        let r = rects(&p);
+        assert!(r.iter().any(|r| r.4 == CTL_BORDER && (r.2 - c.w).abs() < 0.01));
+        assert!(r.iter().any(|r| r.4 == Color::WHITE && r.2 < c.w));
+    }
+
+    #[test]
+    fn values_placeholders_passwords_and_hidden_inputs() {
+        let p = render("<input value='hello'>");
+        assert!(texts(&p).iter().any(|(t, _)| t == "hello"));
+        // password fields never draw the real text
+        let p = render("<input type=password value=secret>");
+        let t = texts(&p);
+        assert!(t.iter().any(|(s, _)| s == "••••••") && !t.iter().any(|(s, _)| s.contains("secret")), "{t:?}");
+        // a placeholder shows while empty, in grey
+        let p = render("<input placeholder='Search…'>");
+        assert!(texts(&p).iter().any(|(t, _)| t == "Search…"));
+        let p = render("<input placeholder='Search…' value='x'>");
+        assert!(!texts(&p).iter().any(|(t, _)| t == "Search…"));
+        // hidden inputs take no space and have no region
+        let p = render("<p style='margin:0'>a<input type=hidden name=h value=1>b</p>");
+        assert!(p.layout.controls.is_empty());
+        assert_eq!(at(&p, "a").1, at(&p, "b").1);
+    }
+
+    #[test]
+    fn buttons_checkboxes_radios_and_selects_render() {
+        let p = render("<input type=submit><input type=submit value='Go now'><button>Click  me</button><input type=button value=B><input type=reset>");
+        let labels: Vec<String> = texts(&p).into_iter().map(|(t, _)| t).collect();
+        for want in ["Submit", "Go", "now", "Click", "me", "B", "Reset"] {
+            // multi-word labels are one Text item each; accept either form
+            assert!(labels.iter().any(|l| l == want || l.contains(want)), "{want} in {labels:?}");
+        }
+        assert_eq!(p.layout.controls.len(), 5);
+        // boxes: a checkbox is 13px square, and a checked one has an inner mark
+        let off = render("<input type=checkbox>");
+        let on = render("<input type=checkbox checked>");
+        let c = &on.layout.controls[0];
+        assert_eq!((c.w, c.h), (13.0, 13.0));
+        assert!(rects(&on).len() > rects(&off).len(), "the checked box draws an extra mark");
+        // a select shows the chosen option and sizes to the widest
+        let p = render("<select name=s><option>Short<option selected>A much longer option</select>");
+        let t = texts(&p);
+        assert!(t.iter().any(|(s, _)| s == "A much longer option") && !t.iter().any(|(s, _)| s == "Short"));
+        assert!(p.layout.controls[0].w > 100.0);
+    }
+
+    #[test]
+    fn focus_draws_a_ring_and_a_caret_and_typing_changes_what_is_shown() {
+        let fonts = Fonts::load();
+        let mut p = render("<form><input name=q></form>");
+        let id = p.layout.controls[0].node;
+        let plain = rects(&p).len();
+        assert!(!rects(&p).iter().any(|r| r.4 == CTL_FOCUS));
+        p.form.focus = Some(id);
+        p.relayout(&fonts, 400.0);
+        assert!(rects(&p).iter().any(|r| r.4 == CTL_FOCUS), "blue focus border");
+        assert_eq!(rects(&p).len(), plain + 1, "plus a caret");
+        let (dom, form) = (&p.dom, &mut p.form);
+        form.type_text(dom, id, "typed");
+        p.relayout(&fonts, 400.0);
+        assert!(texts(&p).iter().any(|(t, _)| t == "typed"));
+        // the region doesn't move or resize while typing
+        assert_eq!(p.layout.controls.len(), 1);
+    }
+
+    #[test]
+    fn long_values_are_clipped_to_the_box() {
+        let fonts = Fonts::load();
+        let mut p = render(&format!("<input size=8 value='{}'>", "w".repeat(200)));
+        let c = (p.layout.controls[0].x, p.layout.controls[0].w);
+        let shown = |p: &Page| texts_full(p).into_iter().find(|(t, _, _)| t.starts_with('w')).unwrap();
+        let (t, x, _) = shown(&p);
+        assert!(t.len() < 200 && x + fonts.measure(ctl_face(), CTL_FONT, &t) <= c.0 + c.1, "head of the value fits: {t:?}");
+        // while editing, the END of the value is what shows, so the caret stays visible
+        let id = p.layout.controls[0].node;
+        p.dom_value_edit(id, "END");
+        p.form.focus = Some(id);
+        p.relayout(&fonts, 400.0);
+        let (t, ..) = shown_end(&p);
+        assert!(t.ends_with("END"), "{t:?}");
+    }
+
+    fn shown_end(p: &Page) -> (String, f32, f32) {
+        texts_full(p).into_iter().find(|(t, _, _)| t.ends_with("END")).expect("the tail of the value is drawn")
+    }
+
+    #[test]
+    fn textareas_show_their_last_rows_and_scale_with_rows_and_cols() {
+        let small = render("<textarea rows=2 cols=10></textarea>");
+        let big = render("<textarea rows=6 cols=40></textarea>");
+        assert!(big.layout.controls[0].h > small.layout.controls[0].h * 2.5);
+        assert!(big.layout.controls[0].w > small.layout.controls[0].w * 3.0);
+        let p = render("<textarea rows=2>one\ntwo\nthree</textarea>");
+        let t: Vec<String> = texts(&p).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(t, ["two", "three"], "only the last two rows fit");
+    }
+
+    #[test]
+    fn controls_wrap_flow_in_tables_and_have_clickable_regions() {
+        // wraps to the next line in a narrow container, like any inline box
+        let p = render_w("<input size=10><input size=10><input size=10>", 200.0);
+        assert!(p.layout.controls.len() == 3 && p.layout.controls[2].y > p.layout.controls[0].y + 5.0);
+        // inside table cells they move with vertical alignment
+        let p = render("<table><tr><td><input name=a></td><td>one<br>two<br>three</td></tr></table>");
+        let c = &p.layout.controls[0];
+        let top = at(&p, "one").1;
+        assert!(c.y + c.h / 2.0 > top - 12.0 && c.y > 0.0, "the control was shifted with its cell: y={} first line {}", c.y, top);
+        // every visible control has a region whose rect is inside the document
+        let p = render("<form><input name=a><input type=checkbox><button>b</button><select><option>x</select><textarea></textarea></form>");
+        assert_eq!(p.layout.controls.len(), 5);
+        assert!(p.layout.controls.iter().all(|c| c.w > 0.0 && c.h > 0.0 && c.y + c.h <= p.layout.height + 1.0));
+    }
+
+    #[test]
+    fn hostile_control_attributes_do_not_break_layout() {
+        for body in [
+            "<input size=99999 value='x'>", "<input size=-5>", "<input size=abc>", "<textarea rows=99999 cols=99999>x</textarea>",
+            "<textarea rows=-3 cols=0></textarea>", "<select></select>", "<select><option></select>", "<button></button>",
+            "<input type=submit value=''>", "<input value='é日本語🎉' placeholder='ü'>", "<table><tr><td><input></td></tr></table>",
+            "<input style='display:none'>", "<form><form><input></form></form>",
+        ] {
+            let p = render(body);
+            assert!(p.layout.height.is_finite(), "{body}");
+        }
+    }
+
+    #[test]
+    fn pages_with_controls_paint_without_panicking() {
+        use crate::paint::Painter;
+        let fonts = Fonts::load();
+        let mut p = render("<form><input name=a value=hello><input type=password value=x><input type=checkbox checked><button>Go</button><select><option>A</select><textarea>t</textarea></form>");
+        p.form.focus = Some(p.layout.controls[0].node);
+        p.relayout(&fonts, 400.0);
+        let (w, h) = (400usize, 120usize);
+        for scale in [1.0, 2.0] {
+            Painter::default().paint(&mut vec![0; w * h], w, h, &p.layout, &fonts, 0.0, scale);
+        }
     }
 }

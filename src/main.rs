@@ -2,6 +2,7 @@ mod chrome;
 mod css;
 mod dom;
 mod fonts;
+mod forms;
 mod html;
 mod images;
 mod layout;
@@ -11,7 +12,9 @@ mod paint;
 mod style;
 
 use chrome::{AddressBar, ChromeView, Hit};
+use dom::NodeId;
 use fonts::Fonts;
+use forms::{ControlKind, FormState};
 use page::Page;
 use paint::Painter;
 use std::num::NonZeroU32;
@@ -397,8 +400,15 @@ impl App {
             };
             (icon, None)
         } else {
-            let link = self.link_at(cx, cy - chrome::HEIGHT + self.scroll);
-            (if link.is_some() { CursorIcon::Pointer } else { CursorIcon::Default }, link)
+            let (px, py) = (cx, cy - chrome::HEIGHT + self.scroll);
+            if let Some(id) = self.page.control_at(px, py) {
+                // an I-beam over text fields, a hand over buttons, boxes and menus
+                let text = forms::kind_of(&self.page.dom, id).is_some_and(forms::is_text_like);
+                (if text { CursorIcon::Text } else { CursorIcon::Pointer }, None)
+            } else {
+                let link = self.link_at(px, py);
+                (if link.is_some() { CursorIcon::Pointer } else { CursorIcon::Default }, link)
+            }
         };
         self.hover = hover;
         if let Some(w) = &self.window {
@@ -497,6 +507,116 @@ impl App {
         l.map(|l| l.href.clone())
     }
 
+    // ---------- forms ----------
+
+    /// The form state changed (focus, text, a toggle): the page must be laid out
+    /// and drawn again.
+    fn form_changed(&mut self) {
+        self.laid_out_width = -1.0;
+        self.request_redraw();
+    }
+
+    /// A click landed on control `id`.
+    fn activate_control(&mut self, id: NodeId) {
+        let kind = forms::kind_of(&self.page.dom, id);
+        let Page { dom, form, .. } = &mut self.page;
+        match kind {
+            Some(ControlKind::Text | ControlKind::Password | ControlKind::Textarea) => form.focus = Some(id),
+            Some(ControlKind::Checkbox | ControlKind::Radio) => {
+                form.focus = Some(id);
+                form.toggle(dom, id);
+            }
+            Some(ControlKind::Select) => {
+                form.focus = Some(id);
+                form.cycle_select(dom, id);
+            }
+            Some(ControlKind::Submit) => {
+                form.focus = Some(id);
+                self.submit_form(id, Some(id));
+            }
+            Some(ControlKind::Button) => form.focus = Some(id),
+            _ => {}
+        }
+        self.form_changed();
+    }
+
+    /// Submit the form that contains `control`, as if `submitter` (a button) was clicked.
+    fn submit_form(&mut self, control: NodeId, submitter: Option<NodeId>) {
+        let Some(form_el) = forms::form_of(&self.page.dom, control) else { return };
+        let Some(sub) = self.page.form.submit(&self.page.dom, form_el, submitter, &self.page.url) else { return };
+        match sub.method {
+            forms::Method::Get => match resolve_link(&self.page.url, sub.url.as_str()) {
+                Link::Navigate(url) => self.open(url),
+                Link::Nothing => self.reload(), // submitting the page you're already on
+                Link::External(url) => eprintln!("not supported (yet): {url}"),
+            },
+            forms::Method::Post => eprintln!("POST forms aren't supported yet: {}", sub.url),
+        }
+    }
+
+    /// A key press while a form control has focus. Returns true if the control
+    /// consumed it. Typing in a text field consumes everything (so `r` types an
+    /// `r` instead of reloading); other controls only take Space, Enter, Tab and Escape.
+    fn control_key(&mut self, event: &KeyEvent, cmd: bool) -> bool {
+        let Some(id) = self.page.form.focus else { return false };
+        if cmd {
+            return false; // Cmd+L, Cmd+R ... still work
+        }
+        let kind = forms::kind_of(&self.page.dom, id);
+        let text_like = kind.is_some_and(forms::is_text_like);
+        let shift = self.modifiers.shift_key();
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.page.form.focus = None;
+                self.form_changed();
+                true
+            }
+            Key::Named(NamedKey::Tab) => {
+                let Page { dom, form, .. } = &mut self.page;
+                form.focus_next(dom, !shift);
+                self.form_changed();
+                true
+            }
+            Key::Named(NamedKey::Enter) => {
+                match kind {
+                    Some(ControlKind::Textarea) => self.page.dom_value_edit(id, "\n"),
+                    Some(ControlKind::Submit) => self.submit_form(id, Some(id)),
+                    Some(ControlKind::Text | ControlKind::Password) => {
+                        // implicit submission: Enter "clicks" the form's first submit button
+                        if let Some(form_el) = forms::form_of(&self.page.dom, id) {
+                            let button = FormState::default_button(&self.page.dom, form_el);
+                            self.submit_form(id, button);
+                        }
+                    }
+                    Some(ControlKind::Checkbox | ControlKind::Radio | ControlKind::Select) => self.activate_control(id),
+                    _ => {}
+                }
+                self.form_changed();
+                true
+            }
+            Key::Named(NamedKey::Backspace) if text_like => {
+                let Page { dom, form, .. } = &mut self.page;
+                form.backspace(dom, id);
+                self.form_changed();
+                true
+            }
+            Key::Named(NamedKey::Space)
+                if matches!(kind, Some(ControlKind::Checkbox | ControlKind::Radio | ControlKind::Select | ControlKind::Submit | ControlKind::Button)) =>
+            {
+                self.activate_control(id);
+                true
+            }
+            _ if text_like => {
+                if let Some(text) = &event.text {
+                    self.page.dom_value_edit(id, text.as_str());
+                }
+                self.form_changed();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Enter pressed in the address bar. Going to the page you're already on is
     /// a reload, not a new history entry.
     fn commit_address(&mut self) {
@@ -532,9 +652,18 @@ impl App {
                 let url = if self.nav.is_loading() { self.bar.submit_text().to_string() } else { self.page.url.to_string() };
                 self.bar.show(&url);
             }
-            self.update_hover(); // hit-test at release time rather than trusting a stale hover
-            if let Some(href) = self.hover.clone() {
-                self.follow(&href);
+            let (px, py) = (cx, cy - chrome::HEIGHT + self.scroll);
+            if let Some(id) = self.page.control_at(px, py) {
+                self.activate_control(id);
+            } else {
+                // clicking anywhere else leaves the control that had focus
+                if self.page.form.focus.take().is_some() {
+                    self.form_changed();
+                }
+                self.update_hover(); // hit-test at release time rather than trusting a stale hover
+                if let Some(href) = self.hover.clone() {
+                    self.follow(&href);
+                }
             }
         }
         self.request_redraw();
@@ -590,6 +719,10 @@ impl App {
             self.request_redraw();
             return;
         }
+        if self.control_key(event, cmd) {
+            self.request_redraw();
+            return;
+        }
         let page = self.view_height() * 0.9;
         let alt_or_cmd = self.modifiers.alt_key() || self.modifiers.super_key();
         match &event.logical_key {
@@ -602,6 +735,12 @@ impl App {
                 _ => {}
             },
             Key::Named(NamedKey::Escape) => self.cancel_load(),
+            Key::Named(NamedKey::Tab) => {
+                // Tab into the page's first control (Shift+Tab: the last)
+                let (shift, Page { dom, form, .. }) = (self.modifiers.shift_key(), &mut self.page);
+                form.focus_next(dom, !shift);
+                self.form_changed();
+            }
             Key::Named(NamedKey::ArrowDown) => self.scroll_by(48.0),
             Key::Named(NamedKey::ArrowUp) => self.scroll_by(-48.0),
             Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => self.scroll_by(page),
@@ -799,6 +938,18 @@ mod tests {
         assert_eq!(resolve_link(&local, "file:///other.html"), Link::Navigate(u("file:///other.html")));
     }
 
+    #[test]
+    fn form_submissions_go_through_the_same_link_safety_checks() {
+        // a form on a web page can't send you to a local file or a javascript: URL
+        let page = u("https://example.com/form.html");
+        for action in ["file:///etc/passwd", "javascript:alert(1)", "mailto:a@b.c"] {
+            assert!(matches!(resolve_link(&page, action), Link::External(_)), "{action}");
+        }
+        // and a GET form to the same URL is "nothing new", which the window turns into a reload
+        assert_eq!(resolve_link(&page, "https://example.com/form.html"), Link::Nothing);
+        assert_eq!(resolve_link(&page, "https://example.com/form.html?q=rust"), Link::Navigate(u("https://example.com/form.html?q=rust")));
+    }
+
     // ---------- background loading ----------
 
     #[test]
@@ -925,7 +1076,7 @@ mod tests {
         enc.set_depth(png::BitDepth::Eight);
         enc.write_header().unwrap().write_image_data(&[255u8; 24]).unwrap();
         std::fs::write(dir.join("a.png"), &png).unwrap();
-        std::fs::write(dir.join("p.html"), "<title>Threaded</title><style>p{color:red}</style><p>hi</p><img src=a.png><img src=a.png>").unwrap();
+        std::fs::write(dir.join("p.html"), "<title>Threaded</title><style>p{color:red}</style><p>hi</p><img src=a.png><img src=a.png><form><input name=q value=x></form>").unwrap();
         let url = Url::from_file_path(dir.join("p.html")).unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel::<(u64, SendPage)>();
@@ -946,6 +1097,7 @@ mod tests {
             assert_eq!((page.title.as_str(), page.images.len()), ("Threaded", 2));
             page.relayout(&fonts, 300.0); // lays out and clones the Rc'd images, on this thread
             assert!(page.layout.items.iter().any(|i| matches!(i, layout::Item::Image { .. })));
+            assert_eq!(page.layout.controls.len(), 1, "form controls survive the handoff too");
         }
         assert_eq!(seen, 4);
     }

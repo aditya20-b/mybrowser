@@ -3,6 +3,7 @@
 use crate::css::{self, Rule};
 use crate::dom::{Dom, Kind, NodeId};
 use crate::fonts::Fonts;
+use crate::forms::FormState;
 use crate::html;
 use crate::images::{self, Image};
 use crate::layout::{self, Layout};
@@ -38,6 +39,8 @@ pub struct Page {
     pub dom: Dom,
     pub styles: Vec<Style>,
     pub images: HashMap<NodeId, Rc<Image>>,
+    /// What the user has typed into, checked or chosen in the page's form controls.
+    pub form: FormState,
     pub layout: Layout,
 }
 
@@ -314,13 +317,32 @@ impl Page {
             }
         }
 
-        let layout = Layout { items: vec![], links: vec![], height: 0.0, canvas_bg: None };
-        Page { url: url.clone(), status: None, title, dom, styles, images, layout }
+        let layout = Layout { items: vec![], links: vec![], controls: vec![], height: 0.0, canvas_bg: None };
+        Page { url: url.clone(), status: None, title, dom, styles, images, form: FormState::default(), layout }
     }
 
-    /// Re-run layout for a new viewport width (logical pixels).
+    /// Re-run layout for a new viewport width (logical pixels), or after the
+    /// form state changed (typing, focus, a toggled checkbox).
     pub fn relayout(&mut self, fonts: &Fonts, width: f32) {
-        self.layout = layout::layout_document(&self.dom, &self.styles, fonts, &self.images, width);
+        self.layout = layout::layout_document(&self.dom, &self.styles, fonts, &self.images, &self.form, width);
+    }
+
+    /// The form control under layout position `(x, y)`, if any. Later controls
+    /// win over earlier ones where they overlap.
+    pub fn control_at(&self, x: f32, y: f32) -> Option<NodeId> {
+        self.layout
+            .controls
+            .iter()
+            .rev()
+            .find(|c| x >= c.x && x <= c.x + c.w && y >= c.y && y <= c.y + c.h)
+            .map(|c| c.node)
+    }
+
+    /// Type text into control `id` (the page's DOM and its form state live in
+    /// separate fields, so this borrows them together).
+    pub fn dom_value_edit(&mut self, id: NodeId, text: &str) {
+        let Page { dom, form, .. } = self;
+        form.type_text(dom, id, text);
     }
 }
 
@@ -783,5 +805,32 @@ mod tests {
         assert_eq!(p.display_title(), "notes.html");
         let p = Page::from_source(&t_url(), "<title>Hi</title>");
         assert_eq!(p.display_title(), "Hi");
+    }
+
+    // ---------- forms ----------
+
+    #[test]
+    fn clicking_finds_the_control_under_the_cursor() {
+        // (a space between the inputs: written back to back they would touch, as in a browser)
+        let p = render("<style>body{margin:0}</style><form><input name=a> <input name=b></form>", 400.0);
+        let (a, b) = (&p.layout.controls[0], &p.layout.controls[1]);
+        assert_eq!(p.control_at(a.x + 2.0, a.y + 2.0), Some(a.node));
+        assert_eq!(p.control_at(b.x + b.w - 2.0, b.y + b.h - 2.0), Some(b.node));
+        assert_eq!(p.control_at(-5.0, -5.0), None);
+        assert!(b.x > a.x + a.w + 1.0, "there is a gap to click in");
+        assert_eq!(p.control_at(a.x + a.w + 0.5 * (b.x - a.x - a.w), a.y + 2.0), None, "the gap between two inputs");
+    }
+
+    #[test]
+    fn typing_into_a_page_control_updates_its_value() {
+        let fonts = Fonts::load();
+        let mut p = render("<form action=/s><input name=q value=ab></form>", 400.0);
+        let id = p.layout.controls[0].node;
+        p.dom_value_edit(id, "cd");
+        p.relayout(&fonts, 400.0);
+        assert!(p.layout.items.iter().any(|i| matches!(i, Item::Text { text, .. } if text == "abcd")));
+        let form = crate::forms::form_of(&p.dom, id).unwrap();
+        let sub = p.form.submit(&p.dom, form, None, &p.url).unwrap();
+        assert_eq!(sub.url.query(), Some("q=abcd"));
     }
 }

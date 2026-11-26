@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Forms</title>
+  <style>
+    body { font-family: Helvetica, sans-serif; background-color: #f8fafc; color: #0f172a; }
+    .wrap { max-width: 560px; margin: 0 auto; padding: 8px 20px; }
+    h1 { color: #1e3a8a; font-size: 28px; }
+    .row { margin: 12px 0; }
+    .hint { color: #64748b; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Forms</h1>
+    <p>Click a field and type. <b>Tab</b> moves between controls, <b>Enter</b> submits, and the result lands in the address bar as a query string.</p>
+
+    <form action="forms.html" method="get">
+      <div class="row">Name: <input name="name" placeholder="Your name"></div>
+      <div class="row">Password: <input type="password" name="pw" value="hunter2"></div>
+      <div class="row">Colour:
+        <select name="colour">
+          <option value="r">Red</option>
+          <option value="g" selected>Green</option>
+          <option value="b">Blue</option>
+        </select>
+      </div>
+      <div class="row">
+        <input type="checkbox" name="news" checked> Send me news
+        &nbsp;&nbsp;
+        <input type="radio" name="size" value="s"> Small
+        <input type="radio" name="size" value="l" checked> Large
+      </div>
+      <div class="row">Message:<br><textarea name="msg" rows="3" cols="40">Hello, world</textarea></div>
+      <div class="row">
+        <input type="submit" value="Send">
+        <button name="act" value="save">Save draft</button>
+        <input type="button" value="Does nothing">
+      </div>
+      <p class="hint">Hidden fields are submitted too, but never drawn.<input type="hidden" name="token" value="abc123"></p>
+    </form>
+  </div>
+</body>
+</html>

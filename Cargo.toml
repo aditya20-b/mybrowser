@@ -1,0 +1,11 @@
+[package]
+name = "mybrowser"
+version = "0.1.0"
+edition = "2024"
+description = "A tiny browser rendering engine written from scratch in Rust"
+
+[dependencies]
+fontdue = "0.9.5"
+png = "0.18.1"
+softbuffer = "0.4.8"
+winit = "0.30.13"

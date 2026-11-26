@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>mybrowser demo</title>
+  <style>
+    body { background-color: #fafafa; font-family: Georgia, serif; }
+    .page { max-width: 640px; margin: 0 auto; padding: 8px 24px; background-color: white; }
+    h1 { color: #1a3a6b; border-bottom: 2px solid #1a3a6b; padding-bottom: 6px; }
+    .note { background-color: #fff3cd; border: 1px solid #e0c36a; padding: 10px 14px; margin: 16px 0; }
+    .note p { margin: 0; }
+    #tagline { font-style: italic; color: #666666; text-align: center; }
+    .box { width: 50%; margin: 12px auto; padding: 10px; background: #e8f0fe; text-align: center; }
+    blockquote { border-left: 4px solid #ccc; color: #444; }
+    code { background-color: #eeeeee; }
+    ul.plain { list-style: none; padding-left: 0; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>Hello from my own engine</h1>
+    <p id="tagline">HTML &rarr; DOM &rarr; styles &rarr; layout &rarr; pixels</p>
+
+    <p>This page is rendered by a tiny browser engine written from scratch in Rust.
+    It parses HTML and CSS, runs the cascade, lays out <b>block</b> and <i>inline</i> content,
+    wraps text, and rasterizes glyphs itself. Here is a <a href="second.html">link to another page</a>,
+    some <code>inline code</code>, and <mark>highlighted text</mark>.</p>
+
+    <div class="note"><p><b>Note:</b> backgrounds, borders, padding and margins all work, and
+    adjacent margins collapse like in a real browser.</p></div>
+
+    <h2>Box model</h2>
+    <div class="box">A centred box: width 50%, margin auto.</div>
+
+    <h2>Lists</h2>
+    <ul>
+      <li>Unordered item one</li>
+      <li>Unordered item two
+        <ul><li>Nested item</li></ul>
+      </li>
+    </ul>
+    <ol>
+      <li>First</li>
+      <li>Second</li>
+      <li>Third</li>
+    </ol>
+
+    <h2>Quotes &amp; code</h2>
+    <blockquote>Simplicity is prerequisite for reliability.</blockquote>
+    <pre>fn main() {
+    println!("preformatted text");
+}</pre>
+
+    <h2>Alignment</h2>
+    <p style="text-align: right">Right aligned paragraph.</p>
+    <p style="text-align: center; color: crimson; font-size: 20px">Centred, crimson, 20px.</p>
+    <hr>
+    <p><small>Scroll with the wheel or arrow keys. R reloads, Backspace goes back.</small></p>
+  </div>
+</body>
+</html>

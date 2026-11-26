@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Showcase</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { background-color: #0f172a; font-family: Helvetica, sans-serif; color: #e2e8f0; }
+    .wrap { max-width: 680px; margin: 0 auto; padding: 16px; }
+    h1 { color: #38bdf8; font-size: 34px; margin-bottom: 4px; }
+    .sub { color: #94a3b8; margin-top: 0; }
+    .card { background-color: #1e293b; border: 1px solid #334155; padding: 16px 20px; margin: 16px 0; }
+    .card h2 { margin-top: 0; color: #f8fafc; font-size: 20px; }
+    .row p { margin: 0; padding: 12px; text-align: center; color: #0f172a; font-weight: bold; }
+    #a { background: #f87171; }
+    #b { background: #fbbf24; width: 75%; margin: 0 auto; }
+    #c { background: #4ade80; width: 50%; margin: 0 auto; }
+    #d { background: #38bdf8; width: 25%; margin: 0 auto; }
+    .tag { background-color: #334155; color: #7dd3fc; }
+    .warn { border-left: 4px solid #f59e0b; padding-left: 12px; color: #fde68a; }
+    a { color: #7dd3fc; }
+    code { color: #fda4af; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Rendered by a from-scratch engine</h1>
+    <p class="sub">No WebKit, no Blink, no Gecko. Just a parser, a cascade, and a rasterizer.</p>
+
+    <div class="card">
+      <h2>Box model &amp; sizing</h2>
+      <div class="row">
+        <p id="a">width: auto</p>
+        <p id="b">75% + auto margins</p>
+        <p id="c">50%</p>
+        <p id="d">25%</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Inline formatting</h2>
+      <p>Text wraps greedily across lines and mixes <b>bold</b>, <i>italic</i>, <code>monospace</code>,
+      <span class="tag"> highlighted spans </span> and <a href="index.html">links</a>, all
+      measured with real glyph advances so every line breaks where a browser would.</p>
+      <p class="warn">Blocks can carry their own borders, padding and colours.</p>
+    </div>
+
+    <div class="card">
+      <h2>Lists</h2>
+      <ol>
+        <li>Parse HTML into a DOM</li>
+        <li>Parse CSS and run the cascade</li>
+        <li>Lay out boxes and wrap text</li>
+        <li>Rasterize to pixels</li>
+      </ol>
+    </div>
+  </div>
+</body>
+</html>

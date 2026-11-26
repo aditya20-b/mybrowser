@@ -5,27 +5,37 @@
 //! `Max-Age`) this applies the protections a browser needs:
 //!
 //! * a cookie's `Domain` may not be a public suffix (`co.uk`, `github.io`): no supercookies
-//! * `Secure` cookies are only accepted from https (or loopback) and never sent over plain http
+//! * `Secure` cookies are only accepted from https (or loopback), never sent over
+//!   plain http, and can't be overwritten by a plain-http response
 //! * `__Secure-` and `__Host-` prefixes are enforced
-//! * size and count limits, so one site can't make every later request to a host fail
+//! * size and count limits, so one site can't make every later request to a host fail;
+//!   when a site goes over, *its own* oldest cookies are evicted, never another site's
 //! * cross-site subresources (a tracking pixel on another domain) neither send nor set cookies
 use cookie_store::{Cookie, CookieDomain, CookieStore};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use url::{Host, Url};
 
 /// Longest `name=value` we keep (browsers use about 4 KB).
 const MAX_COOKIE_BYTES: usize = 4096;
-/// Most cookies kept per domain.
+/// Most cookies kept per host (or `Domain=` value).
 const MAX_PER_DOMAIN: usize = 50;
+/// Most cookies kept per site (registrable domain, all its subdomains together).
+const MAX_PER_SITE: usize = 180;
 /// Most cookies kept in total.
 const MAX_TOTAL: usize = 3000;
 /// Longest `Cookie:` request header we send. The HTTP client's buffer is finite, so an
 /// oversized header would make every request to the host fail.
 const MAX_HEADER: usize = 8000;
 
+/// (domain, path, name): how the store identifies a cookie.
+type Key = (String, String, String);
+
 pub struct Jar {
     store: CookieStore,
+    /// When each cookie was last set, so the oldest of an over-limit site go first.
+    seq: HashMap<Key, u64>,
+    counter: u64,
 }
 
 fn is_loopback(url: &Url) -> bool {
@@ -41,13 +51,19 @@ fn is_loopback(url: &Url) -> bool {
 /// or the host itself for IP addresses and names the suffix list doesn't know.
 pub fn site_of(url: &Url) -> String {
     match url.host() {
-        Some(Host::Domain(d)) => {
-            let d = d.to_ascii_lowercase();
-            psl::domain_str(&d).map(String::from).unwrap_or(d)
-        }
+        Some(Host::Domain(d)) => site_of_domain(d),
         Some(h) => h.to_string(),
         None => String::new(),
     }
+}
+
+/// The registrable domain of a cookie's domain string (IP addresses stay as they are).
+fn site_of_domain(d: &str) -> String {
+    let d = d.trim_start_matches('.').to_ascii_lowercase();
+    if d.parse::<std::net::IpAddr>().is_ok() {
+        return d;
+    }
+    psl::domain_str(&d).map(String::from).unwrap_or(d)
 }
 
 /// Are both URLs on the same site?
@@ -62,9 +78,13 @@ fn sendable(s: &str, allow_empty: bool) -> bool {
         && s.bytes().all(|b| (0x21..=0x7e).contains(&b) && !matches!(b, b';' | b',' | b'\\' | b'"' | b'=' | b' '))
 }
 
+fn key_of(c: &Cookie<'_>) -> Key {
+    (c.domain.as_cow().map(|d| d.into_owned()).unwrap_or_default(), String::from(&c.path), c.name().to_string())
+}
+
 impl Jar {
     pub fn new() -> Jar {
-        Jar { store: CookieStore::new() }
+        Jar { store: CookieStore::new(), seq: HashMap::new(), counter: 0 }
     }
 
     /// Process one `Set-Cookie` header received from `url`. Returns whether the cookie was kept.
@@ -97,17 +117,42 @@ impl Jar {
                 return false;
             }
         }
+        let key = key_of(&cookie);
+        // A plain-http response must not replace a Secure cookie (a network attacker could
+        // otherwise plant a value in a session that https then trusts).
+        if !https {
+            if let Some(old) = self.store.get(&key.0, &key.1, &key.2) {
+                if old.secure() == Some(true) {
+                    return false;
+                }
+            }
+        }
+        let expired = cookie.is_expired();
         if self.store.insert(cookie.into_owned(), url).is_err() {
             return false;
+        }
+        if expired {
+            self.seq.remove(&key); // it was a deletion
+        } else {
+            self.counter += 1;
+            self.seq.insert(key, self.counter);
         }
         self.prune();
         true
     }
 
     /// The value of the `Cookie:` header for a request to `url`, if any cookies apply.
+    /// Longer paths come first, then older cookies (RFC 6265).
     pub fn header_for(&self, url: &Url) -> Option<String> {
+        let mut matching = self.store.matches(url);
+        matching.sort_by_cached_key(|c| {
+            let key = key_of(c);
+            let age = self.seq.get(&key).copied().unwrap_or(0);
+            (std::cmp::Reverse(key.1.len()), age)
+        });
         let mut header = String::new();
-        for (name, value) in self.store.get_request_values(url) {
+        for c in matching {
+            let (name, value) = c.name_value();
             if !sendable(name, false) || !sendable(value, true) {
                 continue;
             }
@@ -130,33 +175,47 @@ impl Jar {
         self.store.iter_any().count()
     }
 
-    /// Drop cookies beyond the per-domain and total limits.
+    /// Enforce the limits. A host, then a whole site, that is over its share loses its
+    /// own oldest cookies; only if the jar as a whole is still over does the globally
+    /// oldest cookie go.
     fn prune(&mut self) {
-        // (domain, path, name) for every stored cookie
-        let all: Vec<(String, String, String)> = self
+        let all: Vec<(Key, String, u64)> = self
             .store
             .iter_any()
-            .map(|c| (c.domain.as_cow().map(|d| d.into_owned()).unwrap_or_default(), String::from(&c.path), c.name().to_string()))
+            .map(|c| {
+                let key = key_of(c);
+                let age = self.seq.get(&key).copied().unwrap_or(0);
+                let site = site_of_domain(&key.0);
+                (key, site, age)
+            })
             .collect();
-        let mut per_domain: HashMap<&str, usize> = HashMap::new();
-        for (domain, _, _) in &all {
-            *per_domain.entry(domain.as_str()).or_default() += 1;
+        if all.len() <= MAX_PER_DOMAIN {
+            return; // no group can be over a limit
         }
-        let mut excess: HashMap<&str, usize> = per_domain.into_iter().map(|(d, n)| (d, n.saturating_sub(MAX_PER_DOMAIN))).collect();
-        let mut over_total = all.len().saturating_sub(MAX_TOTAL);
-        let mut doomed = vec![];
-        for entry in &all {
-            let e = excess.get_mut(entry.0.as_str()).expect("counted above");
-            if *e > 0 {
-                *e -= 1;
-                doomed.push(entry);
-            } else if over_total > 0 {
-                over_total -= 1;
-                doomed.push(entry);
+        let mut doomed: HashSet<usize> = HashSet::new();
+        for (limit, by_site) in [(MAX_PER_DOMAIN, false), (MAX_PER_SITE, true)] {
+            let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+            for (i, (key, site, _)) in all.iter().enumerate() {
+                if !doomed.contains(&i) {
+                    groups.entry(if by_site { site.as_str() } else { key.0.as_str() }).or_default().push(i);
+                }
+            }
+            for (_, mut members) in groups {
+                if members.len() > limit {
+                    members.sort_by_key(|&i| all[i].2);
+                    doomed.extend(members.iter().take(members.len() - limit));
+                }
             }
         }
-        for (domain, path, name) in doomed {
-            self.store.remove(domain, path, name);
+        let mut alive: Vec<usize> = (0..all.len()).filter(|i| !doomed.contains(i)).collect();
+        if alive.len() > MAX_TOTAL {
+            alive.sort_by_key(|&i| all[i].2);
+            doomed.extend(alive.iter().take(alive.len() - MAX_TOTAL));
+        }
+        for i in doomed {
+            let (d, p, n) = &all[i].0;
+            self.store.remove(d, p, n);
+            self.seq.remove(&all[i].0);
         }
     }
 }
@@ -197,6 +256,19 @@ mod tests {
     }
 
     #[test]
+    fn the_cookie_header_order_is_stable_longer_paths_then_oldest_first() {
+        // the order used to depend on hash-map iteration, so it changed from run to run
+        for _ in 0..20 {
+            let mut jar = Jar::new();
+            let url = u("https://example.com/a/b/c");
+            for set in ["first=1; Path=/", "deep=2; Path=/a/b", "mid=3; Path=/a", "second=4; Path=/"] {
+                assert!(jar.accept(&url, set));
+            }
+            assert_eq!(header(&jar, "https://example.com/a/b/c"), "deep=2; mid=3; first=1; second=4");
+        }
+    }
+
+    #[test]
     fn a_public_suffix_domain_is_refused() {
         // Domain=co.uk used to put one site's cookie in front of every .co.uk site
         let mut jar = Jar::new();
@@ -228,6 +300,19 @@ mod tests {
     }
 
     #[test]
+    fn plain_http_cannot_overwrite_or_delete_a_secure_cookie() {
+        // a network attacker on any http page of the host used to plant values in https sessions
+        let mut jar = Jar::new();
+        assert!(jar.accept(&u("https://example.com/"), "tok=SECURE; Secure; Path=/"));
+        assert!(!jar.accept(&u("http://example.com/"), "tok=EVIL; Path=/"));
+        assert!(!jar.accept(&u("http://example.com/"), "tok=; Path=/; Max-Age=0"), "nor delete it");
+        assert_eq!(header(&jar, "https://example.com/"), "tok=SECURE");
+        // https itself may still update it
+        assert!(jar.accept(&u("https://example.com/"), "tok=NEW; Secure; Path=/"));
+        assert_eq!(header(&jar, "https://example.com/"), "tok=NEW");
+    }
+
+    #[test]
     fn cookie_name_prefixes_are_enforced() {
         let mut jar = Jar::new();
         let https = u("https://example.com/");
@@ -253,9 +338,34 @@ mod tests {
         assert!(jar.len() <= MAX_PER_DOMAIN, "{} cookies kept", jar.len());
         let h = header(&jar, "https://spam.example.com/");
         assert!(!h.is_empty() && h.len() <= MAX_HEADER, "header is {} bytes", h.len());
+        // the oldest 150 were evicted: what is sent starts with the oldest survivor
+        assert!(h.starts_with("c150="), "{}", &h[..h.len().min(40)]);
+        assert!(!h.contains("c0=") && !h.contains("c149="));
         // other domains are untouched and still work
         assert!(jar.accept(&u("https://other.example.org/"), "fine=1"));
         assert_eq!(header(&jar, "https://other.example.org/"), "fine=1");
+    }
+
+    #[test]
+    fn one_site_flooding_cookies_cannot_evict_another_sites() {
+        // wildcard DNS gave an attacker a fresh 50-cookie bucket per subdomain, and the
+        // global cap then dropped arbitrary cookies, including the bank's session
+        let mut jar = Jar::new();
+        assert!(jar.accept(&u("https://bank.com/"), "session=BANK; Path=/; Secure"));
+        for host in 0..70 {
+            for c in 0..50 {
+                jar.accept(&u(&format!("https://h{host}.attacker.com/")), &format!("c{c}=1; Path=/"));
+            }
+        }
+        assert_eq!(header(&jar, "https://bank.com/"), "session=BANK");
+        assert!(jar.len() <= MAX_PER_SITE + 1, "{} cookies kept", jar.len());
+        // a sibling subdomain flooding Domain=example.com cookies stays within the site's cap
+        let mut jar = Jar::new();
+        assert!(jar.accept(&u("https://www.example.com/"), "sid=GOOD; Path=/"));
+        for i in 0..400 {
+            jar.accept(&u("https://evil.example.com/"), &format!("f{i}=1; Domain=example.com; Path=/"));
+        }
+        assert!(jar.len() <= MAX_PER_SITE, "{} cookies kept", jar.len());
     }
 
     #[test]

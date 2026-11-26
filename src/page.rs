@@ -169,6 +169,14 @@ impl Page {
         }
     }
 
+    /// Submit a form: POST `body` to `url` and build the page that comes back.
+    pub fn load_post(url: &Url, body: &str) -> Page {
+        match net::fetch_post(url, body) {
+            Ok(f) => Page::from_fetched(f),
+            Err(e) => Page::error(url, &e),
+        }
+    }
+
     pub fn error(url: &Url, message: &str) -> Page {
         Page::from_source(
             url,
@@ -740,6 +748,18 @@ mod tests {
         server.join().unwrap();
         assert_eq!(p.status, Some(404));
         assert!(p.dom.text_content(0).contains("nope"));
+    }
+
+    #[test]
+    fn a_form_post_builds_the_page_the_server_returns() {
+        // (the server ignores the body; net.rs tests check what is sent)
+        let (port, server) = serve_routes(vec![("/login", "text/html", b"<title>Welcome</title><p>hi user</p>".to_vec())], 1);
+        let p = Page::load_post(&Url::parse(&format!("http://127.0.0.1:{port}/login")).unwrap(), "user=a");
+        server.join().unwrap();
+        assert_eq!((p.title.as_str(), p.status), ("Welcome", Some(200)));
+        // posting somewhere that can't be posted to is an error page, not a crash
+        let e = Page::load_post(&Url::parse("file:///tmp/x.html").unwrap(), "a=1");
+        assert_eq!(e.title, "Error");
     }
 
     #[test]

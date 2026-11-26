@@ -13,6 +13,9 @@ use url::Url;
 /// Largest response body we will read (pages, stylesheets, images).
 pub const MAX_BODY: u64 = 32 * 1024 * 1024;
 
+/// Largest form body we will send.
+pub const MAX_POST_BODY: usize = 8 * 1024 * 1024;
+
 /// Redirects followed before giving up.
 const MAX_REDIRECTS: usize = 10;
 
@@ -30,20 +33,33 @@ const ACCEPT: &str = "text/html,application/xhtml+xml,text/css,image/png,*/*;q=0
 
 /// Load a top-level document (what the user navigated to).
 pub fn fetch(url: &Url) -> Result<Fetched, String> {
-    fetch_in(url, None)
+    fetch_in(url, None, None)
+}
+
+/// Submit a form: POST `body` (already `application/x-www-form-urlencoded`) to
+/// `url`. Only http(s) can be posted to. A redirect after the POST is followed
+/// with a plain GET (as browsers do for 301, 302 and 303).
+pub fn fetch_post(url: &Url, body: &str) -> Result<Fetched, String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("can't submit a form to {}: URLs", url.scheme()));
+    }
+    if body.len() > MAX_POST_BODY {
+        return Err("form data is too large to send".into());
+    }
+    fetch_in(url, None, Some(body))
 }
 
 /// Load a subresource (stylesheet, image) of the page at `top`. Where it comes
 /// from a different site than the page, no cookies are sent or stored: a
 /// tracking pixel on another domain can't recognise you.
 pub fn fetch_subresource(url: &Url, top: &Url) -> Result<Fetched, String> {
-    fetch_in(url, Some(top))
+    fetch_in(url, Some(top), None)
 }
 
-fn fetch_in(url: &Url, top: Option<&Url>) -> Result<Fetched, String> {
+fn fetch_in(url: &Url, top: Option<&Url>, post: Option<&str>) -> Result<Fetched, String> {
     match url.scheme() {
         "file" => fetch_file(url),
-        "http" | "https" => fetch_http(url, top),
+        "http" | "https" => fetch_http(url, top, post),
         "data" => fetch_data(url),
         other => Err(format!("unsupported URL scheme '{other}:'")),
     }
@@ -99,18 +115,34 @@ fn agent() -> &'static ureq::Agent {
     })
 }
 
-fn fetch_http(start: &Url, top: Option<&Url>) -> Result<Fetched, String> {
+fn fetch_http(start: &Url, top: Option<&Url>, post: Option<&str>) -> Result<Fetched, String> {
     let mut url = start.clone();
+    let mut post = post;
     for _ in 0..=MAX_REDIRECTS {
         // Each hop is judged on its own: a redirect to another site loses the cookies.
         let use_cookies = top.is_none_or(|t| cookies::same_site(t, &url));
-        let mut req = agent().get(url.as_str()).header("Accept", ACCEPT).header("Accept-Language", "en");
-        if use_cookies {
-            if let Some(header) = cookies::global().header_for(&url) {
-                req = req.header("Cookie", header);
+        let cookie_header = if use_cookies { cookies::global().header_for(&url) } else { None };
+        let result = match post {
+            Some(body) => {
+                let mut req = agent()
+                    .post(url.as_str())
+                    .header("Accept", ACCEPT)
+                    .header("Accept-Language", "en")
+                    .header("Content-Type", "application/x-www-form-urlencoded");
+                if let Some(c) = cookie_header {
+                    req = req.header("Cookie", c);
+                }
+                req.send(body)
             }
-        }
-        let mut resp = req.call().map_err(|e| format!("{url}: {e}"))?;
+            None => {
+                let mut req = agent().get(url.as_str()).header("Accept", ACCEPT).header("Accept-Language", "en");
+                if let Some(c) = cookie_header {
+                    req = req.header("Cookie", c);
+                }
+                req.call()
+            }
+        };
+        let mut resp = result.map_err(|e| format!("{url}: {e}"))?;
         if use_cookies {
             let sets: Vec<String> =
                 resp.headers().get_all("set-cookie").into_iter().filter_map(|v| v.to_str().ok()).map(String::from).collect();
@@ -130,6 +162,7 @@ fn fetch_http(start: &Url, top: Option<&Url>) -> Result<Fetched, String> {
                     return Err(format!("{url}: refusing to follow a redirect to {}:", next.scheme()));
                 }
                 url = next;
+                post = None; // the redirected request is a GET
                 continue;
             }
         }
@@ -334,8 +367,9 @@ mod tests {
         (port, handle)
     }
 
-    /// Like `serve`, but also records the raw head of every request it receives
-    /// (lower-cased), so tests can check which headers the browser sent.
+    /// Like `serve`, but also records each request (lower-cased, head and any
+    /// body that arrived with it), so tests can check what the browser sent.
+    /// It reads the whole body when a `Content-Length` is given.
     fn serve_recording(responses: Vec<String>) -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -346,12 +380,30 @@ mod tests {
                 let (mut sock, _) = listener.accept().unwrap();
                 let mut buf = [0u8; 4096];
                 let mut seen = vec![];
-                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let head_end = loop {
+                    if let Some(i) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(i + 4);
+                    }
                     let n = sock.read(&mut buf).unwrap_or(0);
                     if n == 0 {
-                        break;
+                        break None;
                     }
                     seen.extend_from_slice(&buf[..n]);
+                };
+                if let Some(end) = head_end {
+                    let head = String::from_utf8_lossy(&seen[..end]).to_ascii_lowercase();
+                    let want: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while seen.len() < end + want {
+                        let n = sock.read(&mut buf).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        seen.extend_from_slice(&buf[..n]);
+                    }
                 }
                 seen_heads.lock().unwrap().push(String::from_utf8_lossy(&seen).to_ascii_lowercase());
                 sock.write_all(resp.as_bytes()).unwrap();
@@ -431,6 +483,50 @@ mod tests {
         assert!(fetch(&Url::parse("ftp://example.com/x").unwrap()).is_err());
         assert!(fetch(&Url::parse("mailto:a@b.c").unwrap()).is_err());
         assert!(fetch(&Url::parse("file:///definitely/not/here.html").unwrap()).is_err());
+    }
+
+    // ---------- POST ----------
+
+    #[test]
+    fn a_form_post_sends_its_body_content_type_and_cookies() {
+        let (port, heads, h) = serve_recording(vec![
+            http("200 OK", "Set-Cookie: post_ck=1; Path=/\r\n", "seed"),
+            http("200 OK", "Content-Type: text/plain\r\n", "welcome"),
+        ]);
+        let base = format!("http://127.0.0.1:{port}");
+        fetch(&Url::parse(&format!("{base}/start")).unwrap()).unwrap();
+        let f = fetch_post(&Url::parse(&format!("{base}/login")).unwrap(), "user=a&pw=p+w%26x").unwrap();
+        h.join().unwrap();
+        assert_eq!(f.body, b"welcome");
+        let req = &heads.lock().unwrap()[1];
+        assert!(req.starts_with("post /login http/1.1"), "{req}");
+        assert!(req.contains("content-type: application/x-www-form-urlencoded"), "{req}");
+        assert!(req.contains("content-length: 17"), "{req}");
+        assert!(req.contains("post_ck=1"), "cookies go with the POST: {req}");
+        assert!(req.ends_with("\r\n\r\nuser=a&pw=p+w%26x"), "body: {req}");
+    }
+
+    #[test]
+    fn a_redirect_after_a_post_is_followed_with_a_get() {
+        let (port, heads, h) = serve_recording(vec![
+            http("303 See Other", "Location: /done\r\n", ""),
+            http("200 OK", "Content-Type: text/plain\r\n", "thanks"),
+        ]);
+        let f = fetch_post(&Url::parse(&format!("http://127.0.0.1:{port}/submit")).unwrap(), "a=1").unwrap();
+        h.join().unwrap();
+        assert_eq!((f.url.path(), f.body.as_slice()), ("/done", &b"thanks"[..]));
+        let heads = heads.lock().unwrap();
+        assert!(heads[0].starts_with("post /submit"), "{}", heads[0]);
+        assert!(heads[1].starts_with("get /done"), "{}", heads[1]);
+        assert!(!heads[1].contains("a=1"), "the body is not re-sent");
+    }
+
+    #[test]
+    fn posting_to_a_non_http_url_or_with_an_oversized_body_is_refused() {
+        assert!(fetch_post(&Url::parse("file:///tmp/x.html").unwrap(), "a=1").is_err());
+        assert!(fetch_post(&Url::parse("data:text/plain,hi").unwrap(), "a=1").is_err());
+        let big = "x".repeat(MAX_POST_BODY + 1);
+        assert!(fetch_post(&Url::parse("http://127.0.0.1:1/").unwrap(), &big).is_err());
     }
 
     // ---------- cookies ----------

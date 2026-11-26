@@ -328,6 +328,11 @@ struct App {
     cwd: std::path::PathBuf,
     history: History,
     nav: Navigation,
+    /// Form data for the next `begin_load` to POST (set by `submit_form`).
+    next_post: Option<String>,
+    /// Form data of the navigation in flight, so restarting it (reload while
+    /// loading) POSTs again instead of silently turning into a GET.
+    inflight_post: Option<String>,
     proxy: EventLoopProxy<UserEvent>,
     scroll: f32,
     laid_out_width: f32,
@@ -344,8 +349,9 @@ impl App {
         let bar = AddressBar::new(start.as_str());
         let mut app = App {
             fonts, painter: Painter::default(), page, bar, cwd, history: History::default(),
-            nav: Navigation::default(), proxy, scroll: 0.0, laid_out_width: -1.0, cursor: (0.0, 0.0),
-            hover: None, modifiers: ModifiersState::empty(), window: None, surface: None,
+            nav: Navigation::default(), next_post: None, inflight_post: None, proxy, scroll: 0.0,
+            laid_out_width: -1.0, cursor: (0.0, 0.0), hover: None, modifiers: ModifiersState::empty(),
+            window: None, surface: None,
         };
         app.begin_load(start, Hist::Replace, None);
         app
@@ -427,16 +433,23 @@ impl App {
     /// Start loading `url` on a background thread. The current page stays on
     /// screen and responsive until the new one arrives; starting another load (or
     /// pressing Escape) abandons this one. The history stacks are only touched
-    /// when the load lands (see `finish_load`).
+    /// when the load lands (see `finish_load`). If `next_post` is set, the load
+    /// is a form POST with that body.
     fn begin_load(&mut self, url: Url, hist: Hist, keep_scroll: Option<f32>) {
         let ticket = self.nav.start(self.page.url.clone(), url.clone(), hist, keep_scroll);
+        let post = self.next_post.take();
+        self.inflight_post = post.clone();
         self.bar.show(url.as_str());
         self.set_title();
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
+            let load = || match &post {
+                Some(body) => Page::load_post(&url, body),
+                None => Page::load(&url),
+            };
             // A panic while loading must still end the "Loading…" state, even if
             // building the error page itself panics.
-            let page = std::panic::catch_unwind(|| Page::load(&url))
+            let page = std::panic::catch_unwind(load)
                 .or_else(|_| std::panic::catch_unwind(|| Page::error(&url, "internal error while loading this page")))
                 .unwrap_or_else(|_| Page::from_source(&url, "<p>Could not load this page.</p>"));
             let _ = proxy.send_event(UserEvent::Loaded { ticket, page: SendPage(page) });
@@ -447,6 +460,7 @@ impl App {
     /// A loader thread delivered a page.
     fn finish_load(&mut self, ticket: u64, page: Page) {
         let Some(pending) = self.nav.finish(ticket) else { return }; // superseded or cancelled
+        self.inflight_post = None;
         self.history.apply(pending.hist, pending.from, &page.url);
         self.page = page;
         self.bar.show(self.page.url.as_str()); // the final URL, after redirects
@@ -460,6 +474,7 @@ impl App {
     /// Give up on the load in flight and show the current page's address again.
     fn cancel_load(&mut self) {
         if self.nav.cancel() {
+            self.inflight_post = None;
             let url = self.page.url.to_string();
             self.bar.show(&url);
             self.set_title();
@@ -472,10 +487,12 @@ impl App {
     }
 
     /// Reload. While a navigation is loading, that navigation is restarted (not
-    /// silently replaced by a reload of the page underneath it).
+    /// silently replaced by a reload of the page underneath it), form data
+    /// included. Reloading a page that a POST produced fetches its URL with a GET.
     fn reload(&mut self) {
         if let Some(p) = self.nav.pending() {
             let (url, hist) = (p.url.clone(), p.hist);
+            self.next_post = self.inflight_post.clone();
             self.begin_load(url, hist, None);
         } else {
             let (url, keep) = (self.page.url.clone(), self.scroll);
@@ -554,16 +571,28 @@ impl App {
     }
 
     /// Submit the form that contains `control`, as if `submitter` (a button) was clicked.
+    /// The target goes through the same safety checks as a link (a web page's form
+    /// can't send you to `file:` or `javascript:`).
     fn submit_form(&mut self, control: NodeId, submitter: Option<NodeId>) {
         let Some(form_el) = forms::form_of(&self.page.dom, control) else { return };
         let Some(sub) = self.page.form.submit(&self.page.dom, form_el, submitter, &self.page.url) else { return };
-        match sub.method {
-            forms::Method::Get => match resolve_link(&self.page.url, sub.url.as_str()) {
-                Link::Navigate(url) => self.open(url),
-                Link::Nothing => self.reload(), // submitting the page you're already on
-                Link::External(url) => eprintln!("not supported (yet): {url}"),
-            },
-            forms::Method::Post => eprintln!("POST forms aren't supported yet: {}", sub.url),
+        let post = matches!(sub.method, forms::Method::Post);
+        match resolve_link(&self.page.url, sub.url.as_str()) {
+            Link::Navigate(url) => {
+                if post {
+                    self.next_post = Some(sub.body);
+                }
+                self.open(url);
+            }
+            // submitting to the page you're already on: a GET reloads it; a POST
+            // sends the data and replaces the page in place
+            Link::Nothing if post => {
+                self.next_post = Some(sub.body);
+                let url = self.page.url.clone();
+                self.begin_load(url, Hist::Replace, None);
+            }
+            Link::Nothing => self.reload(),
+            Link::External(url) => eprintln!("not supported (yet): {url}"),
         }
     }
 

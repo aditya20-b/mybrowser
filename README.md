@@ -45,13 +45,13 @@ One heads-up: fonts are loaded from the macOS system font folder (see `src/fonts
 
 ## What it can do
 
-**Networking.** It loads `http://` and `https://` pages (TLS through rustls, gzip, timeouts, a size limit), as well as local files and `data:` URLs. Redirects are followed by hand so cookies carry across each hop and a redirect can never lead to a `file:` or `data:` URL. Stylesheets and images are fetched in parallel by a small worker pool with a deadline. It honours `<base href>`, decodes UTF-8, UTF-16, Latin-1 and Windows-1252 text, and shows readable pages for plain text, images and errors (including HTTP 404s with their bodies). A web page can't load local files or send you to one.
+**Networking.** It loads `http://` and `https://` pages (TLS through rustls, gzip, timeouts, a size limit), as well as local files and `data:` URLs. It sends `GET` requests and form `POST`s. Redirects are followed by hand so cookies carry across each hop and a redirect can never lead to a `file:` or `data:` URL; a redirect after a `POST` is followed with a `GET`, like in other browsers. Stylesheets and images are fetched in parallel by a small worker pool with a deadline. It honours `<base href>`, decodes UTF-8, UTF-16, Latin-1 and Windows-1252 text, and shows readable pages for plain text, images and errors (including HTTP 404s with their bodies). A web page can't load local files or send you to one.
 
-**Cookies and privacy.** One in-memory cookie jar is shared by every request and never written to disk. Beyond the usual host, path and expiry rules it refuses a `Domain` that is a public suffix (so `Domain=co.uk` can't make a supercookie), refuses `Secure` cookies from plain http and never sends them over it, enforces the `__Secure-` and `__Host-` prefixes, and caps cookie size and count so one site can't break every later request to a domain. Images and stylesheets from a different site than the page get no cookies at all, in either direction, so a tracking pixel can't recognise you. No `Referer` is sent.
+**Cookies and privacy.** One in-memory cookie jar is shared by every request and never written to disk. Beyond the usual host, path and expiry rules it refuses a `Domain` that is a public suffix (so `Domain=co.uk` can't make a supercookie), refuses `Secure` cookies from plain http, never sends them over it and doesn't let a plain-http response overwrite one, enforces the `__Secure-` and `__Host-` prefixes, and caps cookie size and count. When a site goes over its limit it loses its own oldest cookies, never another site's. Images and stylesheets from a different site than the page get no cookies at all, in either direction, so a tracking pixel can't recognise you. No `Referer` is sent.
 
 **Browsing.** Pages load on a background thread, so the window never freezes; only the newest navigation can land, so a slow load can't replace a page you've moved on from. Back and forward history changes only when a navigation actually lands, so cancelling or superseding a load never loses or duplicates entries, and typing the address you're already on reloads instead of adding an entry.
 
-**Forms.** Text, password, checkbox, radio, submit and button inputs, `<button>`, `<textarea>` and `<select>` draw as native-looking boxes that sit on the text baseline. Click to focus, type, toggle and cycle options; `Tab` and `Enter` work. Disabled controls can't be clicked. Submitting a `GET` form builds a properly URL-encoded query (only the clicked button, only checked boxes, no disabled or nameless controls, hidden fields included) and navigates, with the same safety checks as links. Password text is never drawn.
+**Forms.** Text, password, checkbox, radio, submit and button inputs, `<button>`, `<textarea>` and `<select>` draw as native-looking boxes that sit on the text baseline. Click to focus, type, toggle and cycle options; `Tab` and `Enter` work. Disabled controls can't be clicked. Submitting builds a properly URL-encoded body (only the clicked button, only checked boxes, no disabled or nameless controls, hidden fields included) and either navigates with it as a query (`GET`) or sends it (`POST`), with the same safety checks as links. Password text is never drawn.
 
 **HTML.** Entities, void tags, messy markup (unclosed `<p>` and `<li>`, misnested tags, stray end tags, implied table rows and cells), and a synthesized `<head>` and `<body>` when a page leaves them out. The parser runs in linear time, even on hostile input.
 
@@ -73,7 +73,7 @@ URL -> fetch -> HTML -> DOM --\
 
 | Stage | File | Notes |
 |---|---|---|
-| Loading | `src/net.rs`, `src/cookies.rs` | `file:`, `http(s):` and `data:` URLs, hand-followed redirects, limits, content sniffing, charset decoding. The cookie jar and its policy live in `cookies.rs`. |
+| Loading | `src/net.rs`, `src/cookies.rs` | `file:`, `http(s):` and `data:` URLs, `GET` and `POST`, hand-followed redirects, limits, content sniffing, charset decoding. The cookie jar and its policy live in `cookies.rs`. |
 | HTML to DOM | `src/html.rs`, `src/dom.rs` | One pass over the text with a stack of open elements. The DOM is a flat `Vec` of nodes that refer to each other by index, which keeps Rust's ownership rules out of the way. |
 | CSS parsing | `src/css.rs` | Parses rules, matches selectors right to left (with memoization so deep trees stay fast), and expands shorthands like `margin: 0 auto` into their individual properties up front. |
 | Styles | `src/style.rs` | Walks the DOM once, collects every matching declaration, sorts by importance, origin, specificity and order, and fills in a typed `Style` for each node. Legacy presentational attributes act as very low-priority rules. |
@@ -119,14 +119,14 @@ The honest list, roughly by how much it matters for a real browser:
 - **JavaScript.** None. Pages that build their content with scripts will be blank or broken.
 - **Layout.** No flexbox, grid, floats or positioning, no inline padding or margins, and no `vh`/`vw`/`calc()`. A lot of the modern web depends on these.
 - **Selectors.** No pseudo-classes (even `:link` and `:first-child`), attribute selectors or `@media`, so many stylesheets lose rules.
-- **Forms.** `GET` forms work; `POST` is built but not sent yet, which makes login forms dead buttons. No caret movement or selection inside fields (typing appends, backspace deletes), no `readonly`, `maxlength`, `hidden`, `form=` or `<label>` clicks, no file, date or colour inputs, radio buttons draw as squares, and selects cycle on click instead of opening a menu. Hidden (`display:none`) controls can still be tabbed to.
-- **Cookies.** No `SameSite` attribute handling beyond the cross-site subresource rule, and nothing persists between runs.
+- **Forms.** No `multipart/form-data` (so no file uploads; a form asking for it is sent urlencoded). Reloading or going back to a page a `POST` produced fetches its URL with a `GET`. No caret movement or selection inside fields (typing appends, backspace deletes), no `readonly`, `maxlength`, `hidden`, `form=` or `<label>` clicks, no file, date or colour inputs, radio buttons draw as squares, and selects cycle on click instead of opening a menu. Hidden (`display:none`) controls can still be tabbed to.
+- **Cookies.** The `SameSite` attribute is ignored (only the cross-site subresource rule applies), and nothing persists between runs.
 - **Browser features.** No tabs, caching, bookmarks or find-in-page.
 - **Media.** PNG only: no JPEG, GIF, WebP or SVG. No fonts from the web (`@font-face`).
 - **Text.** No shaping, so no kerning, ligatures or complex scripts, and no right-to-left text.
 - **Platform.** macOS fonts only, for now.
 
-The order I'm tackling things in: form fixes and `POST`, tabs, the CSS gaps above (pseudo-classes, inline boxes, viewport units), a flexbox subset, more image formats, and eventually a JavaScript engine. Until then it's best at documents, blogs, articles and older table-based sites.
+The order I'm tackling things in: form fixes, `SameSite`, tabs, the CSS gaps above (pseudo-classes, inline boxes, viewport units), a flexbox subset, more image formats, and eventually a JavaScript engine. Until then it's best at documents, blogs, articles and older table-based sites.
 
 ## Where to learn more
 

@@ -61,7 +61,12 @@ pub struct Page {
     pub console: Vec<String>,
     /// The stylesheets, kept so styles can be recomputed after scripts change the page.
     rules: Vec<Rule>,
+    /// Nodes below this index have had their `<style>` taken into `rules`.
+    styled_upto: usize,
 }
+
+/// Most style rules a page may have in all (scripts can add stylesheets after it loads).
+const MAX_RULES: usize = 100_000;
 
 /// Console lines kept per page.
 const MAX_CONSOLE_LINES: usize = 1000;
@@ -539,8 +544,9 @@ impl Page {
             }
         }
 
+        let dom_len = dom.nodes.len();
         let layout = Layout { items: vec![], links: vec![], controls: vec![], boxes: vec![], anchors: vec![], height: 0.0, canvas_bg: None };
-        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false, no_store: false, scripts, console, rules }
+        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false, no_store: false, scripts, console, rules, styled_upto: dom_len }
     }
 
     /// The innermost block element whose box contains layout position `(x, y)`: where a click
@@ -570,6 +576,14 @@ impl Page {
                 self.console.push(line);
             }
         }
+        // `<style>` elements the scripts added since: their rules join the cascade
+        for n in self.styled_upto..self.dom.nodes.len() {
+            if self.dom.tag(n) == Some("style") && self.rules.len() < MAX_RULES && media_applies(self.dom.attr(n, "media")) {
+                let text = self.dom.text_content(n);
+                css::parse_stylesheet(&text, &mut self.rules);
+            }
+        }
+        self.styled_upto = self.dom.nodes.len();
         self.styles = style::compute(&self.dom, &self.rules);
         prevented
     }
@@ -944,6 +958,19 @@ mod tests {
         let p = Page::from_source(&Url::parse("data:text/html,x").unwrap(), &src);
         assert!(p.scripts.is_none() && !p.console.contains(&"ran".to_string()), "{:?}", p.console);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stylesheet_a_handler_adds_applies() {
+        let fonts = Fonts::load();
+        let src = "<body><p id=t>text</p><button id=b>go</button>\
+            <script>document.getElementById('b').onclick = function () { var s = document.createElement('style'); s.textContent = '#t { font-size: 41px }'; document.head.appendChild(s) }</script></body>";
+        let mut p = Page::from_source(&Url::parse("file:///tmp/st.html").unwrap(), src);
+        let button = p.dom.nodes.iter().position(|n| matches!(&n.kind, crate::dom::Kind::Element { tag, .. } if tag == "button")).unwrap();
+        p.run_event(button, "click");
+        p.relayout(&fonts, 400.0);
+        let size = p.layout.items.iter().find_map(|i| match i { Item::Text { text, size, .. } if text == "text" => Some(*size), _ => None }).unwrap();
+        assert_eq!(size, 41.0);
     }
 
     #[test]

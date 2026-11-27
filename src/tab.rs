@@ -1,6 +1,7 @@
 //! One browser tab: its page, history, scroll position and the navigation in
 //! flight. Everything here is independent of the window system (loaders report
 //! back through a plain callback), so it is unit-tested without opening one.
+use crate::bookmarks;
 use crate::dom::NodeId;
 use crate::download::{self, PendingDownload};
 use crate::forms::{self, ControlKind, FormState};
@@ -222,6 +223,19 @@ pub fn blank_url() -> Url {
     Url::parse(BLANK_URL).expect("a constant, valid URL")
 }
 
+/// Is this the empty `about:blank` page (a new tab), as opposed to another internal page?
+fn is_blank(url: &Url) -> bool {
+    url.scheme() == "about" && url.path() != "bookmarks"
+}
+
+/// The `about:bookmarks` page: the saved list, read fresh each time it is opened.
+fn bookmarks_page(url: &Url) -> Page {
+    let list = bookmarks::data_dir().map(|d| bookmarks::load(&d)).unwrap_or_default();
+    let mut page = Page::from_source(url, &bookmarks::page_html(&list));
+    page.no_store = true;
+    page
+}
+
 fn blank_page(url: &Url) -> Page {
     Page::from_source(
         url,
@@ -342,14 +356,14 @@ impl Tab {
     pub fn address(&self) -> String {
         match self.nav.pending() {
             Some(p) => p.url.to_string(),
-            None if self.page.url.scheme() == "about" => String::new(),
+            None if is_blank(&self.page.url) => String::new(),
             None => self.page.url.to_string(),
         }
     }
 
     /// The tab's label: the page title, or "New Tab" for a blank one.
     pub fn title(&self) -> String {
-        if self.page.url.scheme() == "about" && !self.is_loading() { "New Tab".into() } else { self.page.display_title() }
+        if is_blank(&self.page.url) && !self.is_loading() { "New Tab".into() } else { self.page.display_title() }
     }
 
     /// Start loading `url` on a background thread. The current page stays on
@@ -369,7 +383,7 @@ impl Tab {
         std::thread::spawn(move || {
             let load = || {
                 if url.scheme() == "about" {
-                    return blank_page(&url);
+                    return if url.path() == "bookmarks" { bookmarks_page(&url) } else { blank_page(&url) };
                 }
                 net::with_initiator(initiator.clone(), || match &post {
                     Some(body) => Page::load_post(&url, body),
@@ -594,7 +608,7 @@ impl Tab {
             self.next_post = self.inflight_post.clone();
             self.next_initiator = self.inflight_initiator.clone();
             self.begin_load(url, hist, None);
-        } else if self.page.url.scheme() != "about" {
+        } else if !is_blank(&self.page.url) {
             let (url, keep) = (self.page.url.clone(), self.scroll);
             self.begin_load(url, Hist::Replace, Some(keep));
         }
@@ -1656,6 +1670,42 @@ mod tests {
         tab.go_back();
         assert!(!tab.is_loading());
         assert_eq!(tab.page.form.value(&tab.page.dom, input), "1typed");
+    }
+
+    #[test]
+    fn the_bookmarks_page_lists_saved_pages_and_is_out_of_reach_of_web_pages() {
+        let (dir, a, _b) = site("bookmarkspage");
+        let data = dir.join("data");
+        // (the only test that sets this variable)
+        unsafe { std::env::set_var("MYBROWSER_DATA", &data) };
+        bookmarks::toggle(&data, &a, "Page A").unwrap();
+        let (notify, rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        let page_url = Url::parse("about:bookmarks").unwrap();
+        tab.open(page_url.clone());
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.title(), "Bookmarks");
+        assert_eq!(tab.address(), "about:bookmarks", "unlike a blank tab, it shows its address");
+        let text = tab.page.dom.text_content(0);
+        assert!(text.contains("Page A"), "{text}");
+        // clicking a bookmark opens it
+        tab.page.relayout(&crate::fonts::Fonts::load(), 600.0);
+        let href = tab.page.layout.links[0].href.clone();
+        assert!(tab.follow(&href));
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.page.url, a);
+        // reloading the bookmarks page picks up changes
+        tab.go_back();
+        assert!(tab.is_loading(), "the bookmarks page is read again, never kept in memory");
+        assert!(deliver(&mut tab, &rx));
+        bookmarks::toggle(&data, &a, "x").unwrap(); // removes it
+        tab.reload();
+        assert!(deliver(&mut tab, &rx));
+        assert!(tab.page.dom.text_content(0).contains("Nothing here yet"));
+        // a web page cannot link to it, or to any other internal page
+        let web = Url::parse("https://example.com/").unwrap();
+        assert!(matches!(resolve_link_in(&web, &web, "about:bookmarks"), Link::External(_)));
+        unsafe { std::env::remove_var("MYBROWSER_DATA") };
     }
 
     #[test]

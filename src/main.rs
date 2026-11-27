@@ -1,3 +1,4 @@
+mod bookmarks;
 mod chrome;
 mod cookies;
 mod css;
@@ -108,6 +109,9 @@ fn url_from_input(input: &str, cwd: &Path) -> Result<Url, String> {
     let s = input.trim();
     if s.is_empty() {
         return Err("empty address".into());
+    }
+    if s.eq_ignore_ascii_case("about:bookmarks") {
+        return Ok(Url::parse("about:bookmarks").expect("a constant, valid URL"));
     }
     if let Ok(u) = Url::parse(s) {
         if matches!(u.scheme(), "http" | "https" | "file" | "data") {
@@ -522,6 +526,19 @@ impl App {
     fn reload(&mut self) {
         self.tab_mut().reload();
         self.sync_chrome();
+    }
+
+    /// Cmd+D: bookmark the page on screen, or remove its bookmark if it has one.
+    fn toggle_bookmark(&mut self) {
+        let (url, title) = (self.tab().page.url.clone(), self.tab().page.display_title());
+        self.bar.error = Some(match bookmarks::data_dir() {
+            None => "no folder to keep bookmarks in".to_string(),
+            Some(dir) => match bookmarks::toggle(&dir, &url, &title) {
+                Ok(true) => format!("Bookmarked: {title}"),
+                Ok(false) => "Bookmark removed".to_string(),
+                Err(e) => e,
+            },
+        });
     }
 
     fn go_back(&mut self) {
@@ -941,6 +958,8 @@ impl App {
         match &event.logical_key {
             Key::Character(c) if cmd => match c.as_str().to_ascii_lowercase().as_str() {
                 "l" => self.focus_address_bar(),
+                "d" => self.toggle_bookmark(),
+                "b" if self.modifiers.shift_key() => self.open(Url::parse("about:bookmarks").expect("a constant, valid URL")),
                 "r" => self.reload(),
                 "[" => self.go_back(),
                 "]" => self.go_forward(),

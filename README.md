@@ -33,6 +33,7 @@ The window has a tab strip, a toolbar with back, forward and reload buttons, and
 | `Cmd+click` a link | Open it in a new tab |
 | `Cmd+F` | Find in page: type to search, `Enter` / `Shift+Enter` (or `Cmd+G` / `Cmd+Shift+G`) for the next / previous match, `Esc` to close |
 | `Cmd+L` (or `Ctrl+L`) | Focus the address bar and select it |
+| `Cmd+D`, `Cmd+Shift+B` | Bookmark the page (again to remove its bookmark), open the bookmarks list (`about:bookmarks`) |
 | `Enter` / `Esc` | Go to the typed address / cancel editing, or cancel a load in progress |
 | `Cmd+V`, `Cmd+C`, `Cmd+A` | Paste, copy and select all in the address bar (macOS); `Cmd+V` and `Cmd+C` also paste into and copy from a focused text field on a page (never from a password field), and `Cmd+←` / `Cmd+→` jump to the start or end of the text there |
 | `Cmd+[`, `Cmd+]`, `Alt+←`, `Alt+→`, `Backspace` | Back and forward |
@@ -130,7 +131,7 @@ The honest list, roughly by how much it matters for a real browser:
 - **Forms.** No `multipart/form-data` (so no file uploads; a form asking for it is sent urlencoded), no `<select multiple>`. Reloading a page a `POST` produced, or going back to one that has fallen out of the six-page memory, fetches its URL with a `GET`. Single-line fields have a movable caret (arrow keys, Home, End, Delete), but there is no selection and a `<textarea>` still only edits at its end. No file, date or colour inputs, radio buttons draw as squares, and selects cycle on click instead of opening a menu. Controls hidden with CSS (`display:none`) can still be tabbed to. A page whose markup checks several radios of one group draws them all checked (only the last is submitted).
 - **Tabs.** No dragging to reorder. A reopened tab starts fresh (no back history, scroll position or typed form data). With many tabs open they shrink until only the close button shows (at most 20 can be open).
 - **Cookies.** Nothing persists between runs, and there's no UI to see or clear them.
-- **Browser features.** No caching or bookmarks. Downloads have no progress, no `Content-Disposition` names and no list; the file just lands in `~/Downloads` and a page says so. A `<base>` tag inside a `<template>` is honoured, and a bad `href` on the first `<base>` doesn't stop the search for the next one.
+- **Browser features.** No HTTP caching. Bookmarks are a plain list (`~/.mybrowser/bookmarks.tsv`, web and local pages only): no folders, editing or import, and removing one means pressing `Cmd+D` on its page. Downloads have no progress, no `Content-Disposition` names and no list; the file just lands in `~/Downloads` and a page says so. A `<base>` tag inside a `<template>` is honoured, and a bad `href` on the first `<base>` doesn't stop the search for the next one.
 - **Find and anchors.** Placeholder text in empty fields (and the dots of a password field) is found by search; browsers skip them. An empty `<a name=x></a>` in the middle of a paragraph points at the top of that paragraph rather than its own line.
 - **Media.** Animated GIFs and WebPs show their first frame only; no SVG or AVIF. No fonts from the web (`@font-face`).
 - **Text.** No shaping, so no kerning, ligatures or complex scripts, and no right-to-left text.

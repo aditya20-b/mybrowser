@@ -38,8 +38,8 @@ pub fn is_loopback_host(host: &str) -> bool {
 }
 
 /// What `href` means on a page at `doc` whose relative URLs resolve against `base`
-/// (they differ when the page has a `<base href>`). A link that lands on the page
-/// itself, with or without a fragment, doesn't reload it.
+/// (they differ when the page has a `<base href>`). A link that lands on a
+/// fragment of the page itself doesn't reload it; one to the page's own URL does.
 pub fn resolve_link_in(doc: &Url, base: &Url, href: &str) -> Link {
     let href = href.trim();
     if href.is_empty() {
@@ -56,10 +56,11 @@ pub fn resolve_link_in(doc: &Url, base: &Url, href: &str) -> Link {
         "file" if matches!(doc.scheme(), "http" | "https") => Link::External(target.to_string()),
         "http" | "https" | "file" => {
             if strip_fragment(&target) == strip_fragment(doc) {
-                // same document, maybe a different fragment: no reload
+                // same document with a fragment: no reload. Without one the link asks for the
+                // page again, which is a (replacing) navigation, as in other browsers.
                 match target.fragment() {
                     Some(f) => Link::Fragment(f.to_string()),
-                    None => Link::Nothing,
+                    None => Link::Navigate(target),
                 }
             } else {
                 Link::Navigate(target)
@@ -689,8 +690,10 @@ mod tests {
         for action in ["file:///etc/passwd", "javascript:alert(1)", "mailto:a@b.c"] {
             assert!(matches!(resolve_link(&page, action), Link::External(_)), "{action}");
         }
-        // and a GET form to the same URL is "nothing new", which the window turns into a reload
-        assert_eq!(resolve_link(&page, "https://example.com/form.html"), Link::Nothing);
+        // a link or GET form to the very same URL loads it again (landing on the page you
+        // left replaces its history entry instead of adding one), but with a fragment it only scrolls
+        assert_eq!(resolve_link(&page, "https://example.com/form.html"), Link::Navigate(u("https://example.com/form.html")));
+        assert_eq!(resolve_link(&page, "form.html#x"), Link::Fragment("x".into()));
         assert_eq!(resolve_link(&page, "https://example.com/form.html?q=rust"), Link::Navigate(u("https://example.com/form.html?q=rust")));
     }
 

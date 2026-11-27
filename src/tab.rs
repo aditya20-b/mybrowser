@@ -256,6 +256,10 @@ pub struct Tab {
     /// How many meta-refresh redirects led to the page on screen, and to the load in flight.
     /// What happened to the last file the tab was asked to download (shown once).
     notice: Option<String>,
+    /// How many history entries behind / ahead of the page on screen are fragment positions of
+    /// this same document (Back and Forward between them need no load).
+    frag_back: usize,
+    frag_forward: usize,
     /// The page on screen is the note for a file this tab downloaded (not a page to go back to).
     on_download_page: bool,
     /// The tab was brought back with Cmd+Shift+T: its first load never saves a file.
@@ -302,6 +306,8 @@ impl Tab {
             scroll_memory: HashMap::new(),
             notice: None,
             on_download_page: false,
+            frag_back: 0,
+            frag_forward: 0,
             restored: false,
             refresh_hops: 0,
             inflight_hops: 0,
@@ -372,6 +378,8 @@ impl Tab {
             return self.land_download(pending, page, download, was_post);
         }
         // leaving the note page of a download (a tab opened onto a file) leaves nothing behind in history
+        // a new document: the fragment entries before it belong to the old one
+        (self.frag_back, self.frag_forward) = (0, 0);
         let leaving_note = std::mem::take(&mut self.on_download_page);
         let pending = if leaving_note && pending.hist == Hist::Push { Pending { hist: Hist::Replace, ..pending } } else { pending };
         // `page.html#section`: jump there once the page has been laid out. A redirect that
@@ -578,7 +586,10 @@ impl Tab {
     /// Back / forward between two `#fragment`s of the page on screen needs no load: just
     /// move along the history and scroll. Returns whether it did (not while a load is in flight).
     fn same_document_move(&mut self, target: &Url, back: bool) -> bool {
-        if self.nav.pending().is_some() || strip_fragment(target) != strip_fragment(&self.page.url) {
+        // only between entries that fragment clicks made on this very document: an entry with the
+        // same address from an earlier load (a form's result, a reload) is a different page
+        let steps_left = if back { self.frag_back } else { self.frag_forward };
+        if steps_left == 0 || self.nav.pending().is_some() || strip_fragment(target) != strip_fragment(&self.page.url) {
             return false;
         }
         let here = std::mem::replace(&mut self.page.url, target.clone());
@@ -586,9 +597,11 @@ impl Tab {
         if back {
             self.history.back.pop();
             self.history.forward.push(here);
+            (self.frag_back, self.frag_forward) = (self.frag_back - 1, self.frag_forward + 1);
         } else {
             self.history.forward.pop();
             self.history.back.push(here);
+            (self.frag_back, self.frag_forward) = (self.frag_back + 1, self.frag_forward - 1);
         }
         let depth = self.history.back.len();
         match (self.scroll_memory.get(&(target.clone(), depth)).copied(), target.fragment()) {
@@ -623,6 +636,7 @@ impl Tab {
                         self.remember_scroll(here.clone());
                         self.history.back.push(here);
                         self.history.forward.clear();
+                        (self.frag_back, self.frag_forward) = (self.frag_back + 1, 0);
                     }
                 }
                 self.scroll_to_fragment(&f);
@@ -1505,6 +1519,41 @@ mod tests {
         // a fresh navigation starts the count again
         tab.open(file("hop.html"));
         assert!(deliver(&mut tab, &rx));
+        assert!(tab.is_loading());
+    }
+
+    #[test]
+    fn back_only_skips_loading_between_fragments_of_the_same_document() {
+        let (dir, _a, _b) = site("fragdoc");
+        std::fs::write(dir.join("doc.html"), "<style>p{height:900px}</style><p id=x>one</p><p id=y>two</p>").unwrap();
+        let doc = Url::from_file_path(dir.join("doc.html")).unwrap();
+        let mut with_x = doc.clone();
+        with_x.set_fragment(Some("x"));
+        let (notify, rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        // a page opened at doc#x, then the same address without a fragment (say, a form's result):
+        // Back to doc#x is a different document, so it must load, not just move the address
+        tab.open(with_x.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.open(doc.clone());
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.history.back.last(), Some(&with_x));
+        tab.go_back();
+        assert!(tab.is_loading(), "a real load, not a same-document move");
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.page.url, with_x);
+        // fragment clicks on one document still walk without loading
+        tab.follow("#y");
+        tab.go_back();
+        assert!(!tab.is_loading());
+        assert_eq!(tab.page.url, with_x);
+        tab.go_forward();
+        assert!(!tab.is_loading());
+        assert_eq!(tab.page.url.fragment(), Some("y"));
+        // ...and a fresh load of the page ends that run
+        tab.open(doc.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.go_back();
         assert!(tab.is_loading());
     }
 

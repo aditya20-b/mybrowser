@@ -275,8 +275,31 @@ impl Jar {
     /// The value of the `Cookie:` header for a request to `url` started in `ctx`, if any
     /// cookies apply. Longer paths come first, then older cookies (RFC 6265).
     pub fn header_for(&self, url: &Url, ctx: Ctx) -> Option<String> {
+        self.header_filtered(url, ctx, false)
+    }
+
+    /// What `document.cookie` shows a script on the page at `url`: the same cookies, minus the
+    /// `HttpOnly` ones (those are for the server alone).
+    pub fn script_visible(&self, url: &Url) -> String {
+        self.header_filtered(url, Ctx::SameSite, true).unwrap_or_default()
+    }
+
+    /// `document.cookie = "..."`: a cookie set from script. It goes through the same rules as one
+    /// from a response, except that a script can't make an `HttpOnly` one.
+    pub fn accept_from_script(&mut self, url: &Url, header: &str) -> bool {
+        let lower = header.to_ascii_lowercase();
+        if lower.split(';').skip(1).any(|attr| attr.trim() == "httponly") {
+            return false;
+        }
+        self.accept(url, header)
+    }
+
+    fn header_filtered(&self, url: &Url, ctx: Ctx, script: bool) -> Option<String> {
         let mut matching = self.store.matches(url);
         matching.retain(|c| same_site_allows(c.same_site(), ctx));
+        if script {
+            matching.retain(|c| c.http_only() != Some(true));
+        }
         matching.sort_by_cached_key(|c| {
             let key = key_of(c);
             let age = self.seq.get(&key).copied().unwrap_or(0);
@@ -455,6 +478,24 @@ mod tests {
         // Secure and SameSite survive
         assert_eq!(header(&fresh, "http://shop.example.com/cart/"), "wide=2");
         assert_eq!(header_in(&fresh, "https://shop.example.com/cart/", Ctx::CrossSiteGet), "wide=2");
+    }
+
+    #[test]
+    fn scripts_see_and_set_cookies_except_http_only_ones() {
+        let mut jar = Jar::new();
+        let site = u("https://app.example.com/dir/");
+        jar.accept(&site, "session=abc; Path=/; HttpOnly; Secure");
+        jar.accept(&site, "theme=dark; Path=/");
+        assert_eq!(jar.script_visible(&site), "theme=dark");
+        assert!(header(&jar, "https://app.example.com/").contains("session=abc"));
+        // a script can set an ordinary cookie, not an HttpOnly one (in any capitalisation), and the rules still apply
+        assert!(jar.accept_from_script(&site, "lang=en; Path=/; Max-Age=60"));
+        assert!(!jar.accept_from_script(&site, "evil=1; HttpOnly"));
+        assert!(!jar.accept_from_script(&site, "evil=1; path=/; HTTPONLY"));
+        assert!(!jar.accept_from_script(&u("http://app.example.com/"), "s=1; Secure"));
+        assert!(!jar.accept_from_script(&site, "__Host-x=1; Domain=example.com; Secure; Path=/"));
+        let seen = jar.script_visible(&site);
+        assert!(seen.contains("lang=en") && seen.contains("theme=dark") && !seen.contains("session") && !seen.contains("evil"), "{seen}");
     }
 
     #[test]

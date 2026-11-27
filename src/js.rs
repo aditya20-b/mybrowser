@@ -1188,6 +1188,9 @@ impl Interp {
             }),
             Value::Bool(_) => Ok(if name == "toString" { self.method(bool_to_string, name) } else { Value::Undefined }),
             Value::Obj(o) => {
+                if name == "cookie" && matches!(&self.document, Value::Obj(d) if Rc::ptr_eq(d, o)) {
+                    return Ok(dom_bindings::cookie_get(self));
+                }
                 // an element or text node of the page: what the script set on the object itself, else the DOM
                 let node = if let Kind::Node(id) = o.borrow().kind { Some(id) } else { None };
                 if let Some(id) = node {
@@ -1273,6 +1276,9 @@ impl Interp {
         match target {
             Value::Undefined | Value::Null => self.throw("TypeError", &format!("Cannot set properties of {} (setting '{name}')", if matches!(target, Value::Null) { "null" } else { "undefined" })),
             Value::Obj(o) => {
+                if name == "cookie" && matches!(&self.document, Value::Obj(d) if Rc::ptr_eq(d, o)) {
+                    return dom_bindings::cookie_set(self, value);
+                }
                 let node = if let Kind::Node(id) = o.borrow().kind { Some(id) } else { None };
                 if let Some(id) = node {
                     return dom_bindings::node_set(self, id, name, value);
@@ -3473,6 +3479,23 @@ mod tests {
                  try { var {boom} = null } catch (e) { console.log('null source throws') }"),
             "1 2 5 6\n10 30 40,50\nQ R0 R1 dflt\n6 24\nn2\n1,2,z 1,5,z 1,2,w\na1,b2\na1,b2,1none,2t\nu1,w2\nnull source throws"
         );
+    }
+
+    #[test]
+    fn document_cookie_reads_and_writes_the_jar() {
+        let run_at = |url: &'static str, script: &'static str| {
+            let dom = crate::html::parse("<body></body>");
+            let done = run_page_scripts(dom, url, vec![(script.to_string(), "s".to_string())]).expect("ran");
+            done.console.join("|")
+        };
+        let first = run_at("https://cookie-test.example/a", "console.log('before [' + document.cookie + ']'); document.cookie = 'k=v1; Path=/'; document.cookie = 'j=2; Path=/'; document.cookie = 'evil=1; HttpOnly'; console.log(document.cookie)");
+        assert_eq!(first, "before []|k=v1; j=2", "{first}");
+        // another page of the same site sees them; another site doesn't; a local page has none
+        assert_eq!(run_at("https://cookie-test.example/b", "console.log(document.cookie)"), "k=v1; j=2");
+        assert_eq!(run_at("https://other-cookie-test.example/", "console.log('[' + document.cookie + ']')"), "[]");
+        assert_eq!(run_at("file:///tmp/x.html", "document.cookie = 'a=b'; console.log('[' + document.cookie + ']')"), "[]");
+        // deleting works the way pages do it
+        assert_eq!(run_at("https://cookie-test.example/c", "document.cookie = 'k=; Max-Age=0; Path=/'; console.log(document.cookie)"), "j=2");
     }
 
     #[test]

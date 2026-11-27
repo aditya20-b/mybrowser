@@ -1272,6 +1272,31 @@ fn clear_timer(i: &mut Interp, _: &Value, a: &[Value]) -> Res {
     Ok(Value::Undefined)
 }
 
+// ---- document.cookie
+
+/// The page's address, if it is a web page (only those have cookies).
+fn cookie_url(i: &Interp) -> Option<url::Url> {
+    url::Url::parse(&i.page_url).ok().filter(|u| matches!(u.scheme(), "http" | "https"))
+}
+
+pub(super) fn cookie_get(i: &Interp) -> Value {
+    match cookie_url(i) {
+        Some(u) => str_value(&crate::cookies::global().script_visible(&u)),
+        None => str_value(""),
+    }
+}
+
+pub(super) fn cookie_set(i: &mut Interp, value: Value) -> Result<(), Ctrl> {
+    let text = i.to_string(&value)?;
+    if let Some(u) = cookie_url(i) {
+        // (one `name=value; attributes` string, as `Set-Cookie` takes it; a line break would be a second header)
+        if !text.contains(['\n', '\r']) && crate::cookies::global().accept_from_script(&u, &text) {
+            crate::cookies::save_if_changed();
+        }
+    }
+    Ok(())
+}
+
 // ---- XMLHttpRequest
 //
 // A deliberately small version: same-origin http(s) only (there is no CORS, so another site's

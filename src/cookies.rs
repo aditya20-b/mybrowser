@@ -287,8 +287,15 @@ impl Jar {
     /// `document.cookie = "..."`: a cookie set from script. It goes through the same rules as one
     /// from a response, except that a script can't make an `HttpOnly` one.
     pub fn accept_from_script(&mut self, url: &Url, header: &str) -> bool {
-        let lower = header.to_ascii_lowercase();
-        if lower.split(';').skip(1).any(|attr| attr.trim() == "httponly") {
+        // Judge what the cookie crate will make of it (it reads attribute names without regard to
+        // case and ignores a `=value`, so `httponly=x` is HttpOnly too), not the text.
+        let Ok(parsed) = Cookie::parse(header.to_string(), url) else { return false };
+        if parsed.http_only() == Some(true) {
+            return false;
+        }
+        // ...and a script may not replace or delete a cookie the server made HttpOnly
+        let key = key_of(&parsed);
+        if self.store.get(&key.0, &key.1, &key.2).is_some_and(|old| old.http_only() == Some(true)) {
             return false;
         }
         self.accept(url, header)
@@ -492,6 +499,12 @@ mod tests {
         assert!(jar.accept_from_script(&site, "lang=en; Path=/; Max-Age=60"));
         assert!(!jar.accept_from_script(&site, "evil=1; HttpOnly"));
         assert!(!jar.accept_from_script(&site, "evil=1; path=/; HTTPONLY"));
+        assert!(!jar.accept_from_script(&site, "evil=1; httponly=true"));
+        assert!(!jar.accept_from_script(&site, "evil=1; HttpOnly = x"));
+        // the server's HttpOnly cookie can't be overwritten or deleted by a script
+        assert!(!jar.accept_from_script(&site, "session=PWNED; Path=/"));
+        assert!(!jar.accept_from_script(&site, "session=; Path=/; Max-Age=0"));
+        assert!(header(&jar, "https://app.example.com/").contains("session=abc"));
         assert!(!jar.accept_from_script(&u("http://app.example.com/"), "s=1; Secure"));
         assert!(!jar.accept_from_script(&site, "__Host-x=1; Domain=example.com; Secure; Path=/"));
         let seen = jar.script_visible(&site);

@@ -38,6 +38,9 @@ use winit::window::{CursorIcon, Window, WindowId};
 
 const USAGE: &str = "usage: mybrowser [URL or file]\n       mybrowser --screenshot OUT.png [--width PX] [--scale N] [URL or file]";
 
+/// The most text one paste into a page field may insert.
+const MAX_PASTE_CHARS: usize = 100_000;
+
 fn die(msg: &str) -> ! {
     eprintln!("mybrowser: {msg}\n{USAGE}");
     std::process::exit(2)
@@ -61,6 +64,24 @@ fn parse_number(name: &str, value: &str, min: f32, max: f32) -> Result<f32, Stri
         return Err(format!("{name} must be a number between {min} and {max}"));
     }
     Ok(n)
+}
+
+/// What gets typed into a field when `clipboard` is pasted: a one-line field takes
+/// line breaks as spaces (and drops other control characters), a textarea keeps its
+/// lines as `\n`. Capped, so pasting a huge clipboard can't stall the page.
+fn paste_text_for(kind: Option<ControlKind>, clipboard: &str) -> String {
+    let multiline = kind == Some(ControlKind::Textarea);
+    clipboard
+        .chars()
+        .take(MAX_PASTE_CHARS)
+        .filter_map(|c| match c {
+            '\r' => None,
+            '\n' if multiline => Some('\n'),
+            '\n' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
 }
 
 /// Turn whatever the user typed (or passed on the command line) into a URL:
@@ -510,15 +531,47 @@ impl App {
         self.after_form_action(result);
     }
 
+    /// Cmd+V / Cmd+C in a focused page field. Returns true if the key was handled
+    /// (a field that isn't text-like leaves Cmd shortcuts to the browser).
+    fn field_clipboard_key(&mut self, id: NodeId, kind: Option<ControlKind>, key: &Key) -> bool {
+        if !kind.is_some_and(forms::is_text_like) {
+            return false;
+        }
+        let Key::Character(c) = key else { return false };
+        match c.as_str().to_ascii_lowercase().as_str() {
+            "v" => {
+                if let Some(clip) = chrome::clipboard_get() {
+                    let text = paste_text_for(kind, &clip);
+                    if !text.is_empty() {
+                        let tab = self.tab_mut();
+                        tab.page.dom_value_edit(id, &text);
+                        tab.form_changed();
+                    }
+                }
+                true
+            }
+            "c" => {
+                // a password never goes to the clipboard
+                if kind != Some(ControlKind::Password) {
+                    let tab = self.tab();
+                    chrome::clipboard_set(&tab.page.form.value(&tab.page.dom, id));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// A key press while a form control has focus. Returns true if the control
     /// consumed it. Typing in a text field consumes everything (so `r` types an
     /// `r` instead of reloading); other controls only take Space, Enter, Tab and Escape.
     fn control_key(&mut self, event: &KeyEvent, cmd: bool) -> bool {
         let Some(id) = self.tab().page.form.focus else { return false };
-        if cmd {
-            return false; // Cmd+L, Cmd+R ... still work
-        }
         let kind = forms::kind_of(&self.tab().page.dom, id);
+        if cmd {
+            // Cmd+V pastes into the field and Cmd+C copies from it; Cmd+L, Cmd+R ... still work
+            return self.field_clipboard_key(id, kind, &event.logical_key);
+        }
         let text_like = kind.is_some_and(forms::is_text_like);
         let shift = self.modifiers.shift_key();
         // Holding Enter or Space must not toggle a box or navigate over and over.
@@ -921,6 +974,21 @@ mod tests {
 
     fn u(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn pasted_text_fits_the_field_it_goes_into() {
+        // a one-line field turns line breaks into spaces and drops control characters
+        assert_eq!(paste_text_for(Some(ControlKind::Text), "a\r\nb\nc\td\u{7}e"), "a b c de");
+        assert_eq!(paste_text_for(Some(ControlKind::Password), "pass\nword"), "pass word");
+        // a textarea keeps its lines (and loses the carriage returns)
+        assert_eq!(paste_text_for(Some(ControlKind::Textarea), "one\r\ntwo\nthree"), "one\ntwo\nthree");
+        // escape sequences and other controls never reach a field
+        assert_eq!(paste_text_for(Some(ControlKind::Textarea), "\u{1b}[31mred\u{0}"), "[31mred");
+        // unicode survives, and a huge clipboard is cut off
+        assert_eq!(paste_text_for(Some(ControlKind::Text), "é日本語🎉"), "é日本語🎉");
+        assert_eq!(paste_text_for(Some(ControlKind::Text), &"x".repeat(MAX_PASTE_CHARS * 3)).chars().count(), MAX_PASTE_CHARS);
+        assert_eq!(paste_text_for(None, ""), "");
     }
 
     #[test]

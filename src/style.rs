@@ -469,6 +469,7 @@ pub fn compute(dom: &Dom, rules: &[Rule]) -> Vec<Style> {
 /// The browser's built-in default stylesheet.
 pub const USER_AGENT_CSS: &str = "
 head, style, script, title, meta, link, template, base, col, colgroup { display: none }
+[hidden] { display: none }
 html, body, div, section, article, header, footer, nav, main, aside, p, h1, h2, h3, h4, h5,
 h6, ul, ol, dl, dt, dd, pre, blockquote, hr, form, figure, figcaption, fieldset, address,
 details, summary, center, caption { display: block }
@@ -568,6 +569,18 @@ mod tests {
     }
 
     // ---------- regressions from the adversarial review ----------
+
+    #[test]
+    fn the_hidden_attribute_hides_an_element_unless_the_page_says_otherwise() {
+        assert_eq!(style_of("<div hidden>x</div>", "div").display, Display::None);
+        assert_eq!(style_of("<span hidden>x</span>", "span").display, Display::None);
+        assert_eq!(style_of("<p hidden=until-found>x</p>", "p").display, Display::None);
+        // an author rule beats the user-agent one, as in browsers
+        assert_eq!(style_of("<style>div{display:block}</style><div hidden>x</div>", "div").display, Display::Block);
+        // elements without the attribute are untouched, and a child of a hidden one hides with it
+        assert_eq!(style_of("<div>x</div>", "div").display, Display::Block);
+        assert_eq!(style_of("<div hidden><p>x</p></div>", "p").display, Display::Block, "(its box is simply never laid out)");
+    }
 
     #[test]
     fn author_rules_beat_user_agent_rules_regardless_of_specificity() {

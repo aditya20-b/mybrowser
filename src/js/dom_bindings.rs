@@ -1150,6 +1150,8 @@ impl Interp {
         Interp::declare(&g, "window", Value::Obj(window.clone()), true);
         Interp::declare(&g, "self", Value::Obj(window.clone()), true);
         Interp::declare(&g, "globalThis", Value::Obj(window), true);
+        let xhr = self.native(xhr_construct);
+        Interp::declare(&g, "XMLHttpRequest", xhr, true);
     }
 
     fn lookup_global(&mut self, name: &str) -> Value {
@@ -1182,6 +1184,163 @@ fn clear_timer(i: &mut Interp, _: &Value, a: &[Value]) -> Res {
     let id = i.arg_number(a, 0)?;
     i.timers.retain(|t| t.id as f64 != id);
     Ok(Value::Undefined)
+}
+
+// ---- XMLHttpRequest
+//
+// A deliberately small version: same-origin http(s) only (there is no CORS, so another site's
+// answer can't be shown to the page), and the request is made when `send` is called; the page's
+// callbacks run afterwards, from the timer queue, as a real asynchronous request's would.
+
+/// Requests one page's scripts may make.
+const MAX_REQUESTS: u32 = 30;
+/// Longest response text given to a script.
+const MAX_RESPONSE: usize = 2 * 1024 * 1024;
+
+fn xhr_construct(i: &mut Interp, this: &Value, _: &[Value]) -> Res {
+    let Value::Obj(o) = this else { return Ok(Value::Undefined) };
+    for (n, f) in [
+        ("open", xhr_open as NativeFn),
+        ("send", xhr_send),
+        ("setRequestHeader", xhr_ignore),
+        ("abort", xhr_ignore),
+        ("getResponseHeader", xhr_header),
+        ("addEventListener", xhr_add_listener),
+    ] {
+        let v = i.native(f);
+        Interp::set_prop(o, n, v);
+    }
+    for (n, v) in [("readyState", 0.0), ("status", 0.0)] {
+        Interp::set_prop(o, n, Value::Num(v));
+    }
+    for n in ["responseText", "response", "statusText", "responseURL"] {
+        Interp::set_prop(o, n, str_value(""));
+    }
+    Ok(this.clone())
+}
+
+fn xhr_ignore(_: &mut Interp, _: &Value, _: &[Value]) -> Res {
+    Ok(Value::Undefined)
+}
+
+fn xhr_header(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
+    let name = i.arg_string(a, 0)?.to_ascii_lowercase();
+    if name == "content-type" {
+        return i.get_member(this, "__content_type");
+    }
+    Ok(Value::Null)
+}
+
+fn xhr_open(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
+    let (method, url) = (i.arg_string(a, 0)?, i.arg_string(a, 1)?);
+    i.set_member(this, "__method", str_value(&method.to_ascii_uppercase()))?;
+    i.set_member(this, "__url", str_value(&url))?;
+    i.set_member(this, "readyState", Value::Num(1.0))?;
+    Ok(Value::Undefined)
+}
+
+fn xhr_add_listener(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
+    let event = i.arg_string(a, 0)?;
+    let Some(handler) = a.get(1).filter(|h| h.is_callable()).cloned() else { return Ok(Value::Undefined) };
+    let key = format!("__on_{event}");
+    // (kept as one handler per event: enough for the usual `addEventListener('load', ...)`)
+    i.set_member(this, &key, handler)?;
+    Ok(Value::Undefined)
+}
+
+fn xhr_send(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
+    let method = i.get_member(this, "__method")?;
+    let url = i.get_member(this, "__url")?;
+    let (Value::Str(method), Value::Str(url)) = (method, url) else {
+        return i.throw("Error", "the request was not opened");
+    };
+    let body = match a.first() {
+        Some(Value::Undefined | Value::Null) | None => None,
+        Some(v) => Some(i.to_string(v)?),
+    };
+    let result = if i.requests >= MAX_REQUESTS {
+        Err("too many requests".to_string())
+    } else {
+        i.requests += 1;
+        xhr_fetch(&i.page_url, &method, &url, body.as_deref())
+    };
+    match result {
+        Ok(f) => {
+            let mut text = crate::net::decode_text(&f.body, f.charset.as_deref(), false);
+            if text.len() > MAX_RESPONSE {
+                let mut cut = MAX_RESPONSE;
+                while !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                text.truncate(cut);
+            }
+            i.set_member(this, "status", Value::Num(f.status as f64))?;
+            i.set_member(this, "responseText", str_value(&text))?;
+            i.set_member(this, "response", str_value(&text))?;
+            i.set_member(this, "responseURL", str_value(f.url.as_str()))?;
+            i.set_member(this, "__content_type", str_value(&f.content_type))?;
+            i.set_member(this, "readyState", Value::Num(4.0))?;
+            xhr_schedule(i, this, "load");
+        }
+        Err(message) => {
+            i.set_member(this, "readyState", Value::Num(4.0))?;
+            i.set_member(this, "statusText", str_value(&message))?;
+            xhr_schedule(i, this, "error");
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+/// The request itself. Only the page's own origin may be asked.
+fn xhr_fetch(page_url: &str, method: &str, target: &str, body: Option<&str>) -> Result<crate::net::Fetched, String> {
+    let page = url::Url::parse(page_url).map_err(|_| "no page address".to_string())?;
+    let target = page.join(target.trim()).map_err(|_| "bad address".to_string())?;
+    if !matches!(page.scheme(), "http" | "https") || target.origin() != page.origin() {
+        return Err("blocked: only the page's own site can be requested".into());
+    }
+    crate::net::with_initiator(Some(page.clone()), || match method {
+        "GET" | "HEAD" => crate::net::fetch_subresource(&target, &page),
+        "POST" => crate::net::fetch_post(&target, body.unwrap_or("")),
+        _ => Err(format!("{method} requests are not supported")),
+    })
+}
+
+/// Queue the page's callbacks for `event` ("load" or "error") on a zero-delay timer.
+fn xhr_schedule(i: &mut Interp, this: &Value, event: &str) {
+    let func = i.native(|i, _, a| {
+        let xhr = a.first().cloned().unwrap_or(Value::Undefined);
+        let event = i.arg_string(a, 1)?;
+        let object = i.new_object();
+        Interp::set_prop(&object, "type", str_value(&event));
+        Interp::set_prop(&object, "target", xhr.clone());
+        let ev = Value::Obj(object);
+        let mut names = vec![];
+        if event == "load" {
+            names.extend(["onreadystatechange", "__on_readystatechange", "onload", "__on_load"]);
+        } else {
+            names.extend(["onerror", "__on_error"]);
+        }
+        for name in names {
+            let handler = i.get_member(&xhr, name)?;
+            if handler.is_callable() {
+                match i.call(&handler, &xhr, std::slice::from_ref(&ev)) {
+                    Err(Ctrl::Throw(e)) => {
+                        let msg = i.describe_error(&e);
+                        i.log_line(format!("Uncaught {msg}"));
+                    }
+                    Err(e) => return Err(e),
+                    Ok(_) => {}
+                }
+            }
+        }
+        Ok(Value::Undefined)
+    });
+    if i.timers.len() < MAX_TIMERS {
+        i.timer_seq += 1;
+        let id = i.timer_seq;
+        let due = i.clock;
+        i.timers.push(Timer { id, due, func, args: vec![this.clone(), str_value(event)], interval: None, runs: 0 });
+    }
 }
 
 // ---- document methods

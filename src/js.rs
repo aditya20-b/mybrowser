@@ -290,6 +290,8 @@ pub struct Interp {
     /// Bytes the page's scripts have kept from earlier runs (load, events): what is left of the
     /// allowance is for the next one.
     retained: isize,
+    /// Network requests the page's scripts have made.
+    requests: u32,
     /// Arrays being joined right now (a cycle joins as an empty string).
     joining: Vec<ObjRef>,
     /// What the script wrote with `console.log` and friends.
@@ -599,6 +601,7 @@ impl Interp {
             bytes: 0,
             mem_limit: crate::memcount::live_bytes() + MAX_SCRIPT_MEMORY,
             retained: 0,
+            requests: 0,
             joining: vec![],
             console: vec![],
             console_bytes: 0,

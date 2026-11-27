@@ -842,6 +842,27 @@ mod tests {
     }
 
     #[test]
+    fn scripts_can_request_their_own_site_but_no_other() {
+        let (port, server) = serve_routes(vec![("/data", "text/plain", b"hello from the server".to_vec()), ("/post", "text/plain", b"posted".to_vec())], 3);
+        let src = "<body><p id=out>waiting</p><script>
+            var x = new XMLHttpRequest(); x.open('GET', '/data');
+            x.onload = function () { document.getElementById('out').textContent = x.responseText; console.log('status ' + x.status + ' ' + x.getResponseHeader('Content-Type') + ' ' + x.readyState) };
+            x.send();
+            var y = new XMLHttpRequest(); y.open('POST', '/post'); y.addEventListener('load', function () { console.log('post ' + y.responseText) }); y.send('a=1');
+            var z = new XMLHttpRequest(); z.open('GET', 'http://example.invalid/steal'); z.onerror = function () { console.log('blocked: ' + z.statusText) }; z.send();
+            var m = new XMLHttpRequest(); m.open('GET', '/missing'); m.onload = function () { console.log('missing ' + m.status) }; m.send();
+        </script></body>";
+        let p = Page::from_source(&Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(), src);
+        let _ = server.join();
+        let shown = p.dom.text_content(0);
+        assert!(shown.contains("hello from the server") && !shown.contains("waiting"), "{:?}", p.console);
+        assert!(p.console.contains(&"status 200 text/plain 4".to_string()), "{:?}", p.console);
+        assert!(p.console.contains(&"post posted".to_string()), "{:?}", p.console);
+        assert!(p.console.iter().any(|l| l.starts_with("blocked: blocked: only the page's own site")), "{:?}", p.console);
+        assert!(p.console.contains(&"missing 404".to_string()), "{:?}", p.console);
+    }
+
+    #[test]
     fn styles_set_by_scripts_change_the_layout() {
         let fonts = Fonts::load();
         let mut p = Page::from_source(

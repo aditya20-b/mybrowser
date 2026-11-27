@@ -35,8 +35,19 @@ fn size_ok(w: u32, h: u32) -> bool {
     w != 0 && h != 0 && (w as u64) * (h as u64) <= MAX_PIXELS
 }
 
-/// Decode an image from its bytes, sniffing the format from the content.
+/// Decode an image from its bytes, sniffing the format from the content. A damaged
+/// file is `None`, and so is one that makes a decoder crash: a corrupt image must cost
+/// one picture, never the whole page (a panic here would replace it with an error page).
 pub fn decode(bytes: &[u8]) -> Option<Image> {
+    guarded(|| decode_unguarded(bytes))
+}
+
+/// Run `f`, treating a panic as "no image".
+fn guarded(f: impl FnOnce() -> Option<Image>) -> Option<Image> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok().flatten()
+}
+
+fn decode_unguarded(bytes: &[u8]) -> Option<Image> {
     if bytes.starts_with(PNG_SIGNATURE) {
         decode_png(bytes)
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
@@ -267,6 +278,19 @@ mod tests {
     }
 
     #[test]
+    fn a_decoder_that_panics_costs_one_image_not_the_page() {
+        // a corrupt animated lossy WebP with an ALPH chunk made the webp crate index out of
+        // bounds; with no guard that panic unwound through the page load and replaced the page
+        // with an error. `decode` runs every decoder inside `guarded`.
+        assert!(guarded(|| panic!("a decoder crashed")).is_none());
+        let fine = guarded(|| Some(Image { w: 1, h: 1, rgba: vec![1, 2, 3, 4] }));
+        assert_eq!(fine.unwrap().rgba, [1, 2, 3, 4], "an image that decodes passes straight through");
+        assert!(guarded(|| None).is_none());
+        // and the public entry point stays usable after a contained panic
+        assert!(decode(&encode(1, 1, png::ColorType::Rgb, &[1, 2, 3])).is_some());
+    }
+
+    #[test]
     fn decodes_each_color_type_to_rgba() {
         let rgba = decode(&encode(1, 1, png::ColorType::Rgba, &[1, 2, 3, 4])).unwrap();
         assert_eq!(rgba.rgba, [1, 2, 3, 4]);
@@ -303,6 +327,12 @@ mod tests {
             let _ = decode(&good[..cut]);
         }
         assert!(decode(&good[..good.len() / 2]).is_none());
+        // flipping any single byte must not take the process down (the guard catches decoder panics)
+        for i in 0..good.len() {
+            let mut bent = good.clone();
+            bent[i] ^= 0xFF;
+            let _ = decode(&bent);
+        }
         // a header claiming a huge canvas: patch the VP8L width/height field of a lossless file
         let mut huge = good.clone();
         let sig = huge.windows(5).position(|w| w == [0x2f, 0x07, 0x00, 0xc0, 0x01] || w[0] == 0x2f).unwrap();

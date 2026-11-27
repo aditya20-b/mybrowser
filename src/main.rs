@@ -66,16 +66,17 @@ fn parse_number(name: &str, value: &str, min: f32, max: f32) -> Result<f32, Stri
     Ok(n)
 }
 
-/// What gets typed into a field when `clipboard` is pasted: a one-line field takes
-/// line breaks as spaces (and drops other control characters), a textarea keeps its
-/// lines as `\n`. Capped, so pasting a huge clipboard can't stall the page.
+/// What gets typed into a field when `clipboard` is pasted. Every kind of line break
+/// (`\r\n`, a lone `\r`, `\n`) counts as one. A one-line field takes line breaks as
+/// spaces, except those at the very start or end (a copied URL usually ends in one), and
+/// drops other control characters; a textarea keeps its lines as `\n`. Capped, so pasting
+/// a huge clipboard can't stall the page.
 fn paste_text_for(kind: Option<ControlKind>, clipboard: &str) -> String {
     let multiline = kind == Some(ControlKind::Textarea);
-    clipboard
-        .chars()
-        .take(MAX_PASTE_CHARS)
+    let normalized = clipboard.chars().take(MAX_PASTE_CHARS).collect::<String>().replace("\r\n", "\n").replace('\r', "\n");
+    let text = if multiline { normalized.as_str() } else { normalized.trim_matches('\n') };
+    text.chars()
         .filter_map(|c| match c {
-            '\r' => None,
             '\n' if multiline => Some('\n'),
             '\n' | '\t' => Some(' '),
             c if c.is_control() => None,
@@ -989,6 +990,21 @@ mod tests {
         assert_eq!(paste_text_for(Some(ControlKind::Text), "é日本語🎉"), "é日本語🎉");
         assert_eq!(paste_text_for(Some(ControlKind::Text), &"x".repeat(MAX_PASTE_CHARS * 3)).chars().count(), MAX_PASTE_CHARS);
         assert_eq!(paste_text_for(None, ""), "");
+    }
+
+    #[test]
+    fn a_lone_carriage_return_is_a_line_break_and_edge_breaks_are_trimmed() {
+        // classic Mac line endings used to vanish, gluing the words together
+        assert_eq!(paste_text_for(Some(ControlKind::Text), "a\rb"), "a b");
+        assert_eq!(paste_text_for(Some(ControlKind::Textarea), "a\rb\r\nc"), "a\nb\nc");
+        // a copied URL ends in a newline: it must not become a trailing space in a one-line field
+        assert_eq!(paste_text_for(Some(ControlKind::Text), "https://x.test\n"), "https://x.test");
+        assert_eq!(paste_text_for(Some(ControlKind::Text), "\r\n\nabc\n\r\n"), "abc");
+        assert_eq!(paste_text_for(Some(ControlKind::Password), "secret\r\n"), "secret");
+        // but breaks in the middle still become spaces, and a textarea keeps all of its own
+        assert_eq!(paste_text_for(Some(ControlKind::Text), "\nfirst\n\nsecond\n"), "first  second");
+        assert_eq!(paste_text_for(Some(ControlKind::Textarea), "\nabc\n"), "\nabc\n");
+        assert_eq!(paste_text_for(Some(ControlKind::Text), "\n\n"), "");
     }
 
     #[test]

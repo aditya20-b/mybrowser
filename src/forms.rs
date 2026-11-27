@@ -2,7 +2,7 @@
 //! text, checked state, chosen option), and how a submitted form becomes a
 //! request. This module is pure state and logic (no drawing, no windowing).
 use crate::dom::{Dom, NodeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use url::Url;
 
 /// Longest value a text control will hold, so holding a key down can't grow
@@ -63,8 +63,12 @@ pub fn is_disabled(dom: &Dom, id: NodeId) -> bool {
             Some("legend") => legend = Some(p),
             Some("fieldset") => {
                 if dom.attr(p, "disabled").is_some() {
-                    let first_legend = dom.nodes[p].children.iter().copied().find(|&c| dom.tag(c) == Some("legend"));
-                    let exempt = legend.is_some_and(|l| dom.nodes[l].parent == Some(p) && first_legend == Some(l));
+                    // (only look for the fieldset's first legend when we came through one:
+                    // scanning every child for every control made a wide fieldset quadratic)
+                    let exempt = legend.is_some_and(|l| {
+                        dom.nodes[l].parent == Some(p)
+                            && dom.nodes[p].children.iter().copied().find(|&c| dom.tag(c) == Some("legend")) == Some(l)
+                    });
                     if !exempt {
                         return true;
                     }
@@ -312,14 +316,18 @@ impl FormState {
     /// resolved against `base`, or the form is `method=dialog` (which only closes a dialog).
     pub fn submit(&self, dom: &Dom, form: NodeId, submitter: Option<NodeId>, base: &Url) -> Option<Submission> {
         let mut pairs: Vec<(String, String)> = vec![];
-        // a radio group submits one value: if markup left several checked, the last one wins
+        // a radio group submits one value: if markup left several checked, the last one wins,
+        // and if that one is disabled the group submits nothing
         let mut radio_slot: HashMap<String, usize> = HashMap::new();
+        let mut dropped: HashSet<usize> = HashSet::new();
         for id in controls_in(dom, form) {
-            if is_disabled(dom, id) {
+            let kind = kind_of(dom, id)?;
+            let disabled = is_disabled(dom, id);
+            if disabled && kind != ControlKind::Radio {
                 continue;
             }
             let Some(name) = dom.attr(id, "name").filter(|n| !n.is_empty()) else { continue };
-            match kind_of(dom, id)? {
+            match kind {
                 ControlKind::Hidden | ControlKind::Text | ControlKind::Password => {
                     pairs.push((name.to_string(), self.value(dom, id)));
                 }
@@ -336,12 +344,21 @@ impl FormState {
                 ControlKind::Radio => {
                     if self.is_checked(dom, id) {
                         let pair = (name.to_string(), dom.attr(id, "value").unwrap_or("on").to_string());
-                        match radio_slot.get(name) {
-                            Some(&slot) => pairs[slot] = pair,
+                        let slot = match radio_slot.get(name) {
+                            Some(&slot) => {
+                                pairs[slot] = pair;
+                                slot
+                            }
                             None => {
                                 radio_slot.insert(name.to_string(), pairs.len());
                                 pairs.push(pair);
+                                pairs.len() - 1
                             }
+                        };
+                        if disabled {
+                            dropped.insert(slot);
+                        } else {
+                            dropped.remove(&slot);
                         }
                     }
                 }
@@ -354,6 +371,8 @@ impl FormState {
                 ControlKind::Button => {}
             }
         }
+        let pairs: Vec<(String, String)> =
+            pairs.into_iter().enumerate().filter(|(i, _)| !dropped.contains(i)).map(|(_, p)| p).collect();
         // the submitting button may override the form's action and method
         let from_button = |attr: &str| submitter.and_then(|s| dom.attr(s, attr)).map(str::trim).filter(|v| !v.is_empty());
         let method_attr = from_button("formmethod").or_else(|| dom.attr(form, "method")).map(|m| m.trim().to_ascii_lowercase());
@@ -514,6 +533,17 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_disabled_fieldset_is_not_quadratic() {
+        // every control used to scan all the fieldset's children for its first legend
+        let inputs: String = (0..20_000).map(|i| format!("<input name=a{i}>")).collect();
+        let dom = html::parse(&format!("<form><fieldset disabled>{inputs}</fieldset></form>"));
+        let t = std::time::Instant::now();
+        let n = (0..dom.nodes.len()).filter(|&i| kind_of(&dom, i).is_some() && is_disabled(&dom, i)).count();
+        assert_eq!(n, 20_000);
+        assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
+    }
+
+    #[test]
     fn several_checked_radios_in_markup_submit_only_the_last() {
         let dom = html::parse(
             "<form action=/s><input type=radio name=r value=1 checked><input type=radio name=r value=2 checked>\
@@ -526,6 +556,24 @@ mod tests {
         let mut st = FormState::default();
         st.toggle(&dom, radios[0]);
         assert_eq!(st.submit(&dom, find(&dom, "form", 0), None, &base()).unwrap().url.query(), Some("r=1&mid=m&other=a"));
+    }
+
+    #[test]
+    fn a_disabled_checked_radio_still_decides_its_group() {
+        // the last checked radio is the group's choice; if it is disabled nothing is sent
+        let dom = html::parse("<form action=/s><input type=radio name=r value=1 checked><input type=radio name=r value=2 checked disabled><input name=z value=1></form>");
+        let sub = FormState::default().submit(&dom, find(&dom, "form", 0), None, &base()).unwrap();
+        assert_eq!(sub.url.query(), Some("z=1"));
+        // through a disabled fieldset too
+        let dom = html::parse("<form action=/s><input type=radio name=r value=1 checked><fieldset disabled><input type=radio name=r value=2 checked></fieldset></form>");
+        let sub = FormState::default().submit(&dom, find(&dom, "form", 0), None, &base()).unwrap();
+        assert_eq!(sub.url.query(), None);
+        // a lone disabled radio is simply not sent, and an enabled last one wins over a disabled earlier one
+        let dom = html::parse("<form action=/s><input type=radio name=r value=1 checked disabled><input type=radio name=r value=2 checked></form>");
+        let sub = FormState::default().submit(&dom, find(&dom, "form", 0), None, &base()).unwrap();
+        assert_eq!(sub.url.query(), Some("r=2"));
+        let dom = html::parse("<form action=/s><input type=radio name=r value=1 checked disabled></form>");
+        assert_eq!(FormState::default().submit(&dom, find(&dom, "form", 0), None, &base()).unwrap().url.query(), None);
     }
 
     #[test]

@@ -37,6 +37,27 @@ impl Drop for RestoreInitiator {
     }
 }
 
+thread_local! {
+    /// While a script's request runs: the one origin it may reach (redirects included) and the
+    /// most it may read.
+    static CONFINED: std::cell::RefCell<Option<(Url, usize)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` (a request a page's script made) so that every hop, not just the first, must stay on
+/// `origin`'s origin, and no more than `max_body` bytes are read.
+pub fn confined_to<T>(origin: &Url, max_body: usize, f: impl FnOnce() -> T) -> T {
+    let previous = CONFINED.with(|c| c.replace(Some((origin.clone(), max_body))));
+    struct Restore(Option<(Url, usize)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let p = self.0.take();
+            CONFINED.with(|c| *c.borrow_mut() = p);
+        }
+    }
+    let _restore = Restore(previous);
+    f()
+}
+
 /// Run `f` (a top-level load) as a navigation started from `initiator`.
 pub fn with_initiator<T>(initiator: Option<Url>, f: impl FnOnce() -> T) -> T {
     let _restore = RestoreInitiator(INITIATOR.with(|i| i.replace(initiator)));
@@ -224,6 +245,10 @@ fn fetch_http(start: &Url, top: Option<&Url>, post: Option<&str>) -> Result<Fetc
                 if !matches!(next.scheme(), "http" | "https") {
                     return Err(format!("{url}: refusing to follow a redirect to {}:", next.scheme()));
                 }
+                // a script's request may not be sent on to another site (its body, its cookies, or the answer)
+                if CONFINED.with(|c| c.borrow().as_ref().is_some_and(|(o, _)| o.origin() != next.origin())) {
+                    return Err(format!("{url}: blocked a redirect to another site"));
+                }
                 // 307 and 308 repeat the same POST; the rest become a GET. Form data is never
                 // re-sent from https to plain http.
                 let repeat = matches!(status.as_u16(), 307 | 308) && !(url.scheme() == "https" && next.scheme() == "http");
@@ -241,7 +266,7 @@ fn fetch_http(start: &Url, top: Option<&Url>, post: Option<&str>) -> Result<Fetc
         let body = resp
             .body_mut()
             .with_config()
-            .limit(MAX_BODY)
+            .limit(CONFINED.with(|c| c.borrow().as_ref().map_or(MAX_BODY, |(_, m)| (*m as u64).min(MAX_BODY))))
             .read_to_vec()
             .map_err(|e| format!("reading {url}: {e}"))?;
         let content_type = if content_type.is_empty() { sniff(&body).to_string() } else { content_type };

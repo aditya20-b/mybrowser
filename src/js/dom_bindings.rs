@@ -139,7 +139,13 @@ fn store_style(i: &mut Interp, id: NodeId, decls: Vec<(String, String)>) {
 /// Set (or, with an empty value, remove) one property. A value that would smuggle in another
 /// declaration or rule is ignored, as a browser ignores an invalid value.
 fn set_style_property(i: &mut Interp, id: NodeId, css: &str, value: &str) {
-    if value.contains([';', '{', '}']) || value.contains("/*") || value.len() > 4096 {
+    if value.contains([';', '{', '}', '\\']) || value.contains("/*") || value.len() > 4096 {
+        return;
+    }
+    // unbalanced quotes or parentheses would swallow the declarations after this one
+    let quotes = |q: char| value.chars().filter(|&c| c == q).count();
+    let (opens, closes) = (quotes('('), quotes(')'));
+    if quotes('"') % 2 != 0 || quotes('\'') % 2 != 0 || opens != closes {
         return;
     }
     let Some(d) = i.dom.as_ref() else { return };
@@ -736,7 +742,8 @@ pub(super) fn node_set(i: &mut Interp, id: NodeId, name: &str, value: Value) -> 
             }
             Ok(())
         }
-        n if n.starts_with("on") && n.len() > 2 => {
+        // (only a function, or null to remove one, is a handler: `el.only = 5` is an ordinary property)
+        n if n.starts_with("on") && n.len() > 2 && (value.is_callable() || matches!(value, Value::Null)) => {
             // `el.onclick = fn`: one handler per event, replacing the last
             let event = n[2..].to_string();
             i.listeners.retain(|l| !(l.target == id && l.event == event && l.property));
@@ -1348,10 +1355,12 @@ fn xhr_fetch(page_url: &str, method: &str, target: &str, body: Option<&str>) -> 
     if !matches!(page.scheme(), "http" | "https") || target.origin() != page.origin() {
         return Err("blocked: only the page's own site can be requested".into());
     }
-    crate::net::with_initiator(Some(page.clone()), || match method {
-        "GET" | "HEAD" => crate::net::fetch_subresource(&target, &page),
-        "POST" => crate::net::fetch_post(&target, body.unwrap_or("")),
-        _ => Err(format!("{method} requests are not supported")),
+    crate::net::confined_to(&page, MAX_RESPONSE, || {
+        crate::net::with_initiator(Some(page.clone()), || match method {
+            "GET" | "HEAD" => crate::net::fetch_subresource(&target, &page),
+            "POST" => crate::net::fetch_post(&target, body.unwrap_or("")),
+            _ => Err(format!("{method} requests are not supported")),
+        })
     })
 }
 

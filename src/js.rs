@@ -3321,6 +3321,18 @@ mod tests {
     }
 
     #[test]
+    fn style_and_handler_edge_cases_from_second_review() {
+        let (log, _) = page(
+            "<body><p id=a>x</p></body>",
+            &["var p = document.getElementById('a'), s = p.style;
+               s.content = '\"'; s.width = '1px'; console.log(s.width);
+               s.setProperty('background', 'url(a'); s.height = '2px'; console.log(s.height);
+               p.only = 5; p.onboarding = {a: 1}; console.log(p.only, typeof p.onboarding)"],
+        );
+        assert_eq!(log, "1px\n2px\n5 object", "{log}");
+    }
+
+    #[test]
     fn lookups_stay_fast_in_deep_trees() {
         // 300 chains of 500 divs: the old lookup walked every node's ancestors, once per call
         let (log, _) = page(

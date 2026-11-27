@@ -868,6 +868,45 @@ mod tests {
     }
 
     #[test]
+    fn a_scripts_request_is_not_redirected_to_another_site() {
+        // B is "another site": nothing may connect to it
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        other.set_nonblocking(true).unwrap();
+        let b = other.local_addr().unwrap().port();
+        let a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a_port = a.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut sock, _) = a.accept().unwrap();
+                let mut seen = vec![];
+                let mut buf = [0u8; 2048];
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let k = sock.read(&mut buf).unwrap_or(0);
+                    if k == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&buf[..k]);
+                }
+                // (drain a small POST body so closing the socket doesn't reset the reply)
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                sock.set_nonblocking(true).ok();
+                let _ = sock.read(&mut buf);
+                let reply = format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{b}/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = sock.write_all(reply.as_bytes());
+            }
+        });
+        let src = "<body><script>
+            var g = new XMLHttpRequest(); g.open('GET', '/r'); g.onerror = function () { console.log('get: ' + g.statusText) }; g.onload = function () { console.log('get got ' + g.responseURL) }; g.send();
+            var p = new XMLHttpRequest(); p.open('POST', '/r'); p.onerror = function () { console.log('post: ' + p.statusText) }; p.onload = function () { console.log('post got ' + p.responseURL) }; p.send('token=abc');
+        </script></body>";
+        let p = Page::from_source(&Url::parse(&format!("http://127.0.0.1:{a_port}/")).unwrap(), src);
+        let _ = server.join();
+        assert_eq!(p.console.len(), 2, "{:?}", p.console);
+        assert!(p.console.iter().all(|l| l.contains("blocked a redirect to another site")), "{:?}", p.console);
+        assert!(other.accept().is_err(), "the other site was contacted");
+    }
+
+    #[test]
     fn styles_set_by_scripts_change_the_layout() {
         let fonts = Fonts::load();
         let mut p = Page::from_source(

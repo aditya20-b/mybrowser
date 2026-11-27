@@ -634,9 +634,6 @@ impl<'a> Ctx<'a> {
             // `margin-left: auto` / `margin-right: auto` on items soak up the leftover space
             // (the "push this one to the far end" idiom) before justify-content sees any of it
             let auto_sides = |it: &FlexItem| -> (bool, bool) {
-                if it.inline.is_some() {
-                    return (false, false);
-                }
                 let m = &styles[it.id].margin;
                 (m[3] == Length::Auto, m[1] == Length::Auto)
             };
@@ -2352,6 +2349,9 @@ mod tests {
         assert!((at(&j, "b").0 - (300.0 - wb)).abs() < 1.0);
         let g = flex("", "<div style='flex:1'>a</div><div style='margin-left:auto'>b</div>");
         assert!(at(&g, "b").0 > 280.0 - wb);
+        // inline items (spans, links) are flex items like any other
+        let i = flex("", "<span>a</span><a href=x style='margin-left:auto'>b</a>");
+        assert!((at(&i, "b").0 - (300.0 - wb)).abs() < 1.0, "{:?}", at(&i, "b"));
         // no room: the margin is just zero
         let n = flex("", "<div style='width:400px'>a</div><div style='margin-left:auto'>b</div>");
         assert!(at(&n, "b").0 >= 400.0 - 0.5);

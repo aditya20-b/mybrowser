@@ -251,7 +251,7 @@ pub struct Tab {
     next_initiator: Option<Url>,
     inflight_initiator: Option<Url>,
     /// Where each page left behind in this tab was scrolled to (by full URL, fragment included).
-    scroll_memory: HashMap<Url, f32>,
+    scroll_memory: HashMap<(Url, usize), f32>,
     notify: Notify,
 }
 
@@ -356,14 +356,18 @@ impl Tab {
         if !self.placeholder {
             self.remember_scroll(pending.from.clone());
         }
+        self.history.apply(pending.hist, pending.from, &page.url);
+        // (positions are kept per place in the history, so visiting a URL twice keeps two)
+        let depth = self.history.back.len();
         let restored = match (pending.hist, pending.keep_scroll) {
-            (Hist::Back | Hist::Forward, None) => self.scroll_memory.get(&pending.url).or(self.scroll_memory.get(&page.url)).copied(),
+            (Hist::Back | Hist::Forward, None) => {
+                self.scroll_memory.get(&(pending.url.clone(), depth)).or(self.scroll_memory.get(&(page.url.clone(), depth))).copied()
+            }
             _ => None,
         };
         if restored.is_some() {
             self.pending_fragment = None;
         }
-        self.history.apply(pending.hist, pending.from, &page.url);
         self.page = page;
         self.placeholder = false;
         self.laid_out_width = -1.0; // force relayout on the next redraw
@@ -371,12 +375,18 @@ impl Tab {
         true
     }
 
-    /// Note the current scroll position as the one for `url` (a page being left).
+    /// Note the current scroll position as the one for `url`, the page on screen at this
+    /// depth of the back history (call it as the page is left, before history changes).
     fn remember_scroll(&mut self, url: Url) {
         if self.scroll_memory.len() >= MAX_REMEMBERED_SCROLLS {
-            self.scroll_memory.clear();
+            // forget the oldest quarter (the shallowest places in the history), not everything
+            let mut depths: Vec<usize> = self.scroll_memory.keys().map(|(_, d)| *d).collect();
+            depths.sort_unstable();
+            let cut = depths[depths.len() / 4];
+            self.scroll_memory.retain(|(_, d), _| *d > cut);
         }
-        self.scroll_memory.insert(url, self.scroll);
+        let depth = self.history.back.len();
+        self.scroll_memory.insert((url, depth), self.scroll);
     }
 
     /// Scroll to the target of `fragment` in the current layout. Returns whether
@@ -470,7 +480,8 @@ impl Tab {
             self.history.forward.pop();
             self.history.back.push(here);
         }
-        match (self.scroll_memory.get(target).copied(), target.fragment()) {
+        let depth = self.history.back.len();
+        match (self.scroll_memory.get(&(target.clone(), depth)).copied(), target.fragment()) {
             (Some(y), _) => self.scroll = y,
             (None, Some(f)) => {
                 self.scroll_to_fragment(f);
@@ -1143,6 +1154,44 @@ mod tests {
         assert_eq!(tab.scroll, 300.0);
         tab.go_forward();
         assert_eq!(tab.scroll, 650.0);
+    }
+
+    #[test]
+    fn scroll_positions_belong_to_history_entries_not_urls() {
+        let (dir, _a, b) = site("scrollentries");
+        std::fs::write(dir.join("long.html"), "<style>body{margin:0}p{margin:0;height:900px}</style><p>one</p><p>two</p>").unwrap();
+        let long = Url::from_file_path(dir.join("long.html")).unwrap();
+        let (notify, rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        tab.open(long.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.scroll = 100.0;
+        tab.open(b.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.scroll = 55.0;
+        tab.open(long.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.scroll = 900.0;
+        tab.go_back();
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!((tab.page.url.clone(), tab.scroll), (b.clone(), 55.0));
+        tab.go_back();
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!((tab.page.url.clone(), tab.scroll), (long.clone(), 100.0), "the first visit's position, not the second's");
+        tab.go_forward();
+        assert!(deliver(&mut tab, &rx));
+        tab.go_forward();
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.scroll, 900.0);
+        // lots of fragment visits on one page: the recent ones all still come back right
+        for i in 0..250 {
+            tab.scroll = 700.0;
+            tab.follow(&format!("#f{i}"));
+        }
+        for i in 0..100 {
+            tab.go_back();
+            assert_eq!(tab.scroll, 700.0, "step back {i}");
+        }
     }
 
     #[test]

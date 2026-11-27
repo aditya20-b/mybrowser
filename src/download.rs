@@ -38,6 +38,7 @@ fn is_invisible(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}' | '\u{180E}'
+            | '\u{180B}'..='\u{180D}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0100}'..='\u{E01EF}'
             | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{2800}'
             | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF9}'..='\u{FFFB}'
             | '\u{E0000}'..='\u{E007F}'
@@ -173,6 +174,8 @@ mod tests {
         assert_eq!(safe_file_name("evil\u{202e}fdp.exe"), "evilfdp.exe");
         assert_eq!(safe_file_name("a\u{200b}b\u{feff}c\u{2066}d.txt"), "abcd.txt");
         assert_eq!(safe_file_name("x\u{61c}.zip"), "x.zip");
+        assert_eq!(safe_file_name("a\u{180b}b\u{e0100}c.pdf"), "abc.pdf");
+        assert_eq!(display_safe("a\u{180b}b\u{e0100}c\u{1d173}d", 50), "abcd");
         assert_eq!(safe_file_name("a\u{3164}b\u{2800}c\u{e0041}d\u{2028}e.zip"), "abcde.zip");
         assert_eq!(display_safe("ok\u{202e}\n\u{0}text", 100), "oktext");
         assert_eq!(display_safe(&"x".repeat(6000), 100).chars().count(), 101);

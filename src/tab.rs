@@ -734,12 +734,9 @@ impl Tab {
         if post {
             self.next_post = Some(sub.body);
         }
-        if target == from {
-            // replace the page in place (not `reload`, which might restart a different pending load)
-            self.begin_load(target, Hist::Replace, None);
-        } else {
-            self.open(target);
-        }
+        // (landing on the page you left is a replace, not a new entry, so submitting a form to
+        // its own address needs no special case; and it is a navigation the user asked for)
+        self.open(target);
         Ok(())
     }
 }
@@ -1348,6 +1345,7 @@ mod tests {
             ("/partial.bin", "application/octet-stream", 206, payload.clone()),
             ("/postdl", "application/octet-stream", 200, payload.clone()),
             ("/f2.zip", "application/zip", 200, payload.clone()),
+            ("/f2.zip?x=1", "application/zip", 200, payload.clone()),
             ("/other.html", "text/html", 200, b"<p>other</p>".to_vec()),
         ]);
         let url = |p: &str| Url::parse(&format!("http://127.0.0.1:{port}{p}")).unwrap();
@@ -1417,6 +1415,15 @@ mod tests {
         let note = tab.take_notice();
         assert_eq!(files_in(&dir), ["f.zip", "postdl"], "note: {note:?}, page: {} {:?}", tab.page.url, tab.page.title);
         assert!(note.unwrap().starts_with("Saved postdl"));
+
+        // a GET form submitted to its own address may download too
+        tab.page = Page::from_source(&url("/f2.zip?x=1"), "<form method=get action='/f2.zip'><input name=x value=1><input type=submit></form>");
+        tab.page.relayout(&crate::fonts::Fonts::load(), 400.0);
+        let get_submit = tab.page.layout.controls.last().unwrap().node;
+        tab.activate_control(get_submit).unwrap();
+        assert!(deliver(&mut tab, &rx));
+        assert!(files_in(&dir).contains(&"f2.zip".to_string()), "{:?} {:?}", files_in(&dir), tab.take_notice());
+        let _ = std::fs::remove_file(dir.join("f2.zip")); // (the next step expects to create it)
 
         // a note about one download is not shown with the next page
         tab.open(url("/f2.zip"));

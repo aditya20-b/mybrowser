@@ -491,6 +491,15 @@ impl App {
         }
         self.sync_chrome();
         self.update_hover();
+        self.show_download_notice();
+    }
+
+    /// Show what happened to a download that finished while the active tab was in the
+    /// background (the note waits in its tab until it is looked at).
+    fn show_download_notice(&mut self) {
+        if let Some(note) = self.tabs[self.active].take_notice() {
+            self.bar.error = Some(note);
+        }
     }
 
     fn switch_tab(&mut self, index: usize) {
@@ -499,10 +508,7 @@ impl App {
             self.find = None;
             self.sync_chrome();
             self.update_hover();
-            // a download that finished while this tab was in the background
-            if let Some(note) = self.tabs[index].take_notice() {
-                self.bar.error = Some(note);
-            }
+            self.show_download_notice();
         }
     }
 

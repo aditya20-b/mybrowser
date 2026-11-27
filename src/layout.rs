@@ -347,14 +347,28 @@ fn flex_line_sizes(items: &[&FlexItem], width: f32, gap: f32, justify: Justify) 
             *w += free * grow_sum.min(1.0) * it.grow / grow_sum;
         }
     } else if free < 0.0 {
-        // how much each item can give up (nothing for `flex-shrink: 0`), and how willingly
-        let room: Vec<f32> = items.iter().map(|i| if i.shrink > 0.0 { (i.basis - i.min).max(0.0) } else { 0.0 }).collect();
-        let weight: Vec<f32> = items.iter().zip(&room).map(|(i, r)| r * i.shrink).collect();
-        let (total_room, total_weight): (f32, f32) = (room.iter().sum(), weight.iter().sum());
-        if total_room > 0.0 && total_weight > 0.0 {
-            let cut = (-free).min(total_room);
-            for ((w, r), wt) in widths.iter_mut().zip(&room).zip(&weight) {
-                *w -= (cut * wt / total_weight).min(*r);
+        // The CSS algorithm: items give up space in proportion to shrink factor times size;
+        // one that would go below its min-content width is frozen there and the rest of the
+        // shortfall is shared out again between the others. `flex-shrink: 0` items start frozen.
+        let mut frozen: Vec<bool> = items.iter().map(|i| i.shrink <= 0.0).collect();
+        for _ in 0..=items.len() {
+            let used: f32 = (0..n).map(|i| if frozen[i] { widths[i] } else { items[i].basis }).sum::<f32>() + gaps;
+            let remaining = width - used;
+            let scaled: f32 = (0..n).filter(|&i| !frozen[i]).map(|i| items[i].shrink * items[i].basis).sum();
+            if remaining >= 0.0 || scaled <= 0.0 {
+                break;
+            }
+            let target = |i: usize| items[i].basis + remaining * items[i].shrink * items[i].basis / scaled;
+            let violators: Vec<usize> = (0..n).filter(|&i| !frozen[i] && target(i) < items[i].min).collect();
+            if violators.is_empty() {
+                for i in (0..n).filter(|&i| !frozen[i]) {
+                    widths[i] = target(i);
+                }
+                break;
+            }
+            for i in violators {
+                widths[i] = items[i].min.min(items[i].basis);
+                frozen[i] = true;
             }
         }
     }
@@ -2474,6 +2488,24 @@ mod tests {
         // an absurd percentage stays finite
         let huge = flex("", "<div style='width:99999999%'>a</div><div>b</div>");
         assert!(huge.layout.height.is_finite());
+    }
+
+    #[test]
+    fn shrinking_redistributes_what_a_capped_item_cannot_give() {
+        // an eager item that hits its minimum must not leave the line overflowing
+        let words = "word ".repeat(40);
+        let p = flex("", &format!("<div style='flex-shrink:10;background:#f00'>aa bb</div><div style='background:#0f0'>{words}</div>"));
+        let total: f32 = rects(&p).iter().map(|r| r.2).sum();
+        assert!(total <= 300.5, "the two boxes fit the 300px container: {total}");
+        // unit level: frozen items hold their minimum and the others absorb the rest
+        let item = |basis: f32, min: f32, shrink: f32| FlexItem { id: 0, inline: None, min, basis, grow: 0.0, shrink };
+        let (a, b) = (item(100.0, 90.0, 10.0), item(300.0, 0.0, 1.0));
+        let l = flex_line_sizes(&[&a, &b], 300.0, 0.0, Justify::Start);
+        assert!((l.widths[0] - 90.0).abs() < 0.01 && (l.widths[1] - 210.0).abs() < 0.01, "{:?}", l.widths);
+        // shares follow shrink factor times size
+        let (c, d) = (item(100.0, 0.0, 1.0), item(300.0, 0.0, 1.0));
+        let l = flex_line_sizes(&[&c, &d], 300.0, 0.0, Justify::Start);
+        assert!((l.widths[0] - 75.0).abs() < 0.01 && (l.widths[1] - 225.0).abs() < 0.01, "{:?}", l.widths);
     }
 
     #[test]

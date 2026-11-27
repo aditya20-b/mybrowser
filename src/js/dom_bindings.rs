@@ -339,17 +339,24 @@ fn is_inside(dom: &Dom, mut node: NodeId, maybe_ancestor: NodeId) -> bool {
 
 /// Copy a node and everything under it into new nodes (detached), returning the copy's id.
 fn clone_subtree(dom: &mut Dom, id: NodeId) -> NodeId {
+    clone_subtree_mapped(dom, id).0
+}
+
+/// As `clone_subtree`, and also which new node stands for each old one (so what scripts hold on
+/// to, wrappers and listeners, can follow a node that had to be copied).
+fn clone_subtree_mapped(dom: &mut Dom, id: NodeId) -> (NodeId, Vec<(NodeId, NodeId)>) {
     let kind = match &dom.nodes[id].kind {
         DKind::Element { tag, attrs } => DKind::Element { tag: tag.clone(), attrs: attrs.clone() },
         DKind::Text(t) => DKind::Text(t.clone()),
     };
     let copy = new_node(dom, kind);
+    let mut mapping = vec![(id, copy)];
     let mut work = vec![(id, copy)];
     while let Some((src, dst)) = work.pop() {
         let kids = dom.nodes[src].children.clone();
         for k in kids {
             if dom.nodes.len() > MAX_NODES {
-                return copy;
+                return (copy, mapping);
             }
             let kind = match &dom.nodes[k].kind {
                 DKind::Element { tag, attrs } => DKind::Element { tag: tag.clone(), attrs: attrs.clone() },
@@ -358,10 +365,11 @@ fn clone_subtree(dom: &mut Dom, id: NodeId) -> NodeId {
             let kc = new_node(dom, kind);
             dom.nodes[kc].parent = Some(dst);
             dom.nodes[dst].children.push(kc);
+            mapping.push((k, kc));
             work.push((k, kc));
         }
     }
-    copy
+    (copy, mapping)
 }
 
 /// Make `child` the last (or `before`'s previous) child of `parent`. Returns the node that ended
@@ -396,13 +404,25 @@ fn attach(i: &mut Interp, parent: NodeId, child: NodeId, before: Option<NodeId>)
     let mut node = child;
     if child < parent {
         // an older node can't go under a newer parent (the arena keeps parents first): move a copy
-        node = clone_subtree(dom, child);
+        let (copy, mapping) = clone_subtree_mapped(dom, child);
+        if dom.nodes.len() > MAX_NODES {
+            return Err(Ctrl::Abort("the page grew too big".into())); // (the copy may be cut short: nothing is moved)
+        }
+        node = copy;
         detach(dom, child);
-        // the script's object for the old node now stands for the copy
-        let wrapper = i.wrappers.remove(&child);
-        if let Some(w) = wrapper {
-            w.borrow_mut().kind = Kind::Node(node);
-            i.wrappers.insert(node, w);
+        // what scripts hold on to follows the copy: the objects standing for the old nodes (the
+        // moved node and everything under it), and the listeners registered on them
+        let moved: HashMap<NodeId, NodeId> = mapping.into_iter().collect();
+        for (old, new) in &moved {
+            if let Some(w) = i.wrappers.remove(old) {
+                w.borrow_mut().kind = Kind::Node(*new);
+                i.wrappers.insert(*new, w);
+            }
+        }
+        for l in i.listeners.iter_mut() {
+            if let Some(new) = moved.get(&l.target) {
+                l.target = *new;
+            }
         }
     }
     let dom = i.dom.as_mut().expect("checked above");

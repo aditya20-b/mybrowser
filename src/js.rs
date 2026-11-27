@@ -3324,6 +3324,26 @@ mod tests {
     }
 
     #[test]
+    fn moving_a_node_under_a_newer_parent_keeps_its_listeners_and_its_descendants_objects() {
+        let (log, body) = page(
+            "<body><div id=old><span id=kid>a</span></div></body>",
+            &["var old = document.getElementById('old'), kid = document.getElementById('kid');
+               kid.addEventListener('click', function () { console.log('kid clicked') });
+               old.onclick = function () { console.log('old clicked') };
+               var btn = document.createElement('button'); btn.onclick = function () { console.log('btn clicked') };
+               var box = document.createElement('div'); box.appendChild(btn); document.body.appendChild(box);
+               btn.click();
+               var wrap = document.createElement('section'); wrap.appendChild(old); document.body.appendChild(wrap);
+               kid.click();
+               kid.textContent = 'X';
+               console.log(kid === document.getElementById('kid'), kid.parentNode === old, old.parentNode === wrap)"],
+        );
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines, ["btn clicked", "kid clicked", "old clicked", "true true true"], "{log}");
+        assert!(body.contains("<span id=\"kid\">X</span>"), "{body}");
+    }
+
+    #[test]
     fn a_page_that_has_waited_long_enough_for_the_network_is_refused() {
         let dom = crate::html::parse("<body></body>");
         let src = vec![("var x = new XMLHttpRequest(); x.open('GET', '/a'); x.onerror = function () { console.log(x.statusText) }; x.send()".to_string(), "s".to_string())];

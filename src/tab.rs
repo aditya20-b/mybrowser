@@ -848,16 +848,21 @@ impl Tab {
         self.form_changed(); // (the scripts may have changed what is on the page)
         // a handler that set `location.href` sends the tab there, as a followed link would
         // `history.back()` / `forward()` from the handler: the tab goes back or forward
+        // (taken first, so a request that isn't acted on now can't fire at some later click)
+        let navigation = self.page.nav_request.take();
         if let Some(direction) = self.page.history_request.take() {
-            if direction < 0 {
-                self.go_back();
-            } else {
-                self.go_forward();
+            let somewhere = if direction < 0 { self.history.back_target().is_some() } else { self.history.forward_target().is_some() };
+            if somewhere {
+                if direction < 0 {
+                    self.go_back();
+                } else {
+                    self.go_forward();
+                }
+                return true;
             }
-            return true;
         }
         // (the click is only taken from the link if the handler's address went somewhere)
-        if let Some((href, replace)) = self.page.nav_request.take() {
+        if let Some((href, replace)) = navigation {
             let went = if replace {
                 match self.classify(&href) {
                     Link::Navigate(url) if url != self.page.url => {

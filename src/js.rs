@@ -3498,6 +3498,38 @@ mod tests {
     }
 
     #[test]
+    fn navigation_requests_leave_nothing_behind() {
+        let host = |script: &str| {
+            let dom = crate::html::parse("<body></body>");
+            run_page_scripts(dom, "https://app.example/dir/", vec![(script.to_string(), "s".to_string())]).expect("ran")
+        };
+        // an immediate request survives an unrelated delayed timer, at load and from a handler
+        let mut d = host("location.href = '/a'; setTimeout(function () {}, 5000)");
+        assert_eq!(d.host.requested_navigation(), Some(("https://app.example/a".into(), false)));
+        let mut d = host("setTimeout(function () { location.href = '/a' }, 0); setTimeout(function () {}, 5000)");
+        assert_eq!(d.host.requested_navigation(), Some(("https://app.example/a".into(), false)));
+        // ...but the delayed timer's own request is dropped
+        let mut d = host("setTimeout(function () { location.href = '/late' }, 5000)");
+        assert_eq!(d.host.requested_navigation(), None);
+        // a replace that went nowhere doesn't turn a later ordinary request into a replace
+        let mut d = host("location.replace(location.href); document.addEventListener('click', function () { location.href = '/x' })");
+        assert_eq!(d.host.requested_navigation(), None);
+        let mut dom = d.dom;
+        d.host.dispatch(&mut dom, dom_bindings::DOCUMENT, "click");
+        assert_eq!(d.host.requested_navigation(), Some(("https://app.example/x".into(), false)));
+        // a request made two ways leaves no phantom behind
+        let mut d = host("location.replace('/x'); location = '/y'");
+        assert_eq!(d.host.requested_navigation(), Some(("https://app.example/y".into(), true)));
+        assert_eq!(d.host.requested_navigation(), None);
+        // relative addresses are relative to the address the script knows (after pushState)
+        let mut d = host("history.pushState(null, '', '/a/b/c/'); location.href = 'rel'");
+        assert_eq!(d.host.requested_navigation(), Some(("https://app.example/a/b/c/rel".into(), false)));
+        // pushState with a password in the address is refused
+        let d = host("try { history.pushState(null, '', '//u:p@app.example/z') } catch (e) { console.log(e.name) }");
+        assert_eq!(d.console, ["SecurityError"]);
+    }
+
+    #[test]
     fn history_push_state_changes_the_address_scripts_read_but_not_the_site() {
         let dom = crate::html::parse("<body></body>");
         let script = "history.pushState({n: 1}, '', '/app/page2?x=1'); console.log(location.href, history.state.n);

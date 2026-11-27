@@ -1150,6 +1150,9 @@ impl Interp {
                     });
                 }
             }
+            // what was already asked for stays asked for while a delayed timer runs
+            let delayed = timer.due > clock_at_start;
+            let saved_navigation = if delayed { self.pending_navigation() } else { None };
             let result = self.call(&timer.func, &Value::Undefined, &timer.args);
             // ...but all the callbacks of one run together have a budget too, or the window would
             // freeze while a chain of timers each used nearly all of theirs
@@ -1172,8 +1175,9 @@ impl Interp {
             }
             // a timer that was waiting for a while (a "redirecting in 5 seconds" page) doesn't send the
             // page away at once: there is no real waiting here, so its navigation is dropped
-            if timer.due > clock_at_start {
-                let _ = self.pending_navigation();
+            if delayed {
+                let _ = self.pending_navigation(); // (only what this timer itself asked for)
+                self.restore_navigation(saved_navigation);
             }
             // (promise callbacks go before the next timer; what they use counts towards the total)
             all_timers_spent += self.run_jobs();
@@ -1303,36 +1307,54 @@ impl Interp {
         let loc = self.lookup_global("location");
         let window = self.lookup_global("window");
         let own = self.location_obj.clone();
-        // `location = 'x'` replaces the global; `window.location = 'x'` sets a property of window
-        let target = if let Value::Str(s) = &loc {
-            Interp::declare(&global, "location", own.clone(), true);
-            s.to_string()
-        } else if let Ok(Value::Str(s)) = self.get_member(&window, "location") {
-            self.set_member(&window, "location", own.clone()).ok()?;
-            s.to_string()
-        } else {
-            let href = self.get_member(&loc, "href").ok()?;
-            let href = match href {
-                Value::Str(s) => s.to_string(),
-                v @ (Value::Num(_) | Value::Bool(_)) => self.to_string(&v).ok()?,
-                _ => return None,
-            };
-            if href == *self.page_url {
-                return None;
-            }
-            let back = str_value(&self.page_url.clone());
-            self.set_member(&loc, "href", back).ok()?;
-            href
-        };
+        // What was asked for, wherever the script put it; and whatever it did, the page's own
+        // `location` is put back as it was (address and replace flag), so nothing is left over.
         let replace = matches!(self.get_member(&own, "__replace"), Ok(Value::Bool(true)));
-        if replace {
-            self.set_member(&own, "__replace", Value::Bool(false)).ok()?;
+        let mut asked = if let Value::Str(s) = &loc {
+            // `location = 'x'` replaces the global
+            Some(s.to_string())
+        } else if let Ok(Value::Str(s)) = self.get_member(&window, "location") {
+            // `window.location = 'x'` sets a property of window
+            Some(s.to_string())
+        } else {
+            match self.get_member(&loc, "href") {
+                Ok(Value::Str(s)) => Some(s.to_string()),
+                Ok(v @ (Value::Num(_) | Value::Bool(_))) => self.to_string(&v).ok(),
+                _ => None,
+            }
+        };
+        if let Value::Str(_) = &loc {
+            Interp::declare(&global, "location", own.clone(), true);
         }
+        if matches!(self.get_member(&window, "location"), Ok(Value::Str(_))) {
+            let _ = self.set_member(&window, "location", own.clone());
+        }
+        let back = str_value(&self.page_url.clone());
+        let _ = self.set_member(&own, "href", back);
+        let _ = self.set_member(&own, "__replace", Value::Bool(false));
+        // the address is resolved against the page's address as the script knows it (after a
+        // `pushState`, `location = 'rel'` is relative to the pushed address)
+        let target = asked.take()?;
         let target = target.trim();
-        if target.is_empty() || target.len() > 2000 || target == self.page_url {
+        if target.is_empty() || target.len() > 2000 {
             return None;
         }
-        Some((target.to_string(), replace))
+        let resolved = match url::Url::parse(&self.page_url).ok().and_then(|base| base.join(target).ok()) {
+            Some(u) => u.to_string(),
+            None => target.to_string(),
+        };
+        if resolved == self.page_url {
+            return None;
+        }
+        Some((resolved, replace))
+    }
+
+    /// Put a navigation taken with `pending_navigation` back, as if it had not been taken.
+    fn restore_navigation(&mut self, nav: Option<(String, bool)>) {
+        let Some((target, replace)) = nav else { return };
+        let own = self.location_obj.clone();
+        let _ = self.set_member(&own, "href", str_value(&target));
+        let _ = self.set_member(&own, "__replace", Value::Bool(replace));
     }
 
     fn lookup_global(&mut self, name: &str) -> Value {
@@ -1377,7 +1399,7 @@ fn history_set_url(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
     let target = i.to_string(&target)?;
     let Ok(current) = url::Url::parse(&i.page_url) else { return Ok(Value::Undefined) };
     let Ok(next) = current.join(target.trim()) else { return Ok(Value::Undefined) };
-    if next.origin() != current.origin() || next.as_str().len() > 2000 {
+    if next.origin() != current.origin() || next.as_str().len() > 2000 || !next.username().is_empty() || next.password().is_some() {
         return i.throw("SecurityError", "pushState can't change the address to another site");
     }
     i.page_url = next.to_string();

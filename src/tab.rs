@@ -464,8 +464,29 @@ impl Tab {
         self.laid_out_width = -1.0; // force relayout on the next redraw
         self.scroll = restored.or(pending.keep_scroll).unwrap_or(0.0); // clamped on the next redraw
         self.refresh_hops = std::mem::take(&mut self.inflight_hops);
-        self.follow_meta_refresh();
+        if !self.follow_script_navigation() {
+            self.follow_meta_refresh();
+        }
         true
+    }
+
+    /// A page whose scripts set `location.href` while it loaded sends the tab on, like a redirect
+    /// (replacing the page in the history, a few hops at most, only to places a link could go).
+    /// Returns whether a load began.
+    fn follow_script_navigation(&mut self) -> bool {
+        let Some(href) = self.page.nav_request.take() else { return false };
+        if self.refresh_hops >= MAX_REFRESH_HOPS {
+            return false;
+        }
+        if let Link::Navigate(url) = self.classify(&href) {
+            if url != self.page.url {
+                self.next_hops = self.refresh_hops + 1;
+                self.next_initiator = Some(self.page.url.clone());
+                self.begin_load(url, Hist::Replace, None);
+                return true;
+            }
+        }
+        false
     }
 
     /// A load landed on a file we can't display. The page you were on stays (a download is not
@@ -825,6 +846,11 @@ impl Tab {
         }
         let prevented = self.page.run_event(node, "click");
         self.form_changed(); // (the scripts may have changed what is on the page)
+        // a handler that set `location.href` sends the tab there, as a followed link would
+        if let Some(href) = self.page.nav_request.take() {
+            self.follow(&href);
+            return true;
+        }
         prevented
     }
 
@@ -1631,6 +1657,54 @@ mod tests {
         assert_eq!(files_in(&dir), ["f.zip", "f2.zip", "payload.bin", "postdl"], "no second copy");
         assert!(reopened.take_notice().unwrap().starts_with("Not saved"));
         unsafe { std::env::remove_var("MYBROWSER_DOWNLOADS") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scripts_can_send_the_tab_somewhere_by_setting_location() {
+        let (dir, a, b) = site("scriptnav");
+        std::fs::write(dir.join("go.html"), "<p>moving</p><script>location.href = 'b.html'</script>").unwrap();
+        std::fs::write(dir.join("assign.html"), "<script>location.assign('b.html')</script>").unwrap();
+        std::fs::write(dir.join("loop1.html"), "<script>location.replace('loop2.html')</script>").unwrap();
+        std::fs::write(dir.join("loop2.html"), "<script>location.replace('loop1.html')</script>").unwrap();
+        std::fs::write(dir.join("evil.html"), "<script>location.href = 'javascript:alert(1)'</script><p>stay</p>").unwrap();
+        std::fs::write(dir.join("click.html"), "<a id=l href='a.html'>link</a><script>document.getElementById('l').onclick = function (e) { e.preventDefault(); location.href = 'b.html' }</script>").unwrap();
+        let file = |n: &str| Url::from_file_path(dir.join(n)).unwrap();
+        let (notify, rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        tab.open(a.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.open(file("go.html"));
+        assert!(deliver(&mut tab, &rx));
+        assert!(tab.is_loading(), "setting location while loading starts a load");
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.page.url, b);
+        assert_eq!(tab.history.back.last(), Some(&a), "it replaced the page that sent it on");
+        tab.open(file("assign.html"));
+        assert!(deliver(&mut tab, &rx));
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.page.url, b);
+        // two pages sending each other on stop after a few hops; an odd scheme goes nowhere
+        tab.open(file("loop1.html"));
+        for _ in 0..(MAX_REFRESH_HOPS as usize + 3) {
+            if !tab.is_loading() && tab.page.url.as_str().contains("loop") && tab.refresh_hops >= MAX_REFRESH_HOPS {
+                break;
+            }
+            deliver(&mut tab, &rx);
+        }
+        assert!(!tab.is_loading(), "the chain of hops ends");
+        tab.open(file("evil.html"));
+        assert!(deliver(&mut tab, &rx));
+        assert!(!tab.is_loading());
+        assert_eq!(tab.page.url, file("evil.html"));
+        // a click handler that sets location (and stops the link) sends the tab on
+        tab.open(file("click.html"));
+        assert!(deliver(&mut tab, &rx));
+        let link = (0..tab.page.dom.nodes.len()).find(|&n| tab.page.dom.tag(n) == Some("a")).expect("the page has a link");
+        assert!(tab.script_click(link));
+        assert!(tab.is_loading(), "the click handler's navigation began");
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.page.url, b, "the handler's address won over the link's");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

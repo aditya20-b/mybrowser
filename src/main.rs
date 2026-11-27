@@ -850,6 +850,7 @@ impl App {
                 if !self.tab_mut().script_click(id) {
                     self.activate_control(id);
                 }
+                self.sync_chrome(); // (a handler may have sent the tab somewhere)
             } else {
                 // clicking anywhere else leaves the control that had focus
                 let tab = self.tab_mut();
@@ -866,6 +867,7 @@ impl App {
                     .or_else(|| self.tab().page.body_node());
                 // a script's click handler runs first; `preventDefault()` keeps the link from being followed
                 let prevented = clicked.is_some_and(|n| self.tab_mut().script_click(n));
+                self.sync_chrome();
                 if let (Some(href), false) = (self.hover.clone(), prevented) {
                     if self.modifiers.super_key() {
                         // Cmd+click opens the link in a new tab

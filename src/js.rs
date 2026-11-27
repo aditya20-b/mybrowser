@@ -342,6 +342,11 @@ pub struct ScriptHost(Option<Unsend<Interp>>);
 unsafe impl Send for ScriptHost {}
 
 impl ScriptHost {
+    /// A navigation the scripts asked for (by `location.href = ...`), if any: a link to follow.
+    pub fn requested_navigation(&mut self) -> Option<String> {
+        self.interp().pending_navigation()
+    }
+
     fn interp(&mut self) -> &mut Interp {
         &mut self.0.as_mut().expect("the interpreter is only taken when the host is dropped").0
     }

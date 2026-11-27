@@ -1229,6 +1229,18 @@ impl Interp {
         }
         let location = self.new_object();
         Interp::set_prop(&location, "href", str_value(&self.page_url));
+        // `location.assign(url)` and `.replace(url)` are the same as setting `href`: the browser
+        // looks at `href` once the script has run (see `pending_navigation`)
+        for name in ["assign", "replace"] {
+            let f = self.native(|i, this, a| {
+                let target = i.arg_string(a, 0)?;
+                i.set_member(this, "href", str_value(&target))?;
+                Ok(Value::Undefined)
+            });
+            Interp::set_prop(&location, name, f);
+        }
+        let reload = self.native(|_, _, _| Ok(Value::Undefined));
+        Interp::set_prop(&location, "reload", reload);
         Interp::set_prop(&window, "location", Value::Obj(location.clone()));
         Interp::declare(&g, "location", Value::Obj(location), true);
         Interp::set_prop(&window, "window", Value::Obj(window.clone()));
@@ -1238,6 +1250,20 @@ impl Interp {
         let xhr = self.native(xhr_construct);
         Interp::declare(&g, "XMLHttpRequest", xhr, true);
         self.install_promises();
+    }
+
+    /// Where the scripts have asked the page to go (they set `location.href`, or called `assign`
+    /// or `replace`), once: the address is put back, so the same request isn't seen twice.
+    pub(super) fn pending_navigation(&mut self) -> Option<String> {
+        let loc = self.lookup_global("location");
+        let Value::Str(href) = self.get_member(&loc, "href").ok()? else { return None };
+        if *href == *self.page_url || href.len() > 2000 || href.trim().is_empty() {
+            return None;
+        }
+        let target = href.trim().to_string();
+        let back = str_value(&self.page_url.clone());
+        self.set_member(&loc, "href", back).ok()?;
+        Some(target)
     }
 
     fn lookup_global(&mut self, name: &str) -> Value {

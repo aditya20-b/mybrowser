@@ -59,6 +59,8 @@ pub struct Page {
     pub scripts: Option<ScriptHost>,
     /// What the scripts logged, and why one failed to load or run.
     pub console: Vec<String>,
+    /// Where the scripts asked to go (`location.href = ...`): the tab takes it from here.
+    pub nav_request: Option<String>,
     /// The stylesheets, kept so styles can be recomputed after scripts change the page.
     rules: Vec<Rule>,
     /// Nodes below this index have had their `<style>` taken into `rules`.
@@ -545,8 +547,10 @@ impl Page {
         }
 
         let dom_len = dom.nodes.len();
+        let mut scripts = scripts;
+        let nav_request = scripts.as_mut().and_then(|h| h.requested_navigation());
         let layout = Layout { items: vec![], links: vec![], controls: vec![], boxes: vec![], anchors: vec![], height: 0.0, canvas_bg: None };
-        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false, no_store: false, scripts, console, rules, styled_upto: dom_len }
+        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false, no_store: false, scripts, console, nav_request, rules, styled_upto: dom_len }
     }
 
     /// The innermost block element whose box contains layout position `(x, y)`: where a click
@@ -571,6 +575,9 @@ impl Page {
             return false;
         }
         let prevented = host.dispatch(&mut self.dom, node, event);
+        if let Some(target) = host.requested_navigation() {
+            self.nav_request = Some(target);
+        }
         for line in host.take_console() {
             if self.console.len() < MAX_CONSOLE_LINES {
                 self.console.push(line);

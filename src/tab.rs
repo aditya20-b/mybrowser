@@ -2,7 +2,7 @@
 //! flight. Everything here is independent of the window system (loaders report
 //! back through a plain callback), so it is unit-tested without opening one.
 use crate::dom::NodeId;
-use crate::forms::{self, ControlKind};
+use crate::forms::{self, ControlKind, FormState};
 use crate::net;
 use crate::page::Page;
 use std::collections::HashMap;
@@ -570,6 +570,12 @@ impl Tab {
                 }
                 Some(ControlKind::Submit) => form.focus = Some(id),
                 _ => {}
+            }
+        }
+        if kind == Some(ControlKind::Button) && FormState::is_reset_button(&self.page.dom, id) {
+            if let Some(form_el) = forms::form_of(&self.page.dom, id) {
+                let Page { dom, form, .. } = &mut self.page;
+                form.reset_form(dom, form_el);
             }
         }
         if kind == Some(ControlKind::Submit) {
@@ -1154,6 +1160,22 @@ mod tests {
         assert_eq!(tab.scroll, 300.0);
         tab.go_forward();
         assert_eq!(tab.scroll, 650.0);
+    }
+
+    #[test]
+    fn clicking_a_reset_button_clears_what_was_typed() {
+        let (notify, _rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        tab.page = Page::from_source(&Url::parse("file:///tmp/r.html").unwrap(), "<form><input name=q value=orig><input type=reset value=Reset></form>");
+        tab.page.relayout(&crate::fonts::Fonts::load(), 400.0);
+        let (input, reset) = (tab.page.layout.controls[0].node, tab.page.layout.controls[1].node);
+        tab.activate_control(input).unwrap();
+        let Page { dom, form, .. } = &mut tab.page;
+        form.type_text(dom, input, " changed");
+        assert_eq!(tab.page.form.value(&tab.page.dom, input), "orig changed");
+        tab.activate_control(reset).unwrap();
+        assert_eq!(tab.page.form.value(&tab.page.dom, input), "orig");
+        assert!(!tab.is_loading(), "reset never navigates");
     }
 
     #[test]

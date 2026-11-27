@@ -17,7 +17,8 @@ pub enum ControlKind {
     Radio,
     /// `<input type=submit>`, `<button>` (the default type) and image buttons.
     Submit,
-    /// `<input type=button|reset>` and `<button type=button|reset>`: draws, does nothing.
+    /// `<input type=button|reset>` and `<button type=button|reset>`: draws; a reset button
+/// restores its form's values when clicked, a plain button does nothing.
     Button,
     Textarea,
     Select,
@@ -390,6 +391,22 @@ impl FormState {
         self.selected.insert(id, next);
     }
 
+    /// A reset button was pressed: every control of the form goes back to what the markup says.
+    pub fn reset_form(&mut self, dom: &Dom, form: NodeId) {
+        for c in controls_in(dom, form) {
+            self.values.remove(&c);
+            self.checked.remove(&c);
+            self.selected.remove(&c);
+            self.carets.remove(&c);
+        }
+    }
+
+    /// Is this control a reset button (`<input type=reset>` or `<button type=reset>`)?
+    pub fn is_reset_button(dom: &Dom, id: NodeId) -> bool {
+        matches!(dom.tag(id), Some("input" | "button"))
+            && dom.attr(id, "type").is_some_and(|t| t.trim().eq_ignore_ascii_case("reset"))
+    }
+
     /// Arrow keys on a focused select: move to the next or previous option (stopping at the ends,
     /// and also using Home / End via `to_first` / `to_last`).
     pub fn step_select(&mut self, dom: &Dom, id: NodeId, step: SelectStep) {
@@ -532,6 +549,27 @@ mod tests {
 
     fn find(dom: &Dom, tag: &str, nth: usize) -> NodeId {
         (0..dom.nodes.len()).filter(|&i| dom.tag(i) == Some(tag)).nth(nth).unwrap_or_else(|| panic!("no {tag} #{nth}"))
+    }
+
+    #[test]
+    fn a_reset_button_restores_the_markups_values_in_its_own_form_only() {
+        let dom = html::parse("<form id=f1><input name=a value=x><input type=checkbox name=c checked><select name=s><option value=1>1<option value=2 selected>2</select><input type=reset id=r><button type=reset id=r2>R</button><button id=b>B</button></form><form><input name=other value=keep></form>");
+        let (a, c, s, other) = (by_name(&dom, "a"), by_name(&dom, "c"), by_name(&dom, "s"), by_name(&dom, "other"));
+        let form = find(&dom, "form", 0);
+        let mut st = FormState::default();
+        st.type_text(&dom, a, "yz");
+        st.toggle(&dom, c);
+        st.cycle_select(&dom, s);
+        st.move_caret(&dom, a, CaretMove::Home);
+        st.type_text(&dom, other, "!");
+        assert_eq!((st.value(&dom, a).as_str(), st.is_checked(&dom, c), st.value(&dom, s).as_str()), ("xyz", false, "1"));
+        st.reset_form(&dom, form);
+        assert_eq!((st.value(&dom, a).as_str(), st.is_checked(&dom, c), st.value(&dom, s).as_str()), ("x", true, "2"));
+        assert_eq!(st.caret(&dom, a), 1);
+        assert_eq!(st.value(&dom, other), "keep!", "another form is untouched");
+        let by_id = |id: &str| (0..dom.nodes.len()).find(|&n| dom.attr(n, "id") == Some(id)).unwrap();
+        assert!(FormState::is_reset_button(&dom, by_id("r")) && FormState::is_reset_button(&dom, by_id("r2")));
+        assert!(!FormState::is_reset_button(&dom, by_id("b")) && !FormState::is_reset_button(&dom, a));
     }
 
     #[test]

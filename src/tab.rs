@@ -327,13 +327,14 @@ impl Tab {
         let Some(pending) = self.nav.finish(ticket) else { return false };
         self.inflight_post = None;
         self.inflight_initiator = None;
-        self.history.apply(pending.hist, pending.from, &page.url);
-        // `page.html#section`: jump there once the page has been laid out (a reload
-        // that remembers where you were stays put instead)
+        // `page.html#section`: jump there once the page has been laid out. A redirect that
+        // names no fragment of its own keeps the one that was asked for, as in other browsers.
+        // A reload that remembers where you were stays put instead.
         self.pending_fragment = match pending.keep_scroll {
-            None => page.url.fragment().map(String::from),
+            None => page.url.fragment().or(pending.url.fragment()).map(String::from),
             Some(_) => None,
         };
+        self.history.apply(pending.hist, pending.from, &page.url);
         self.page = page;
         self.placeholder = false;
         self.laid_out_width = -1.0; // force relayout on the next redraw
@@ -965,6 +966,28 @@ mod tests {
         tab.laid_out_width = 400.0;
         tab.settle_fragment();
         assert_eq!(tab.scroll, 123.0);
+    }
+
+    #[test]
+    fn a_redirect_that_names_no_fragment_keeps_the_requested_one() {
+        // `/old#sec` answered with `302 Location: /new` lands on `/new` (no fragment in the
+        // final URL we get back), but the visit is still to #sec
+        let (dir, _a, _b) = site("redirect-fragment");
+        std::fs::write(dir.join("new.html"), "<style>body{margin:0}p{margin:0;height:500px}</style><p>one</p><h2 id=sec style='margin:0'>S</h2>").unwrap();
+        let landed = Url::from_file_path(dir.join("new.html")).unwrap();
+        let (notify, rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        let mut asked = landed.clone();
+        asked.set_fragment(Some("sec"));
+        tab.open(asked);
+        let UserEvent::Loaded { ticket, .. } = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        // hand over the page as the redirect would have built it: its URL has no fragment
+        assert!(tab.finish_load(ticket, Page::load(&landed)));
+        assert_eq!(tab.page.url.fragment(), None);
+        tab.page.relayout(&crate::fonts::Fonts::load(), 400.0);
+        tab.laid_out_width = 400.0;
+        tab.settle_fragment();
+        assert_eq!(tab.scroll, 500.0);
     }
 
     #[test]

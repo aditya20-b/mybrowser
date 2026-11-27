@@ -60,7 +60,7 @@ pub struct ControlRegion {
 
 /// Where a `#fragment` target is: an element's `id` (or an `<a name>`) and the y of
 /// the top of its box. Elements that don't have a box of their own (inline ones) resolve to
-/// the block that contains them.
+/// the top of the line or block they sit in.
 pub struct Anchor {
     pub name: String,
     pub y: f32,
@@ -116,7 +116,10 @@ pub fn layout_document(
 fn collect_anchors(dom: &Dom, styles: &[Style], blocks: &[(NodeId, f32)]) -> Vec<Anchor> {
     let mut block_y = vec![f32::NAN; dom.nodes.len()];
     for &(id, y) in blocks {
-        block_y[id] = y;
+        // the first record of an element wins (a table row group is recorded with each of its rows)
+        if block_y[id].is_nan() {
+            block_y[id] = y;
+        }
     }
     let mut out = vec![];
     for id in 0..dom.nodes.len() {
@@ -164,8 +167,9 @@ struct Ctx<'a> {
     items: Vec<Item>,
     links: Vec<LinkRegion>,
     controls: Vec<ControlRegion>,
-    /// (element, y of its top border edge) for every block-level box laid out, in
-    /// layout order. Table cells shift theirs along with their content.
+    /// (element, y of its top edge) for every box laid out, and for inline elements the
+    /// y of the line or block they start in, in layout order. Table cells shift theirs
+    /// along with their content.
     blocks: Vec<(NodeId, f32)>,
 }
 
@@ -349,7 +353,8 @@ impl<'a> Ctx<'a> {
             && s.height.is_none_or(|h| h <= 0.0)
             && self.is_empty_block(id)
         {
-            self.blocks.push((id, cursor)); // still a place a `#fragment` can point at
+            // still a place a `#fragment` can point at: just below the previous sibling's margin
+            self.blocks.push((id, if top_collapsed { cursor } else { cursor + prev_mb }));
             let merged = if top_collapsed { mb } else { collapse(prev_mb, collapse(mt_raw, mb)) };
             return (cursor, merged);
         }
@@ -571,6 +576,13 @@ impl<'a> Ctx<'a> {
                 Display::Inline => run.push(c),
                 d => {
                     self.flush_run(id, &mut run, x, &mut cursor, &mut prev_mb, width);
+                    // inline elements wrapped around this block (`<a id=x><div>..</div></a>`) have
+                    // no box of their own: they start where this block does
+                    let mut wrapper = self.dom.nodes[c].parent;
+                    while let Some(w) = wrapper.filter(|&w| w != id) {
+                        self.blocks.push((w, cursor + prev_mb));
+                        wrapper = self.dom.nodes[w].parent;
+                    }
                     let collapsed = collapsed_child == Some(c);
                     let (b, mb) = if d == Display::Table {
                         self.layout_table(c, x, cursor, prev_mb, width, collapsed, id)
@@ -630,6 +642,25 @@ impl<'a> Ctx<'a> {
         mt
     }
 
+    /// Record the y of every element with an `id` (or an `<a name>`) inside the inline
+    /// run `run`, which is about to be laid out starting at `y`. Inline elements have no box
+    /// of their own, so this is what makes `<a name=x></a>` between two paragraphs point
+    /// at the gap between them rather than at the top of the parent.
+    fn record_inline_anchors(&mut self, run: &[NodeId], y: f32) {
+        let mut stack: Vec<NodeId> = run.iter().rev().copied().collect();
+        while let Some(n) = stack.pop() {
+            if self.styles[n].display == Display::None {
+                continue;
+            }
+            if let Kind::Element { tag, attrs } = &self.dom.nodes[n].kind {
+                if attrs.get("id").is_some_and(|v| !v.is_empty()) || (tag == "a" && attrs.get("name").is_some_and(|v| !v.is_empty())) {
+                    self.blocks.push((n, y));
+                }
+                stack.extend(self.dom.nodes[n].children.iter().rev().copied());
+            }
+        }
+    }
+
     fn flush_run(
         &mut self,
         parent: NodeId,
@@ -642,6 +673,7 @@ impl<'a> Ctx<'a> {
         if run.is_empty() {
             return;
         }
+        self.record_inline_anchors(run, *cursor + *prev_mb);
         let mut items = vec![];
         for &n in run.iter() {
             self.flatten(n, &mut items);
@@ -1393,9 +1425,14 @@ impl<'a> Ctx<'a> {
         let content_w = (outer_w - pad[1] - pad[3] - bw[1] - bw[3]).max(0.0);
         let bg_slot = self.items.len();
         self.items.push(Item::Nop);
+        // a second placeholder marks the start of the cell for find in page (the first one
+        // becomes the cell's background when it has one), so text never runs from one cell into the next
+        self.items.push(Item::Nop);
         let (content_start, links_start, controls_start) = (self.items.len(), self.links.len(), self.controls.len());
+        // the cell itself can be a `#fragment` target: at the top of its box, which stays put
+        // when the content inside is later centred or bottom-aligned
+        self.blocks.push((id, y));
         let blocks_start = self.blocks.len();
-        self.blocks.push((id, y)); // the cell itself can be a `#fragment` target
 
         let (end_y, last_mb) = self.layout_children(id, x + bw[3] + pad[3], y + bw[0] + pad[0], content_w, false);
         let content = (content_start, self.items.len());
@@ -1447,6 +1484,7 @@ impl<'a> Ctx<'a> {
 
         let model = self.build_table(id);
         if model.rows.is_empty() && model.captions.is_empty() {
+            self.blocks.push((id, if top_collapsed { cursor } else { cursor + prev_mb }));
             let merged = if top_collapsed { mb } else { collapse(prev_mb, collapse(mt, mb)) };
             return (cursor, merged);
         }
@@ -1498,8 +1536,17 @@ impl<'a> Ctx<'a> {
         let mut row_h = vec![0.0f32; nrows];
         let mut spanning: Vec<Spanning> = vec![];
         let mut y_row = y + spacing;
+        let mut last_group: Option<NodeId> = None;
         for (ri, row) in model.rows.iter().enumerate() {
             let rs = &styles[row.id];
+            // rows and row groups (`<tr id=..>`, `<tbody id=..>`) are `#fragment` targets too
+            if row.group != last_group {
+                if let Some(g) = row.group {
+                    self.blocks.push((g, y_row));
+                }
+                last_group = row.group;
+            }
+            self.blocks.push((row.id, y_row));
             // Reserve a slot for the row's background now, so nothing is ever inserted
             // into the middle of the display list (which would shift recorded indices).
             let row_bg_slot = self.items.len();
@@ -1744,13 +1791,50 @@ mod tests {
     }
 
     #[test]
+    fn anchors_between_blocks_point_at_the_gap_not_the_top_of_the_parent() {
+        // `<a name=x></a>` between paragraphs is how old pages mark their sections
+        let p = render("<p style='margin:0;height:300px'>a</p><a name=x></a><p style='margin:0;height:300px'>b</p><span id=z></span><p style='margin:0;height:300px'>c</p>");
+        assert_eq!(p.layout.anchor_y("x"), Some(300.0));
+        assert_eq!(p.layout.anchor_y("z"), Some(600.0));
+        // a non-empty inline run between blocks, with the id on something inside it
+        let p = render("<div style='height:300px'>a</div>some text <b id=m>bold</b> more<div style='height:300px'>b</div>");
+        assert_eq!(p.layout.anchor_y("m"), Some(300.0));
+        // an inline element wrapped around blocks starts where its first block does
+        let p = render("<div style='height:500px;margin:0'>a</div><a id=x href=#><div>card</div></a>");
+        assert_eq!(p.layout.anchor_y("x"), Some(500.0));
+        // and inside a list or a table cell the same holds
+        let p = render("<ul style='margin:0'><li style='height:100px'>a</li><a name=in></a><li>b</li></ul>");
+        assert!(p.layout.anchor_y("in").unwrap() >= 100.0);
+    }
+
+    #[test]
+    fn table_rows_row_groups_and_empty_tables_are_targets() {
+        let p = render(
+            "<table style='border-spacing:0'><thead id=h><tr id=r1><td>a</td></tr></thead>\
+             <tbody id=b><tr id=r2><td style='height:200px'>b</td></tr><tr id=r3><td>c</td></tr></tbody></table>",
+        );
+        let y = |n: &str| p.layout.anchor_y(n).unwrap_or_else(|| panic!("no anchor {n}"));
+        assert_eq!(y("r1"), 0.0);
+        assert_eq!(y("h"), y("r1"), "a group starts with its first row");
+        assert_eq!(y("b"), y("r2"));
+        assert!(y("r2") > 5.0 && y("r3") > y("r2") + 150.0, "{} {}", y("r2"), y("r3"));
+        // an empty table is still there
+        let p = render("<p style='margin:0;height:100px'>a</p><table id=t></table>");
+        assert_eq!(p.layout.anchor_y("t"), Some(100.0));
+    }
+
+    #[test]
     fn anchors_follow_their_table_cells_when_cells_are_aligned() {
-        // c1 is vertically centred next to the tall cell, so it moves down after layout:
-        // its anchor must move with it
+        // c1 is vertically centred next to the tall cell: the cell box itself spans the whole
+        // row (its anchor is the row's top), but what is inside it moves down with its text
         let p = render("<table style='border-spacing:0'><tr><td id=c1><b id=in1>short</b></td><td id=c2>1<br>2<br>3<br>4<br>5</td></tr></table>");
-        let (c1, c2) = (p.layout.anchor_y("c1").unwrap(), p.layout.anchor_y("c2").unwrap());
-        assert!(c1 > c2 + 10.0, "the centred cell's anchor was shifted down: c1={c1} c2={c2}");
-        assert_eq!(p.layout.anchor_y("in1"), Some(c1), "and so is what is inside it");
+        let (c1, c2, in1) = (p.layout.anchor_y("c1").unwrap(), p.layout.anchor_y("c2").unwrap(), p.layout.anchor_y("in1").unwrap());
+        assert_eq!(c1, c2, "both cells start at the top of the row");
+        // (an inline element inside the cell resolves to the block that holds it, which was shifted)
+        assert!(in1 >= c1);
+        let nested = render("<table style='border-spacing:0'><tr><td><div id=d>short</div></td><td>1<br>2<br>3<br>4<br>5</td></tr></table>");
+        let d = nested.layout.anchor_y("d").unwrap();
+        assert!(d > nested.layout.anchor_y("d").unwrap() - 1.0 && d > 10.0, "a block in a centred cell was shifted down: {d}");
         let top = render("<table style='border-spacing:0'><tr valign=top><td id=c1>short</td><td id=c2>1<br>2<br>3<br>4<br>5</td></tr></table>");
         assert_eq!(top.layout.anchor_y("c1"), top.layout.anchor_y("c2"));
         // a table and an element in a cell that is shifted by rowspan
@@ -1780,6 +1864,10 @@ mod tests {
         assert_eq!(p.layout.anchors.len(), 5000);
         assert_eq!(p.layout.anchor_y("p0"), Some(0.0));
         assert!(p.layout.anchor_y("p4999").unwrap() > 4000.0 * 10.0);
+        // many inline ids in one paragraph are fine too
+        let inline: String = (0..5000).map(|i| format!("<a name=n{i}>x</a> ")).collect();
+        let p = render(&format!("<p>{inline}</p>"));
+        assert_eq!(p.layout.anchors.len(), 5000);
     }
 
     // ---------------------------------------------------------------- tables

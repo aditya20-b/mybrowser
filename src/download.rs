@@ -35,7 +35,26 @@ pub fn downloads_dir() -> Option<PathBuf> {
 /// Characters that show nothing or reorder what is shown around them: a file called
 /// `evil<RLO>fdp.exe` would display as `evilexe.pdf`.
 fn is_invisible(c: char) -> bool {
-    matches!(c, '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}')
+    matches!(
+        c,
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}' | '\u{180E}'
+            | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{2800}'
+            | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// Text for a message shown to the user (the address bar): control and invisible characters
+/// removed, and cut to `max` characters.
+pub fn display_safe(text: &str, max: usize) -> String {
+    let clean: String = text.chars().filter(|c| !c.is_control() && !is_invisible(*c)).collect();
+    if clean.chars().count() <= max {
+        clean
+    } else {
+        let mut cut: String = clean.chars().take(max).collect();
+        cut.push('…');
+        cut
+    }
 }
 
 /// A file name that is safe to create: no separators, control or invisible characters,
@@ -153,6 +172,10 @@ mod tests {
         // names that would display as something else
         assert_eq!(safe_file_name("evil\u{202e}fdp.exe"), "evilfdp.exe");
         assert_eq!(safe_file_name("a\u{200b}b\u{feff}c\u{2066}d.txt"), "abcd.txt");
+        assert_eq!(safe_file_name("x\u{61c}.zip"), "x.zip");
+        assert_eq!(safe_file_name("a\u{3164}b\u{2800}c\u{e0041}d\u{2028}e.zip"), "abcde.zip");
+        assert_eq!(display_safe("ok\u{202e}\n\u{0}text", 100), "oktext");
+        assert_eq!(display_safe(&"x".repeat(6000), 100).chars().count(), 101);
         // long names keep their extension, in characters and in bytes
         let long = format!("{}.tar.gz", "x".repeat(500));
         let cut = safe_file_name(&long);

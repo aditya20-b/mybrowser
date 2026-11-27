@@ -462,6 +462,8 @@ impl App {
         }
         if let Some(url) = self.closed.pop() {
             self.new_tab(Some(url), None);
+            // (a reopened tab is not a fresh request: if its address is a file, nothing is saved)
+            self.tab_mut().mark_restored();
         }
     }
 
@@ -497,6 +499,10 @@ impl App {
             self.find = None;
             self.sync_chrome();
             self.update_hover();
+            // a download that finished while this tab was in the background
+            if let Some(note) = self.tabs[index].take_notice() {
+                self.bar.error = Some(note);
+            }
         }
     }
 

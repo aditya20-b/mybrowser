@@ -239,7 +239,7 @@ impl Page {
                 esc(&truncate_chars(&name, 120)),
                 esc(&truncate_chars(&name, 120)),
                 f.body.len(),
-                esc(&f.content_type),
+                esc(&download::display_safe(&f.content_type, 100)),
             ),
         );
         page.download = Some(PendingDownload { name, content_type: f.content_type.clone(), body: f.body.clone() });
@@ -289,7 +289,8 @@ impl Page {
             // something we can't show: a successful, non-empty response from a web server is a
             // download (saved later, by the tab, only if the user asked for it); anything else
             // (an error status, an empty body, a local file) just says it can't be shown
-            _ if matches!(f.url.scheme(), "http" | "https") && (200..300).contains(&f.status) && f.status != 204 && !f.body.is_empty() => {
+            // (only a plain 200: a 206 is a piece of a file, 204/205 have nothing to save)
+            _ if matches!(f.url.scheme(), "http" | "https") && f.status == 200 && !f.body.is_empty() => {
                 Page::download_notice(&f)
             }
             other => Page::error(&f.url, &format!("Cannot display content of type '{other}'")),

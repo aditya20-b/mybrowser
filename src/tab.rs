@@ -256,6 +256,10 @@ pub struct Tab {
     /// How many meta-refresh redirects led to the page on screen, and to the load in flight.
     /// What happened to the last file the tab was asked to download (shown once).
     notice: Option<String>,
+    /// The page on screen is the note for a file this tab downloaded (not a page to go back to).
+    on_download_page: bool,
+    /// The tab was brought back with Cmd+Shift+T: its first load never saves a file.
+    restored: bool,
     refresh_hops: u8,
     inflight_hops: u8,
     /// Set just before `begin_load` by a meta refresh; taken by it.
@@ -297,6 +301,8 @@ impl Tab {
             inflight_initiator: None,
             scroll_memory: HashMap::new(),
             notice: None,
+            on_download_page: false,
+            restored: false,
             refresh_hops: 0,
             inflight_hops: 0,
             next_hops: 0,
@@ -331,6 +337,7 @@ impl Tab {
     pub fn begin_load(&mut self, url: Url, hist: Hist, keep_scroll: Option<f32>) {
         let ticket = self.nav.start(self.page.url.clone(), url.clone(), hist, keep_scroll);
         self.inflight_hops = std::mem::take(&mut self.next_hops);
+        self.notice = None; // a note about an earlier download isn't about this page
         let post = self.next_post.take();
         let initiator = self.next_initiator.take();
         self.inflight_post = post.clone();
@@ -359,11 +366,14 @@ impl Tab {
     /// superseded or cancelled load is ignored).
     pub fn finish_load(&mut self, ticket: u64, mut page: Page) -> bool {
         let Some(pending) = self.nav.finish(ticket) else { return false };
-        self.inflight_post = None;
+        let was_post = self.inflight_post.take().is_some();
         self.inflight_initiator = None;
         if let Some(download) = page.download.take() {
-            return self.land_download(pending, page, download);
+            return self.land_download(pending, page, download, was_post);
         }
+        // leaving the note page of a download (a tab opened onto a file) leaves nothing behind in history
+        let leaving_note = std::mem::take(&mut self.on_download_page);
+        let pending = if leaving_note && pending.hist == Hist::Push { Pending { hist: Hist::Replace, ..pending } } else { pending };
         // `page.html#section`: jump there once the page has been laid out. A redirect that
         // names no fragment of its own keeps the one that was asked for, as in other browsers.
         // A reload that remembers where you were stays put instead.
@@ -403,28 +413,44 @@ impl Tab {
     /// that was cancelled or superseded never gets here, so it writes nothing either.
     /// The outcome goes to `notice`, for the window to show. A tab that has shown nothing yet
     /// (opened straight onto the file) shows the note page instead.
-    fn land_download(&mut self, pending: Pending, page: Page, download: PendingDownload) -> bool {
+    fn land_download(&mut self, pending: Pending, page: Page, download: PendingDownload, was_post: bool) -> bool {
         let hops = std::mem::take(&mut self.inflight_hops);
-        // (a tab opened straight onto an address has shown nothing yet: that load is the user's too)
-        let asked = (pending.hist == Hist::Push || self.placeholder) && pending.keep_scroll.is_none() && hops == 0;
+        // (a tab opened straight onto an address has shown nothing yet: that load is the user's too,
+        // unless the tab was only brought back from the closed list; a form the user submitted
+        // counts even when it posts to the page's own address, which is a "replace" load)
+        let first_load = self.placeholder && !self.restored;
+        let asked = (pending.hist == Hist::Push || first_load || was_post) && pending.keep_scroll.is_none() && hops == 0;
+        let name = download::display_safe(&download.name, 120);
         self.notice = Some(if !asked {
-            format!("Not saved: {} (a download only starts from a link or address you open)", download.name)
+            format!("Not saved: {name} (a download only starts from a link or address you open)")
         } else {
             match download::downloads_dir() {
-                None => format!("Cannot save {}: there is no downloads folder", download.name),
+                None => format!("Cannot save {name}: there is no downloads folder"),
                 Some(dir) => match download::save(&dir, &download.name, &download.body) {
-                    Ok(path) => format!("Saved {} ({}) to {}", download.name, download.content_type, path.display()),
-                    Err(e) => format!("Cannot save {}: {e}", download.name),
+                    Ok(path) => format!(
+                        "Saved {name} ({}) to {}",
+                        download::display_safe(&download.content_type, 100),
+                        download::display_safe(&path.to_string_lossy(), 300)
+                    ),
+                    Err(e) => format!("Cannot save {name}: {}", download::display_safe(&e.to_string(), 200)),
                 },
             }
         });
         if self.placeholder {
+            // the note page is all this tab has; leaving it later must not put its address in the history
             self.page = page;
             self.placeholder = false;
+            self.on_download_page = true;
             self.laid_out_width = -1.0;
             self.scroll = 0.0;
         }
         true
+    }
+
+    /// Mark a tab that was brought back from the closed-tabs list: whatever it loads first is
+    /// not something the user just asked for, so a file there is never saved.
+    pub fn mark_restored(&mut self) {
+        self.restored = true;
     }
 
     /// The message about the last download, once (the window shows it in the address bar).
@@ -1263,6 +1289,18 @@ mod tests {
                             _ => return,
                         }
                     }
+                    // read a POST body too: closing with unread data can reset the connection and lose the reply
+                    let head_end = seen.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                    let declared = String::from_utf8_lossy(&seen[..head_end])
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                        .unwrap_or(0);
+                    while seen.len() < head_end + declared {
+                        match sock.read(&mut buf) {
+                            Ok(k) if k > 0 => seen.extend_from_slice(&buf[..k]),
+                            _ => break,
+                        }
+                    }
                     let line = String::from_utf8_lossy(&seen).lines().next().unwrap_or("").to_string();
                     let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
                     let (ctype, status, body) = match routes.iter().find(|r| r.0 == path) {
@@ -1299,6 +1337,10 @@ mod tests {
             ("/missing.zip", "application/zip", 404, payload.clone()),
             ("/ping", "application/octet-stream", 204, vec![]),
             ("/slow.zip", "application/zip", 200, payload.clone()),
+            ("/partial.bin", "application/octet-stream", 206, payload.clone()),
+            ("/postdl", "application/octet-stream", 200, payload.clone()),
+            ("/f2.zip", "application/zip", 200, payload.clone()),
+            ("/other.html", "text/html", 200, b"<p>other</p>".to_vec()),
         ]);
         let url = |p: &str| Url::parse(&format!("http://127.0.0.1:{port}{p}")).unwrap();
         let (notify, rx) = queue();
@@ -1353,12 +1395,46 @@ mod tests {
             assert!(tab.take_notice().is_none(), "{path}");
         }
 
+        // a piece of a file (206) is not a whole file
+        tab.open(url("/partial.bin"));
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(files_in(&dir), ["f.zip"]);
+
+        // a form the user submits may download, even when it posts to its own address
+        tab.page = Page::from_source(&url("/postdl"), "<form method=post><input name=a value=1><input type=submit></form>");
+        tab.page.relayout(&crate::fonts::Fonts::load(), 400.0);
+        let submit = tab.page.layout.controls.last().unwrap().node;
+        tab.activate_control(submit).unwrap();
+        assert!(deliver(&mut tab, &rx));
+        let note = tab.take_notice();
+        assert_eq!(files_in(&dir), ["f.zip", "postdl"], "note: {note:?}, page: {} {:?}", tab.page.url, tab.page.title);
+        assert!(note.unwrap().starts_with("Saved postdl"));
+
+        // a note about one download is not shown with the next page
+        tab.open(url("/f2.zip"));
+        assert!(deliver(&mut tab, &rx));
+        tab.open(url("/other.html"));
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.take_notice(), None, "the old note is dropped when a new load starts");
+        assert_eq!(files_in(&dir), ["f.zip", "f2.zip", "postdl"]);
+
         // a tab that was opened straight onto a file shows the note page (and saves it)
         let (notify2, rx2) = queue();
         let mut fresh = Tab::new(2, url("/payload.bin"), None, notify2);
         assert!(deliver(&mut fresh, &rx2));
-        assert_eq!(files_in(&dir), ["f.zip", "payload.bin"]);
+        assert_eq!(files_in(&dir), ["f.zip", "f2.zip", "payload.bin", "postdl"]);
         assert!(fresh.page.title.starts_with("Download payload.bin"), "{}", fresh.page.title);
+        // ...and the note page doesn't become a Back entry once the tab moves on
+        fresh.open(url("/home.html"));
+        assert!(deliver(&mut fresh, &rx2));
+        assert!(!fresh.history.back.contains(&url("/payload.bin")), "{:?}", fresh.history.back);
+        // a tab brought back from the closed list saves nothing, so closing and reopening can't copy a file
+        let (notify3, rx3) = queue();
+        let mut reopened = Tab::new(3, url("/payload.bin"), None, notify3);
+        reopened.mark_restored();
+        assert!(deliver(&mut reopened, &rx3));
+        assert_eq!(files_in(&dir), ["f.zip", "f2.zip", "payload.bin", "postdl"], "no second copy");
+        assert!(reopened.take_notice().unwrap().starts_with("Not saved"));
         unsafe { std::env::remove_var("MYBROWSER_DOWNLOADS") };
         let _ = std::fs::remove_dir_all(&dir);
     }

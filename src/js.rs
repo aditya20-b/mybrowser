@@ -1445,10 +1445,41 @@ impl Interp {
         result
     }
 
+    /// Evaluate call arguments or array elements; `...list` contributes its items.
+    fn eval_list(&mut self, items: &[Expr], scope: &ScopeRef, this: &Value) -> Result<Vec<Value>, Ctrl> {
+        let mut values = Vec::with_capacity(items.len());
+        for item in items {
+            let Expr::Spread(inner) = item else {
+                values.push(self.eval(item, scope, this)?);
+                continue;
+            };
+            let list = self.eval(inner, scope, this)?;
+            let spread: Vec<Value> = match &list {
+                Value::Obj(o) => match &o.borrow().kind {
+                    Kind::Array(a) => a.clone(),
+                    _ => return self.throw("TypeError", "spread of something that isn't an array or string"),
+                },
+                Value::Str(s) => s.chars().map(|c| str_value(&c.to_string())).collect(),
+                _ => return self.throw("TypeError", "spread of something that isn't an array or string"),
+            };
+            self.charge(spread.len())?;
+            if values.len() + spread.len() > MAX_ARRAY {
+                return Err(Ctrl::Abort("array too big".into()));
+            }
+            values.extend(spread);
+        }
+        Ok(values)
+    }
+
     fn call_closure(&mut self, c: &Closure, this: &Value, args: &[Value]) -> Res {
         let scope = new_scope(Some(c.scope.clone()));
-        for (i, p) in c.func.params.iter().enumerate() {
+        let named = c.func.params.len() - usize::from(c.func.rest);
+        for (i, p) in c.func.params.iter().take(named).enumerate() {
             Interp::declare(&scope, p, args.get(i).cloned().unwrap_or(Value::Undefined), true);
+        }
+        if c.func.rest {
+            let rest = self.new_array(args.get(named..).unwrap_or(&[]).to_vec());
+            Interp::declare(&scope, &c.func.params[named], rest, true);
         }
         if !c.func.arrow && c.func.uses_arguments {
             let arguments = self.new_array(args.to_vec());
@@ -1519,12 +1550,10 @@ impl Interp {
                 Ok(str_value(&out))
             }
             Expr::Array(items) => {
-                let mut values = Vec::with_capacity(items.len());
-                for i in items {
-                    values.push(self.eval(i, scope, this)?);
-                }
+                let values = self.eval_list(items, scope, this)?;
                 Ok(self.new_array(values))
             }
+            Expr::Spread(_) => self.throw("SyntaxError", "unexpected '...'"),
             Expr::Object(props) => {
                 let obj = self.new_object();
                 for (key, value) in props {
@@ -1610,10 +1639,7 @@ impl Interp {
                     }
                     other => (self.eval(other, scope, this)?, Value::Undefined),
                 };
-                let mut values = Vec::with_capacity(args.len());
-                for a in args {
-                    values.push(self.eval(a, scope, this)?);
-                }
+                let values = self.eval_list(args, scope, this)?;
                 if !func.is_callable() {
                     return self.throw("TypeError", "is not a function");
                 }
@@ -1621,10 +1647,7 @@ impl Interp {
             }
             Expr::New(callee, args) => {
                 let ctor = self.eval(callee, scope, this)?;
-                let mut values = Vec::with_capacity(args.len());
-                for a in args {
-                    values.push(self.eval(a, scope, this)?);
-                }
+                let values = self.eval_list(args, scope, this)?;
                 self.construct(&ctor, &values)
             }
         }
@@ -3390,6 +3413,24 @@ mod tests {
             &["setTimeout(function () { console.log('timer') }, 0); Promise.resolve().then(function () { while (true) {} })"],
         );
         assert!(log.contains("ran for too long") && log.contains("timer"), "{log}");
+    }
+
+    #[test]
+    fn spread_and_rest() {
+        assert_eq!(
+            run("function sum() { var t = 0; for (var i = 0; i < arguments.length; i++) t += arguments[i]; return t }
+                 var a = [1, 2, 3], b = [...a, 4, ...[5, 6]];
+                 console.log(b.join(), sum(...a), sum(0, ...a, 10), Math.max(...b), [...'héy'].join('|'));
+                 function f(first, ...others) { return first + ':' + others.length + ':' + others.join('+') }
+                 console.log(f(1), f(1, 2, 3), f(...[7, 8, 9, 10]));
+                 var g = (...xs) => xs.map(function (x) { return x * 2 }).join(); console.log(g(1, 2, 3), g());
+                 var h = (p, ...q) => p + q.length; console.log(h(5, 6, 7));
+                 class P { constructor(...args) { this.n = args.length } } console.log(new P(...a, ...a).n);
+                 var copy = [...a]; copy.push(9); console.log(a.length, copy.length);"),
+            "1,2,3,4,5,6 6 16 6 h|é|y\n1:0: 1:2:2+3 7:3:8+9+10\n2,4,6 \n7\n6\n3 4"
+        );
+        assert!(run("try { [...5] } catch (e) { console.log('not iterable') }").contains("not iterable"));
+        assert!(run("var big = []; for (var i = 0; i < 1000; i++) big.push(i); var n = 0; try { for (;;) { big = [...big, ...big]; n++ } } catch (e) {} console.log('x')").starts_with("ERR"), "growth is bounded");
     }
 
     #[test]

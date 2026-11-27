@@ -434,6 +434,8 @@ pub struct Func {
     pub arrow: bool,
     /// The body mentions `arguments` (so a call has to build the arguments array).
     pub uses_arguments: bool,
+    /// The last parameter is `...rest`: it receives the arguments from there on, as an array.
+    pub rest: bool,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -476,6 +478,8 @@ pub enum Expr {
     /// `obj[expr]`
     Index(Box<Expr>, Box<Expr>),
     Seq(Vec<Expr>),
+    /// `...list` inside a call's arguments or an array literal.
+    Spread(Box<Expr>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -858,19 +862,29 @@ impl Parser {
     /// The parameters and body of a function, after its name.
     fn function_rest(&mut self, name: Option<String>) -> PResult<Func> {
         self.expect_punct("(")?;
-        let mut params = vec![];
-        while !self.is_punct(")") {
-            params.push(self.ident()?);
-            if !self.eat_punct(",") {
-                break;
-            }
-        }
-        self.expect_punct(")")?;
+        let (params, rest) = self.parameter_list()?;
         // (`arguments` seen in the body belongs to this function, not the one around it)
         let outer = std::mem::take(&mut self.arguments_seen);
         let body = self.block();
         let uses_arguments = std::mem::replace(&mut self.arguments_seen, outer);
-        Ok(Func { name, params, body: body?, arrow: false, uses_arguments })
+        Ok(Func { name, params, body: body?, arrow: false, uses_arguments, rest })
+    }
+
+    /// Parameter names up to and including `)`, the last of which may be `...rest`.
+    fn parameter_list(&mut self) -> PResult<(Vec<String>, bool)> {
+        let mut params = vec![];
+        let mut rest = false;
+        while !self.is_punct(")") {
+            if self.eat_punct("...") {
+                rest = true;
+            }
+            params.push(self.ident()?);
+            if rest || !self.eat_punct(",") {
+                break;
+            }
+        }
+        self.expect_punct(")")?;
+        Ok((params, rest))
     }
 
     // ---- expressions
@@ -915,18 +929,7 @@ impl Parser {
     }
 
     fn arrow(&mut self) -> PResult<Expr> {
-        let mut params = vec![];
-        if self.eat_punct("(") {
-            while !self.is_punct(")") {
-                params.push(self.ident()?);
-                if !self.eat_punct(",") {
-                    break;
-                }
-            }
-            self.expect_punct(")")?;
-        } else {
-            params.push(self.ident()?);
-        }
+        let (params, rest) = if self.eat_punct("(") { self.parameter_list()? } else { (vec![self.ident()?], false) };
         self.expect_punct("=>")?;
         // an arrow function has no `arguments` of its own: a mention is the enclosing function's
         // (it stays flagged on the parser, so the enclosing function sees it)
@@ -935,7 +938,7 @@ impl Parser {
         } else {
             vec![Stmt::Return(Some(self.assignment()?))]
         };
-        Ok(Expr::Function(Rc::new(Func { name: None, params, body, arrow: true, uses_arguments: false })))
+        Ok(Expr::Function(Rc::new(Func { name: None, params, body, arrow: true, uses_arguments: false, rest })))
     }
 
     pub fn assignment(&mut self) -> PResult<Expr> {
@@ -1101,13 +1104,21 @@ impl Parser {
         self.expect_punct("(")?;
         let mut args = vec![];
         while !self.is_punct(")") {
-            args.push(self.assignment()?);
+            args.push(self.argument()?);
             if !self.eat_punct(",") {
                 break;
             }
         }
         self.expect_punct(")")?;
         Ok(args)
+    }
+
+    /// One argument or array element: an expression, or `...list`.
+    fn argument(&mut self) -> PResult<Expr> {
+        if self.eat_punct("...") {
+            return Ok(Expr::Spread(Box::new(self.assignment()?)));
+        }
+        self.assignment()
     }
 
     /// `new Foo(args)`, `new a.b.C()`, `new Foo` (no arguments), `new new X()()`.
@@ -1229,8 +1240,9 @@ impl Parser {
                 body: vec![Stmt::Expr(Expr::Call(Box::new(dot(id("__super"), "apply")), vec![Expr::This, id("arguments")]))],
                 arrow: false,
                 uses_arguments: true,
+                rest: false,
             },
-            None => Func { name: Some(cname.clone()), params: vec![], body: vec![], arrow: false, uses_arguments: false },
+            None => Func { name: Some(cname.clone()), params: vec![], body: vec![], arrow: false, uses_arguments: false, rest: false },
         };
         body.push(Stmt::Function(Rc::new(ctor)));
         if parent.is_some() {
@@ -1242,7 +1254,7 @@ impl Parser {
         }
         body.extend(members);
         body.push(Stmt::Return(Some(id(&cname))));
-        let wrapper = Func { name: None, params: vec!["__super".to_string()], body, arrow: false, uses_arguments: false };
+        let wrapper = Func { name: None, params: vec!["__super".to_string()], body, arrow: false, uses_arguments: false, rest: false };
         Ok(Expr::Call(Box::new(Expr::Function(Rc::new(wrapper))), vec![parent.unwrap_or(Expr::Null)]))
     }
 
@@ -1338,7 +1350,7 @@ impl Parser {
                         items.push(Expr::Ident("undefined".into()));
                         continue;
                     }
-                    items.push(self.assignment()?);
+                    items.push(self.argument()?);
                     if !self.eat_punct(",") {
                         break;
                     }

@@ -2151,6 +2151,42 @@ fn error_constructor(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
         Some(Value::Undefined) | None => String::new(),
         Some(v) => i.to_string(v)?,
     };
+    // `this` already is an error object (made by `new`, or by a subclass's `super(message)`):
+    // fill it in rather than making another one the caller would throw away
+    if let Value::Obj(t) = this {
+        let mut cur = t.borrow().proto.clone();
+        let mut is_error = false;
+        while let Some(p) = cur {
+            if Rc::ptr_eq(&p, &i.error_proto) {
+                is_error = true;
+                break;
+            }
+            cur = p.borrow().proto.clone();
+        }
+        if is_error {
+            if matches!(t.borrow().kind, Kind::Plain) {
+                t.borrow_mut().kind = Kind::Error;
+            }
+            if !message.is_empty() || matches!(a.first(), Some(v) if !matches!(v, Value::Undefined)) {
+                Interp::set_prop(t, "message", str_value(&message));
+            }
+            // its name, from the nearest prototype that has one
+            let mut found = None;
+            let mut cur = t.borrow().proto.clone();
+            while let Some(p) = cur {
+                if let Some(Value::Str(n)) = p.borrow().props.get("name") {
+                    found = Some(n.to_string());
+                    break;
+                }
+                cur = p.borrow().proto.clone();
+            }
+            let has_name = t.borrow().props.contains_key("name");
+            if let (Some(n), false) = (found, has_name) {
+                Interp::set_prop(t, "name", str_value(&n));
+            }
+            return Ok(this.clone());
+        }
+    }
     let err = i.make_error("Error", &message);
     if let (Value::Obj(e), Value::Obj(t)) = (&err, this) {
         // take the name from the constructor's prototype link when called through `new`
@@ -3436,6 +3472,24 @@ mod tests {
                  var m = Object.entries({u: 1, w: 2}).map(([key, val]) => key + val); console.log(m.join());
                  try { var {boom} = null } catch (e) { console.log('null source throws') }"),
             "1 2 5 6\n10 30 40,50\nQ R0 R1 dflt\n6 24\nn2\n1,2,z 1,5,z 1,2,w\na1,b2\na1,b2,1none,2t\nu1,w2\nnull source throws"
+        );
+    }
+
+    #[test]
+    fn parser_findings_from_review() {
+        // super in a static method reaches the parent's static
+        assert_eq!(run("class A { static s() { return 'A' } } class B extends A { static s() { return super.s() + 'B' } m() { return 1 } } console.log(B.s())"), "AB");
+        // a classic for whose declaration is a pattern
+        assert_eq!(run("for (let [a, b] = [0, 10]; a < 3; a++) console.log(a, b)"), "0 10\n1 10\n2 10");
+        // a var loop's names outlive it; let's don't
+        assert_eq!(run("for (var [a, b] of [[1, 2], [3, 4]]) {} console.log(typeof a, a, b); for (let [c] of [[1]]) {} console.log(typeof c)"), "number 3 4\nundefined");
+        // subclasses of Error keep their message and still are errors
+        assert_eq!(
+            run("class E extends Error { constructor(m) { super(m); this.code = 7 } } var e = new E('hi');
+                 console.log(e.message, e instanceof E, e instanceof Error, e.code, String(e));
+                 try { throw new E('thrown') } catch (x) { console.log(x.message, x.code) }
+                 var plain = new Error('p'); console.log(plain.message, plain instanceof Error, new TypeError('t').name)"),
+            "hi true true 7 Error: hi\nthrown 7\np true TypeError"
         );
     }
 

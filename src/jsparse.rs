@@ -535,6 +535,8 @@ struct Parser {
     arguments_seen: bool,
     /// Hidden variables made for destructuring so far (their names must not repeat).
     temps: usize,
+    /// Parsing the body of a `static` method (where `super.x` is the parent class's own `x`).
+    static_method: bool,
 }
 
 type PResult<T> = Result<T, String>;
@@ -931,21 +933,26 @@ impl Parser {
         // `for (const [k, v] of pairs)`: the pattern is bound from a hidden variable at the top of each pass
         if let (Some(k), true) = (kind, self.pattern_ahead()) {
             let pat = self.pattern()?;
-            let of = match self.advance() {
-                Tok::Ident(w) if w == "of" => true,
-                Tok::Ident(w) if w == "in" => false,
-                other => {
-                    self.back(&other);
-                    return self.err("expected 'of' after the pattern");
-                }
+            let of = match self.peek() {
+                Tok::Ident(w) if w == "of" => Some(true),
+                Tok::Ident(w) if w == "in" => Some(false),
+                _ => None,
             };
+            let Some(of) = of else {
+                // `for (let [a, b] = [0, 1]; ...)`: an ordinary `for` with a pattern in its declaration
+                self.pos = save;
+                return self.classic_for();
+            };
+            self.advance();
             let obj = if of { self.assignment()? } else { self.expression()? };
             self.expect_punct(")")?;
             let tmp = self.temp_name();
             let mut decls = vec![];
             self.flatten_pattern(pat, Expr::Ident(tmp.clone()), &mut decls);
             let inner = self.statement()?;
-            let body = Box::new(Stmt::Block(vec![Stmt::Decl(DeclKind::Let, decls), inner]));
+            // (a `var` loop's names are function-wide; `let` and `const` get fresh ones each pass)
+            let per_pass = if k == DeclKind::Var { DeclKind::Var } else { DeclKind::Let };
+            let body = Box::new(Stmt::Block(vec![Stmt::Decl(per_pass, decls), inner]));
             return Ok(Stmt::ForIn { of, kind: Some(k), var: tmp, obj, body });
         }
         if let Tok::Ident(name) = self.peek().clone() {
@@ -959,6 +966,11 @@ impl Parser {
             }
         }
         self.pos = save;
+        self.classic_for()
+    }
+
+    /// `for (init; test; update) body`, after the `(`.
+    fn classic_for(&mut self) -> PResult<Stmt> {
         let init = if self.eat_punct(";") {
             ForInit::None
         } else if let Some(kind) = self.decl_kind() {
@@ -1212,7 +1224,7 @@ impl Parser {
     fn template_exprs(&mut self, sources: Vec<(String, u32)>) -> PResult<Vec<Expr>> {
         let mut exprs = vec![];
         for (src, line) in sources {
-            let mut inner = Parser { toks: tokenize_at(&src, line)?, pos: 0, depth: self.depth, chain: self.chain, arguments_seen: false, temps: 1000 + self.temps };
+            let mut inner = Parser { toks: tokenize_at(&src, line)?, pos: 0, depth: self.depth, chain: self.chain, arguments_seen: false, temps: 1000 + self.temps, static_method: self.static_method };
             let e = inner.expression()?;
             if *inner.peek() != Tok::Eof {
                 return inner.err("bad expression in template");
@@ -1414,7 +1426,10 @@ impl Parser {
             if !self.is_punct("(") {
                 return self.err(&format!("'{key}': accessors and class fields are not supported"));
             }
-            let func = self.function_rest(None)?;
+            let outer_static = std::mem::replace(&mut self.static_method, is_static);
+            let func = self.function_rest(None);
+            self.static_method = outer_static;
+            let func = func?;
             if key == "constructor" && !is_static {
                 constructor = Some(Func { name: Some(cname.clone()), ..func });
                 continue;
@@ -1467,7 +1482,8 @@ impl Parser {
         }
         if self.eat_punct(".") {
             let name = self.property_name()?;
-            let member = dot(dot(id("__super"), "prototype"), &name);
+            // (in a static method `super.x` is the parent class's own `x`, not its prototype's)
+            let member = if self.static_method { dot(id("__super"), &name) } else { dot(dot(id("__super"), "prototype"), &name) };
             if self.is_punct("(") {
                 let mut args = vec![Expr::This];
                 args.extend(self.arguments()?);
@@ -1622,7 +1638,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
 }
 
 fn parse_here(src: &str) -> Result<Vec<Stmt>, String> {
-    let mut p = Parser { toks: tokenize(src)?, pos: 0, depth: 0, chain: 0, arguments_seen: false, temps: 0 };
+    let mut p = Parser { toks: tokenize(src)?, pos: 0, depth: 0, chain: 0, arguments_seen: false, temps: 0, static_method: false };
     p.program()
 }
 
@@ -1631,7 +1647,7 @@ mod tests {
     use super::*;
 
     fn expr(src: &str) -> Expr {
-        let mut p = Parser { toks: tokenize(src).unwrap(), pos: 0, depth: 0, chain: 0, arguments_seen: false, temps: 0 };
+        let mut p = Parser { toks: tokenize(src).unwrap(), pos: 0, depth: 0, chain: 0, arguments_seen: false, temps: 0, static_method: false };
         let e = p.expression().unwrap_or_else(|e| panic!("{src}: {e}"));
         assert_eq!(*p.peek(), Tok::Eof, "{src}: leftover tokens");
         e

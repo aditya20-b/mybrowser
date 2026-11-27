@@ -49,18 +49,28 @@ pub fn is_text_like(kind: ControlKind) -> bool {
 }
 
 /// Is the control disabled, by its own attribute or by an enclosing
-/// `<fieldset disabled>`? (Controls inside that fieldset's `<legend>` are exempt.)
+/// `<fieldset disabled>`? Controls inside that fieldset's FIRST `<legend>` child
+/// are exempt; a second legend, or one nested deeper, is not special.
 pub fn is_disabled(dom: &Dom, id: NodeId) -> bool {
     if dom.attr(id, "disabled").is_some() {
         return true;
     }
-    let mut in_legend = false;
+    // the closest legend passed on the way up since the last fieldset
+    let mut legend: Option<NodeId> = None;
     let mut cur = dom.nodes[id].parent;
     while let Some(p) = cur {
         match dom.tag(p) {
-            Some("legend") => in_legend = true,
-            Some("fieldset") if dom.attr(p, "disabled").is_some() && !in_legend => return true,
-            Some("fieldset") => in_legend = false,
+            Some("legend") => legend = Some(p),
+            Some("fieldset") => {
+                if dom.attr(p, "disabled").is_some() {
+                    let first_legend = dom.nodes[p].children.iter().copied().find(|&c| dom.tag(c) == Some("legend"));
+                    let exempt = legend.is_some_and(|l| dom.nodes[l].parent == Some(p) && first_legend == Some(l));
+                    if !exempt {
+                        return true;
+                    }
+                }
+                legend = None;
+            }
             _ => {}
         }
         cur = dom.nodes[p].parent;
@@ -302,6 +312,8 @@ impl FormState {
     /// resolved against `base`, or the form is `method=dialog` (which only closes a dialog).
     pub fn submit(&self, dom: &Dom, form: NodeId, submitter: Option<NodeId>, base: &Url) -> Option<Submission> {
         let mut pairs: Vec<(String, String)> = vec![];
+        // a radio group submits one value: if markup left several checked, the last one wins
+        let mut radio_slot: HashMap<String, usize> = HashMap::new();
         for id in controls_in(dom, form) {
             if is_disabled(dom, id) {
                 continue;
@@ -316,9 +328,21 @@ impl FormState {
                     let value = self.value(dom, id).replace("\r\n", "\n").replace('\n', "\r\n");
                     pairs.push((name.to_string(), value));
                 }
-                ControlKind::Checkbox | ControlKind::Radio => {
+                ControlKind::Checkbox => {
                     if self.is_checked(dom, id) {
                         pairs.push((name.to_string(), dom.attr(id, "value").unwrap_or("on").to_string()));
+                    }
+                }
+                ControlKind::Radio => {
+                    if self.is_checked(dom, id) {
+                        let pair = (name.to_string(), dom.attr(id, "value").unwrap_or("on").to_string());
+                        match radio_slot.get(name) {
+                            Some(&slot) => pairs[slot] = pair,
+                            None => {
+                                radio_slot.insert(name.to_string(), pairs.len());
+                                pairs.push(pair);
+                            }
+                        }
                     }
                 }
                 ControlKind::Select => pairs.push((name.to_string(), self.value(dom, id))),
@@ -471,6 +495,37 @@ mod tests {
         let mut st = FormState::default();
         st.type_text(&dom, by_name(&dom, "a"), "zzz");
         assert_eq!(st.value(&dom, by_name(&dom, "a")), "1");
+    }
+
+    #[test]
+    fn only_the_first_legend_of_a_disabled_fieldset_is_exempt() {
+        let dom = html::parse(
+            "<fieldset disabled><legend><input name=first></legend><legend><input name=second></legend>\
+             <div><legend><input name=nested></legend></div></fieldset>\
+             <fieldset disabled><legend>t</legend><fieldset><input name=inner></fieldset></fieldset>",
+        );
+        assert!(!is_disabled(&dom, by_name(&dom, "first")));
+        assert!(is_disabled(&dom, by_name(&dom, "second")), "a second legend gives no exemption");
+        assert!(is_disabled(&dom, by_name(&dom, "nested")), "neither does one that isn't a direct child");
+        assert!(is_disabled(&dom, by_name(&dom, "inner")), "a fieldset inside a disabled one stays disabled");
+        // a legend of an INNER disabled fieldset doesn't free a control from the OUTER one
+        let dom = html::parse("<fieldset disabled><div><fieldset disabled><legend><input name=x></legend></fieldset></div></fieldset>");
+        assert!(is_disabled(&dom, by_name(&dom, "x")));
+    }
+
+    #[test]
+    fn several_checked_radios_in_markup_submit_only_the_last() {
+        let dom = html::parse(
+            "<form action=/s><input type=radio name=r value=1 checked><input type=radio name=r value=2 checked>\
+             <input name=mid value=m><input type=radio name=r value=3 checked><input type=radio name=other value=a checked></form>",
+        );
+        let sub = FormState::default().submit(&dom, find(&dom, "form", 0), None, &base()).unwrap();
+        assert_eq!(sub.url.query(), Some("r=3&mid=m&other=a"), "one value per group, in the place of the first");
+        // clicking a radio decides it, as before
+        let radios: Vec<_> = (0..dom.nodes.len()).filter(|&i| kind_of(&dom, i) == Some(ControlKind::Radio)).collect();
+        let mut st = FormState::default();
+        st.toggle(&dom, radios[0]);
+        assert_eq!(st.submit(&dom, find(&dom, "form", 0), None, &base()).unwrap().url.query(), Some("r=1&mid=m&other=a"));
     }
 
     #[test]

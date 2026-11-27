@@ -629,10 +629,27 @@ impl<'a> Ctx<'a> {
         for (li, line) in lines.iter().enumerate() {
             let members: Vec<&FlexItem> = line.iter().map(|&i| &items[i]).collect();
             let sizes = flex_line_sizes(&members, width, gap_c, s.justify);
-            let mut cx = x + sizes.offset;
+            // `margin-left: auto` / `margin-right: auto` on items soak up the leftover space
+            // (the "push this one to the far end" idiom) before justify-content sees any of it
+            let auto_sides = |it: &FlexItem| -> (bool, bool) {
+                if it.inline.is_some() {
+                    return (false, false);
+                }
+                let m = &styles[it.id].margin;
+                (m[3] == Length::Auto, m[1] == Length::Auto)
+            };
+            let auto_count: usize = members.iter().map(|it| { let (l, r) = auto_sides(it); l as usize + r as usize }).sum();
+            let leftover = (width - sizes.widths.iter().sum::<f32>() - gap_c * members.len().saturating_sub(1) as f32).max(0.0);
+            let auto_unit = if auto_count > 0 && leftover > 0.0 { leftover / auto_count as f32 } else { 0.0 };
+            let (offset, extra_gap) = if auto_unit > 0.0 { (0.0, 0.0) } else { (sizes.offset, sizes.extra_gap) };
+            let mut cx = x + offset;
             let mut placed: Vec<([(usize, usize); 4], f32)> = vec![];
             let mut line_h = 0.0f32;
             for (it, &w) in members.iter().zip(&sizes.widths) {
+                let (auto_l, auto_r) = auto_sides(it);
+                if auto_l {
+                    cx += auto_unit;
+                }
                 let before = (self.items.len(), self.links.len(), self.controls.len(), self.blocks.len());
                 let h = if let Some(v) = &it.inline {
                     self.layout_inline(v, cx, cy, w, Align::Left, id)
@@ -646,7 +663,10 @@ impl<'a> Ctx<'a> {
                 let after = (self.items.len(), self.links.len(), self.controls.len(), self.blocks.len());
                 placed.push(([(before.0, after.0), (before.1, after.1), (before.2, after.2), (before.3, after.3)], h));
                 line_h = line_h.max(h);
-                cx += w + gap_c + sizes.extra_gap;
+                cx += w + gap_c + extra_gap;
+                if auto_r {
+                    cx += auto_unit;
+                }
             }
             // across the line: items that are shorter than it sit at the top, middle or bottom
             for (ranges, h) in &placed {
@@ -2278,6 +2298,28 @@ mod tests {
         // deep nesting of flex containers
         let deep = format!("{}core{}", "<div style='display:flex'><div>".repeat(60), "</div></div>".repeat(60));
         assert!(texts(&render(&deep)).iter().any(|(t, _)| t == "core"));
+    }
+
+    #[test]
+    fn auto_margins_on_flex_items_take_the_leftover_space() {
+        let wb = Fonts::load().measure(ctl_face(), 16.0, "b");
+        // the push-to-the-end idiom
+        let p = flex("", "<div>a</div><div style='margin-left:auto'>b</div>");
+        assert!((at(&p, "b").0 - (300.0 - wb)).abs() < 1.0, "{:?}", at(&p, "b"));
+        assert!(at(&p, "a").0.abs() < 0.5);
+        // both sides auto centres the item; auto on two items splits the space
+        let c = flex("", "<div style='margin:0 auto'>b</div>");
+        assert!((at(&c, "b").0 - (300.0 - wb) / 2.0).abs() < 1.0, "{:?}", at(&c, "b"));
+        let s = flex("", "<div>a</div><div style='margin-left:auto;margin-right:auto'>b</div><div>c</div>");
+        assert!(at(&s, "b").0 > 100.0 && at(&s, "b").0 < 200.0, "{:?}", at(&s, "b"));
+        // auto margins beat justify-content, and growing items leave nothing for them
+        let j = flex("justify-content:center", "<div>a</div><div style='margin-left:auto'>b</div>");
+        assert!((at(&j, "b").0 - (300.0 - wb)).abs() < 1.0);
+        let g = flex("", "<div style='flex:1'>a</div><div style='margin-left:auto'>b</div>");
+        assert!(at(&g, "b").0 > 280.0 - wb);
+        // no room: the margin is just zero
+        let n = flex("", "<div style='width:400px'>a</div><div style='margin-left:auto'>b</div>");
+        assert!(at(&n, "b").0 >= 400.0 - 0.5);
     }
 
     #[test]

@@ -543,6 +543,11 @@ impl Page {
         Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false, no_store: false, scripts, console, rules }
     }
 
+    /// The `<body>` element, if the document has one.
+    pub fn body_node(&self) -> Option<NodeId> {
+        (0..self.dom.nodes.len()).find(|&n| self.dom.tag(n) == Some("body"))
+    }
+
     /// Send `event` (say "click") to the page's scripts, starting at `node`. Returns whether a
     /// handler called `preventDefault()`. If the page has scripts, the styles are recomputed
     /// afterwards (a handler may have changed classes or added elements), so the caller must lay

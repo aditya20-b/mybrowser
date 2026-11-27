@@ -71,6 +71,20 @@ fn css_name(js: &str) -> Option<String> {
     if js == "cssFloat" {
         return Some("float".into());
     }
+    // custom properties keep their name exactly (`--my-var`); a name already written with
+    // dashes (`font-size`, as `setProperty` takes it) is only lower-cased
+    if let Some(rest) = js.strip_prefix("--") {
+        return (!rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')).then(|| js.to_string());
+    }
+    if js.contains('-') {
+        return js.chars().all(|c| c.is_ascii_alphanumeric() || c == '-').then(|| js.to_ascii_lowercase());
+    }
+    // `webkitTransition` is `-webkit-transition`, as `WebkitTransition` is
+    for prefix in ["webkit", "moz", "ms"] {
+        if js.starts_with(prefix) && js[prefix.len()..].starts_with(|c: char| c.is_ascii_uppercase()) {
+            return css_name(&format!("{}{}", js[..1].to_ascii_uppercase(), &js[1..]));
+        }
+    }
     let mut out = String::new();
     for c in js.chars() {
         if c.is_ascii_uppercase() {
@@ -85,27 +99,28 @@ fn css_name(js: &str) -> Option<String> {
     Some(out)
 }
 
-fn camel_name(css: &str) -> String {
-    let mut out = String::new();
-    let mut up = false;
-    for c in css.chars() {
-        if c == '-' {
-            up = true;
-        } else if up {
-            out.push(c.to_ascii_uppercase());
-            up = false;
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 /// The `style` attribute as (property, value) pairs.
 fn style_decls(dom: &Dom, id: NodeId) -> Vec<(String, String)> {
-    dom.attr(id, "style")
-        .unwrap_or("")
-        .split(';')
+    // split at the `;`s that end declarations: not those inside quotes or parentheses (`url("a;b")`)
+    let text = dom.attr(id, "style").unwrap_or("");
+    let (mut parts, mut start, mut depth, mut quote) = (vec![], 0, 0i32, None::<char>);
+    for (at, c) in text.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') => depth = (depth - 1).max(0),
+            (None, ';') if depth == 0 => {
+                parts.push(&text[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+        .into_iter()
         .filter_map(|d| {
             let (k, v) = d.split_once(':')?;
             let (k, v) = (k.trim().to_ascii_lowercase(), v.trim().to_string());
@@ -124,7 +139,7 @@ fn store_style(i: &mut Interp, id: NodeId, decls: Vec<(String, String)>) {
 /// Set (or, with an empty value, remove) one property. A value that would smuggle in another
 /// declaration or rule is ignored, as a browser ignores an invalid value.
 fn set_style_property(i: &mut Interp, id: NodeId, css: &str, value: &str) {
-    if value.contains([';', '{', '}']) || value.len() > 4096 {
+    if value.contains([';', '{', '}']) || value.contains("/*") || value.len() > 4096 {
         return;
     }
     let Some(d) = i.dom.as_ref() else { return };
@@ -157,7 +172,15 @@ pub(super) fn style_get(i: &mut Interp, id: NodeId, name: &str) -> Res {
     }
     let Some(dom) = dom_ref(i).filter(|d| id < d.nodes.len()) else { return Ok(Value::Undefined) };
     if name == "cssText" {
-        return Ok(str_value(dom.attr(id, "style").unwrap_or("")));
+        // (written out as a browser does, ending in `;`, so `cssText += 'color: red'` adds a declaration)
+        let text: String = style_decls(dom, id).iter().map(|(k, v)| format!("{k}: {v}; ")).collect();
+        return Ok(str_value(text.trim_end()));
+    }
+    if name == "getPropertyPriority" {
+        return Ok(i.method(style_priority, name));
+    }
+    if name == "length" {
+        return Ok(Value::Num(style_decls(dom, id).len() as f64));
     }
     let Some(css) = css_name(name) else { return Ok(Value::Undefined) };
     let found = style_decls(dom, id).into_iter().rev().find(|(k, _)| *k == css).map(|(_, v)| v);
@@ -168,7 +191,8 @@ pub(super) fn style_set(i: &mut Interp, id: NodeId, name: &str, value: Value) ->
     if i.dom.as_ref().is_none_or(|d| id >= d.nodes.len()) {
         return Ok(());
     }
-    let text = i.to_string(&value)?;
+    // (`null` clears a property, as it does in a browser)
+    let text = if matches!(value, Value::Null) { String::new() } else { i.to_string(&value)? };
     if name == "cssText" {
         if text.len() > 8192 {
             return Ok(());
@@ -184,10 +208,18 @@ pub(super) fn style_set(i: &mut Interp, id: NodeId, name: &str, value: Value) ->
     Ok(())
 }
 
+fn style_priority(_: &mut Interp, _: &Value, _: &[Value]) -> Res {
+    Ok(str_value("")) // (priorities aren't kept)
+}
+
 fn style_set_property(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
     let id = this_style(i, this)?;
-    let (name, value) = (i.arg_string(a, 0)?, i.arg_string(a, 1)?);
-    if let Some(css) = css_name(&camel_name(&name)) {
+    if a.len() < 2 {
+        return i.throw("TypeError", "setProperty needs a name and a value");
+    }
+    let name = i.arg_string(a, 0)?;
+    let value = if matches!(a[1], Value::Null) { String::new() } else { i.arg_string(a, 1)? };
+    if let Some(css) = css_name(&name) {
         set_style_property(i, id, &css, &value);
     }
     Ok(Value::Undefined)
@@ -195,16 +227,16 @@ fn style_set_property(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
 
 fn style_get_property_value(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
     let id = this_style(i, this)?;
-    let name = i.arg_string(a, 0)?.to_ascii_lowercase();
+    let name = css_name(&i.arg_string(a, 0)?).unwrap_or_default();
     let found = dom_ref(i).filter(|d| id < d.nodes.len()).and_then(|d| style_decls(d, id).into_iter().rev().find(|(k, _)| *k == name));
     Ok(str_value(&found.map(|(_, v)| v).unwrap_or_default()))
 }
 
 fn style_remove_property(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
     let id = this_style(i, this)?;
-    let name = i.arg_string(a, 0)?.to_ascii_lowercase();
+    let name = i.arg_string(a, 0)?;
     let old = style_get_property_value(i, this, a)?;
-    if let Some(css) = css_name(&camel_name(&name)) {
+    if let Some(css) = css_name(&name) {
         set_style_property(i, id, &css, "");
     }
     Ok(old)
@@ -273,6 +305,16 @@ fn detach(dom: &mut Dom, id: NodeId) {
 }
 
 /// Is `maybe_ancestor` the node itself or one of its ancestors?
+/// For every node: is it `root` or somewhere under it? One pass, because a parent always comes
+/// before its children in the arena (asking `is_inside` for each node costs depth each).
+fn under(dom: &Dom, root: NodeId) -> Vec<bool> {
+    let mut inside = vec![false; dom.nodes.len()];
+    for n in 0..dom.nodes.len() {
+        inside[n] = n == root || dom.nodes[n].parent.is_some_and(|p| p < n && inside[p]);
+    }
+    inside
+}
+
 fn is_inside(dom: &Dom, mut node: NodeId, maybe_ancestor: NodeId) -> bool {
     let mut hops = 0;
     loop {
@@ -511,13 +553,13 @@ fn query(i: &mut Interp, root: NodeId, selector: &str, first_only: bool) -> Resu
     i.charge(count)?;
     let Some(dom) = dom_ref(i) else { return Ok(vec![]) };
     let mut found = vec![];
+    // the document's own queries only see what is attached to it; an element's, what is under it
+    let scope = under(dom, if root == DOCUMENT { 0 } else { root });
     for id in 0..dom.nodes.len() {
         if id == root || !matches!(dom.nodes[id].kind, DKind::Element { .. }) {
             continue;
         }
-        // the document's own queries only see what is attached to it; an element's, what is under it
-        let in_scope = if root == DOCUMENT { is_inside(dom, id, 0) } else { is_inside(dom, id, root) };
-        if !in_scope {
+        if !scope[id] {
             continue;
         }
         if selectors.iter().any(|s| css::selector_matches(dom, id, s)) {
@@ -1053,6 +1095,7 @@ impl Interp {
     /// schedule, until none are left or a limit is reached. Intervals fire a few times, then stop.
     pub fn run_timers(&mut self) {
         let mut runs = 0;
+        let mut all_timers_spent: u64 = 0;
         while runs < MAX_TIMER_RUNS {
             let Some(next) = (0..self.timers.len()).min_by(|&x, &y| {
                 let (a, b) = (&self.timers[x], &self.timers[y]);
@@ -1079,6 +1122,13 @@ impl Interp {
                 }
             }
             let result = self.call(&timer.func, &Value::Undefined, &timer.args);
+            // ...but all the callbacks of one run together have a budget too, or the window would
+            // freeze while a chain of timers each used nearly all of theirs
+            all_timers_spent += self.steps.saturating_sub(MAX_STEPS - TIMER_STEPS);
+            if all_timers_spent > ALL_TIMER_STEPS {
+                self.log_line("timers ran for too long and were stopped".into());
+                break;
+            }
             match result {
                 Ok(_) => {}
                 Err(Ctrl::Throw(e)) => {
@@ -1347,7 +1397,10 @@ fn xhr_schedule(i: &mut Interp, this: &Value, event: &str) {
 
 fn doc_get_by_id(i: &mut Interp, _: &Value, a: &[Value]) -> Res {
     let wanted = i.arg_string(a, 0)?;
-    let found = dom_ref(i).and_then(|d| (0..d.nodes.len()).find(|&n| is_inside(d, n, 0) && d.attr(n, "id") == Some(wanted.as_str())));
+    let found = dom_ref(i).and_then(|d| {
+        let attached = under(d, 0);
+        (0..d.nodes.len()).find(|&n| attached[n] && d.attr(n, "id") == Some(wanted.as_str()))
+    });
     i.charge(dom_ref(i).map_or(0, |d| d.nodes.len()))?;
     Ok(wrap_opt(i, found))
 }

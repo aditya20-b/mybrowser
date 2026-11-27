@@ -21,6 +21,8 @@ use dom_bindings::{Listener, Timer};
 /// Steps one event, and one timer callback, may take (a page has many of them).
 const EVENT_STEPS: u64 = 5_000_000;
 const TIMER_STEPS: u64 = 2_000_000;
+/// Steps all the timer callbacks run after one event or load may take together.
+const ALL_TIMER_STEPS: u64 = 8_000_000;
 
 /// Evaluation steps a script may take in total.
 const MAX_STEPS: u64 = 20_000_000;
@@ -411,7 +413,12 @@ impl ScriptHost {
                 // (memory is counted per thread, and this is a new one: the page's whole allowance
                 // is what it hasn't already kept, so many events can't add up to more than one script)
                 let start = crate::memcount::live_bytes();
-                interp.mem_limit = start + (MAX_SCRIPT_MEMORY - interp.retained).max(16 * 1024 * 1024);
+                if interp.retained >= MAX_SCRIPT_MEMORY {
+                    // the page has used all it may keep: its handlers no longer run
+                    interp.log_line("script used too much memory and was stopped".into());
+                    return false;
+                }
+                interp.mem_limit = start + (MAX_SCRIPT_MEMORY - interp.retained);
                 let prevented = match interp.dispatch(node, &event) {
                     Ok(p) => p,
                     Err(Ctrl::Abort(m)) => {
@@ -3289,6 +3296,42 @@ mod tests {
     }
 
     #[test]
+    fn element_style_details_from_review() {
+        let (log, _) = page(
+            "<body><p id=a style='background: url(\"a;b.png\"); color: red'>x</p></body>",
+            &["var s = document.getElementById('a').style;
+               console.log(s.background, s.color);
+               s.setProperty('--my-var', '5px'); console.log(s.getPropertyValue('--my-var'), s.getPropertyValue('FONT-SIZE') === '');
+               s.webkitTransition = 'none'; console.log(s.cssText);
+               s.cssText += 'top: 1px'; console.log(s.top, s.color);
+               s.color = null; console.log(s.color === '', s.length);
+               s.width = '1px /*'; console.log(s.width === '');
+               try { s.setProperty('color') } catch (e) { console.log('needs two') }
+               console.log(s.getPropertyPriority('color') === '')"],
+        );
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines[0], "url(\"a;b.png\") red", "{log}");
+        assert_eq!(lines[1], "5px true", "{log}");
+        assert_eq!(lines[2], "background: url(\"a;b.png\"); color: red; --my-var: 5px; -webkit-transition: none;", "{log}");
+        assert_eq!(lines[3], "1px red", "{log}");
+        assert_eq!(lines[4], "true 4", "{log}");
+        assert_eq!(lines[5], "true");
+        assert_eq!(lines[6], "needs two");
+        assert_eq!(lines[7], "true");
+    }
+
+    #[test]
+    fn lookups_stay_fast_in_deep_trees() {
+        // 300 chains of 500 divs: the old lookup walked every node's ancestors, once per call
+        let (log, _) = page(
+            "<body></body>",
+            &["for (var c = 0; c < 120; c++) { var d = document.body; for (var k = 0; k < 400; k++) { var e = document.createElement('div'); d.appendChild(e); d = e } }
+               var t = 0; for (var q = 0; q < 40; q++) { if (document.getElementById('nope') === null) t++ } console.log(t)"],
+        );
+        assert!(log == "40" || log.contains("too long"), "{log}");
+    }
+
+    #[test]
     fn window_and_document_event_properties_fire() {
         let (log, _) = page(
             "<body><p id=a>x</p></body>",
@@ -3311,7 +3354,7 @@ mod tests {
         );
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines[0], "red true", "{log}");
-        assert_eq!(lines[1], "20px margin: 0; font-size: 20px; background-color: blue; margin-top: 3px", "{log}");
+        assert_eq!(lines[1], "20px margin: 0; font-size: 20px; background-color: blue; margin-top: 3px;", "{log}");
         assert_eq!(lines[2], "true", "an invalid value that would add a declaration is ignored");
         assert_eq!(lines[3], "0 font-size: 20px; background-color: blue; margin-top: 3px", "{log}");
         assert_eq!(lines[4], "1px true", "{log}");

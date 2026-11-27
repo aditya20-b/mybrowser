@@ -857,7 +857,9 @@ impl App {
                     tab.form_changed();
                 }
                 self.update_hover(); // hit-test at release time rather than trusting a stale hover
-                let clicked = self.tab().link_node_at(px, py);
+                // (a click on anything else is still a click on the page: it starts at `<body>`, so handlers
+                // on the body and the document hear it; which element was under the cursor isn't tracked)
+                let clicked = self.tab().link_node_at(px, py).or_else(|| self.tab().page.body_node());
                 // a script's click handler runs first; `preventDefault()` keeps the link from being followed
                 let prevented = clicked.is_some_and(|n| self.tab_mut().script_click(n));
                 if let (Some(href), false) = (self.hover.clone(), prevented) {

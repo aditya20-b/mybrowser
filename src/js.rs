@@ -18,6 +18,10 @@ use std::rc::Rc;
 mod dom_bindings;
 use dom_bindings::{Listener, Timer};
 
+/// Steps one event, and one timer callback, may take (a page has many of them).
+const EVENT_STEPS: u64 = 5_000_000;
+const TIMER_STEPS: u64 = 2_000_000;
+
 /// Evaluation steps a script may take in total.
 const MAX_STEPS: u64 = 20_000_000;
 /// Nested JavaScript calls.
@@ -28,9 +32,8 @@ const MAX_ARRAY: usize = 1_000_000;
 /// Nested evaluations (expressions inside expressions inside calls...) at once: the Rust stack
 /// use of the interpreter is proportional to this, not to what the parser allowed.
 const MAX_NEST: usize = 3000;
-/// Objects (including arrays and functions) a script may create, and the bytes it may ask for.
-const MAX_OBJECTS: usize = 250_000;
-const MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// How much the process's heap may grow, from when an interpreter was made, before its script is stopped.
+const MAX_SCRIPT_MEMORY: isize = 640 * 1024 * 1024;
 
 pub type ObjRef = Rc<RefCell<Object>>;
 type ScopeRef = Rc<RefCell<Scope>>;
@@ -104,6 +107,158 @@ struct Scope {
     parent: Option<ScopeRef>,
 }
 
+// ---- dropping without recursion
+//
+// Values form chains (an array in an array in an array...; scopes whose parent is a scope). The
+// usual recursive drop would use a Rust stack frame per link, so a script could overflow the stack
+// just by being freed. Instead, what an object or scope owns is queued, and a loop on the outermost
+// drop frees the queue one item at a time.
+
+enum Dead {
+    Value(Value),
+    Scope(ScopeRef),
+    Obj(ObjRef),
+    Closure(Rc<Closure>),
+}
+
+thread_local! {
+    static DEAD: RefCell<Vec<Dead>> = const { RefCell::new(Vec::new()) };
+    static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn bury(items: Vec<Dead>) {
+    if items.is_empty() {
+        return;
+    }
+    let queued = DEAD.try_with(|d| d.borrow_mut().extend(items)).is_ok();
+    if !queued {
+        return; // (the thread is shutting down: let the rest drop as it falls)
+    }
+    // an outer drop is already emptying the queue: it will get to these
+    if DRAINING.try_with(|f| f.replace(true)).unwrap_or(true) {
+        return;
+    }
+    while let Some(next) = DEAD.try_with(|d| d.borrow_mut().pop()).ok().flatten() {
+        drop(next);
+    }
+    let _ = DRAINING.try_with(|f| f.set(false));
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        let mut dead: Vec<Dead> = self.vars.drain().map(|(_, b)| Dead::Value(b.value)).collect();
+        if let Some(p) = self.parent.take() {
+            dead.push(Dead::Scope(p));
+        }
+        bury(dead);
+    }
+}
+
+impl Drop for Object {
+    fn drop(&mut self) {
+        let mut dead: Vec<Dead> = self.props.drain().map(|(_, v)| Dead::Value(v)).collect();
+        match std::mem::replace(&mut self.kind, Kind::Plain) {
+            Kind::Array(items) => dead.extend(items.into_iter().map(Dead::Value)),
+            Kind::Closure(c) => dead.push(Dead::Closure(c)),
+            Kind::Bound(b) => {
+                let (f, t, args) = *b;
+                dead.push(Dead::Value(f));
+                dead.push(Dead::Value(t));
+                dead.extend(args.into_iter().map(Dead::Value));
+            }
+            _ => {}
+        }
+        if let Some(p) = self.proto.take() {
+            dead.push(Dead::Obj(p));
+        }
+        bury(dead);
+    }
+}
+
+impl Drop for Interp {
+    /// Reference cycles (a function and the scope it was made in) would keep everything a script
+    /// made alive for ever, so before the interpreter goes, everything reachable from it is emptied.
+    fn drop(&mut self) {
+        let mut scopes: Vec<ScopeRef> = vec![];
+        let mut objs: Vec<ObjRef> = vec![];
+        let mut seen_scopes: std::collections::HashSet<*const RefCell<Scope>> = std::collections::HashSet::new();
+        let mut seen_objs: std::collections::HashSet<*const RefCell<Object>> = std::collections::HashSet::new();
+        enum Visit {
+            Scope(ScopeRef),
+            Value(Value),
+            Obj(ObjRef),
+        }
+        let mut work: Vec<Visit> = vec![Visit::Scope(self.global.clone()), Visit::Value(self.document.clone())];
+        work.push(Visit::Obj(self.object_proto.clone()));
+        work.push(Visit::Obj(self.error_proto.clone()));
+        work.push(Visit::Obj(self.array_proto.clone()));
+        work.push(Visit::Value(self.object_ctor.clone()));
+        work.push(Visit::Value(self.array_ctor.clone()));
+        work.extend(self.wrappers.values().cloned().map(Visit::Obj));
+        work.extend(self.listeners.iter().map(|l| Visit::Value(l.handler.clone())));
+        work.extend(self.timers.iter().flat_map(|t| t.roots()).map(Visit::Value));
+        while let Some(v) = work.pop() {
+            match v {
+                Visit::Scope(s) => {
+                    if !seen_scopes.insert(Rc::as_ptr(&s)) {
+                        continue;
+                    }
+                    for b in s.borrow().vars.values() {
+                        work.push(Visit::Value(b.value.clone()));
+                    }
+                    if let Some(p) = s.borrow().parent.clone() {
+                        work.push(Visit::Scope(p));
+                    }
+                    scopes.push(s);
+                }
+                Visit::Value(Value::Obj(o)) | Visit::Obj(o) => {
+                    if !seen_objs.insert(Rc::as_ptr(&o)) {
+                        continue;
+                    }
+                    {
+                        let b = o.borrow();
+                        work.extend(b.props.values().cloned().map(Visit::Value));
+                        if let Some(p) = &b.proto {
+                            work.push(Visit::Obj(p.clone()));
+                        }
+                        match &b.kind {
+                            Kind::Array(a) => work.extend(a.iter().cloned().map(Visit::Value)),
+                            Kind::Closure(c) => {
+                                work.push(Visit::Scope(c.scope.clone()));
+                                if let Some(t) = &c.this {
+                                    work.push(Visit::Value(t.clone()));
+                                }
+                            }
+                            Kind::Bound(bd) => {
+                                work.push(Visit::Value(bd.0.clone()));
+                                work.push(Visit::Value(bd.1.clone()));
+                                work.extend(bd.2.iter().cloned().map(Visit::Value));
+                            }
+                            _ => {}
+                        }
+                    }
+                    objs.push(o);
+                }
+                Visit::Value(_) => {}
+            }
+        }
+        for s in &scopes {
+            let vars: Vec<Binding> = s.borrow_mut().vars.drain().map(|(_, b)| b).collect();
+            drop(vars);
+        }
+        for o in &objs {
+            let (props, kind) = {
+                let mut b = o.borrow_mut();
+                (std::mem::take(&mut b.props), std::mem::replace(&mut b.kind, Kind::Plain))
+            };
+            drop((props, kind));
+        }
+        self.wrappers.clear();
+        self.listeners.clear();
+        self.timers.clear();
+    }
+}
+
 fn new_scope(parent: Option<ScopeRef>) -> ScopeRef {
     Rc::new(RefCell::new(Scope { vars: HashMap::new(), parent }))
 }
@@ -126,8 +281,10 @@ pub struct Interp {
     nest: usize,
     /// Objects made so far (bounds nesting depth, and so the recursion when they are dropped).
     objects: usize,
-    /// A rough count of the bytes of memory the script has asked for (strings and arrays).
+    /// (no longer limits anything: see `mem_limit`; kept as plain statistics)
     bytes: u64,
+    /// The heap size, process-wide, above which the script is stopped.
+    mem_limit: isize,
     /// Arrays being joined right now (a cycle joins as an empty string).
     joining: Vec<ObjRef>,
     /// What the script wrote with `console.log` and friends.
@@ -140,6 +297,8 @@ pub struct Interp {
     page_url: String,
     document: Value,
     wrappers: HashMap<usize, ObjRef>,
+    /// Built-in methods already handed out (see `method`).
+    methods: HashMap<usize, Value>,
     listeners: Vec<Listener>,
     timers: Vec<Timer>,
     timer_seq: u64,
@@ -158,9 +317,29 @@ struct Unsend<T>(T);
 unsafe impl<T> Send for Unsend<T> {}
 
 /// The scripts of a page, kept alive after loading so events can reach their handlers.
-pub struct ScriptHost(Unsend<Interp>);
+pub struct ScriptHost(Option<Unsend<Interp>>);
 // SAFETY: as `Unsend`: the interpreter inside is only touched by one thread at a time.
 unsafe impl Send for ScriptHost {}
+
+impl ScriptHost {
+    fn interp(&mut self) -> &mut Interp {
+        &mut self.0.as_mut().expect("the interpreter is only taken when the host is dropped").0
+    }
+}
+
+impl Drop for ScriptHost {
+    /// Emptying a big script's world takes a while and some stack: do it on its own thread.
+    fn drop(&mut self) {
+        if let Some(interp) = self.0.take() {
+            let moved = Unsend(interp);
+            // (if the thread can't start, the interpreter is dropped right here instead)
+            let _ = std::thread::Builder::new().stack_size(SCRIPT_STACK).spawn(move || {
+                let moved = moved;
+                drop(moved.0);
+            });
+        }
+    }
+}
 
 /// The stack scripts run on: they recurse as deep as they nest, up to the interpreter's limits.
 const SCRIPT_STACK: usize = 256 * 1024 * 1024;
@@ -186,6 +365,7 @@ pub fn run_page_scripts(dom: Dom, url: &str, scripts: Vec<(String, String)>) -> 
             let (dom, scripts) = job.0;
             let mut interp = Interp::for_page(dom, &url);
             for (source, name) in scripts {
+                interp.steps = 0; // (each script has the whole budget: one that runs away doesn't starve the next)
                 if let Err(message) = interp.run(&source) {
                     interp.log_line(format!("{name}: {message}"));
                 }
@@ -203,7 +383,7 @@ pub fn run_page_scripts(dom: Dom, url: &str, scripts: Vec<(String, String)>) -> 
         .join()
         .ok()?;
     let (dom, console, interp) = result.0;
-    Some(PageScripts { dom, console, host: ScriptHost(Unsend(interp)) })
+    Some(PageScripts { dom, console, host: ScriptHost(Some(Unsend(interp))) })
 }
 
 impl ScriptHost {
@@ -212,19 +392,21 @@ impl ScriptHost {
     pub fn dispatch(&mut self, dom: &mut Dom, node: usize, event: &str) -> bool {
         let event = event.to_string();
         // the DOM goes into the interpreter for the duration, and comes back out (even if the thread fails)
-        self.0 .0.dom = Some(std::mem::replace(dom, Dom::new()));
-        let job = Unsend(&mut self.0 .0);
+        self.interp().dom = Some(std::mem::replace(dom, Dom::new()));
+        let job = Unsend(self.interp());
         let outcome = std::thread::scope(|scope| {
             let handle = std::thread::Builder::new().stack_size(SCRIPT_STACK).spawn_scoped(scope, move || {
                 let job = job;
                 let interp = job.0;
+                interp.steps = MAX_STEPS - EVENT_STEPS;
+                interp.mem_limit = crate::memcount::live_bytes() + MAX_SCRIPT_MEMORY; // (counted per thread: this is a new one)
                 let prevented = interp.dispatch(node, &event).unwrap_or(false);
                 interp.run_timers();
                 prevented
             });
             handle.ok().and_then(|h| h.join().ok())
         });
-        if let Some(back) = self.0 .0.dom.take() {
+        if let Some(back) = self.interp().dom.take() {
             *dom = back;
         }
         outcome.unwrap_or(false)
@@ -232,7 +414,7 @@ impl ScriptHost {
 
     /// Lines the scripts have logged since the last call.
     pub fn take_console(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.0 .0.console)
+        std::mem::take(&mut self.interp().console)
     }
 }
 
@@ -392,6 +574,7 @@ impl Interp {
             nest: 0,
             objects: 0,
             bytes: 0,
+            mem_limit: crate::memcount::live_bytes() + MAX_SCRIPT_MEMORY,
             joining: vec![],
             console: vec![],
             console_bytes: 0,
@@ -400,6 +583,7 @@ impl Interp {
             page_url: String::new(),
             document: Value::Undefined,
             wrappers: HashMap::new(),
+            methods: HashMap::new(),
             listeners: vec![],
             timers: vec![],
             timer_seq: 0,
@@ -419,10 +603,10 @@ impl Interp {
         interp
     }
 
-    /// Count `n` bytes against the script's memory budget.
-    fn spend_bytes(&mut self, n: usize) -> Result<(), Ctrl> {
-        self.bytes += n as u64;
-        if self.bytes > MAX_BYTES {
+    /// Check the memory the process holds against what the script may grow it to. (Memory is
+    /// measured, not summed from what was asked for: building and dropping strings is free.)
+    fn spend_bytes(&mut self, _n: usize) -> Result<(), Ctrl> {
+        if crate::memcount::live_bytes() > self.mem_limit {
             Err(Ctrl::Abort("script used too much memory and was stopped".into()))
         } else {
             Ok(())
@@ -502,11 +686,9 @@ impl Interp {
         if self.steps > MAX_STEPS {
             return Err(Ctrl::Abort("script ran for too long and was stopped".into()));
         }
-        if self.objects > MAX_OBJECTS {
-            return Err(Ctrl::Abort("script made too many objects and was stopped".into()));
-        }
-        if self.bytes > MAX_BYTES {
-            return Err(Ctrl::Abort("script used too much memory and was stopped".into()));
+        // (the memory check reads an atomic: once every thousand steps is plenty)
+        if self.steps & 0x3ff == 0 {
+            self.spend_bytes(0)?;
         }
         Ok(())
     }
@@ -524,6 +706,23 @@ impl Interp {
         self.objects += 1;
         self.bytes += 96 + 16 * items.len() as u64;
         Value::Obj(Rc::new(RefCell::new(Object { kind: Kind::Array(items), props: HashMap::new(), order: vec![], proto: Some(self.array_proto.clone()) })))
+    }
+
+    /// The (shared) function object for a built-in method found by name: asking for `a.push`
+    /// twice gives the same object, and allocates nothing the second time.
+    fn method(&mut self, f: NativeFn, name: &str) -> Value {
+        let key = f as usize;
+        if let Some(v) = self.methods.get(&key) {
+            return v.clone();
+        }
+        let v = self.native(f);
+        if matches!(name, "push" | "pop" | "hasOwnProperty" | "toString") {
+            if let Value::Obj(o) = &v {
+                Interp::set_prop(o, "__cheap", Value::Bool(true));
+            }
+        }
+        self.methods.insert(key, v.clone());
+        v
     }
 
     fn native(&mut self, f: NativeFn) -> Value {
@@ -928,14 +1127,15 @@ impl Interp {
                 if let Some(i) = array_index(name) {
                     return Ok(s.chars().nth(i).map_or(Value::Undefined, |c| str_value(&c.to_string())));
                 }
-                Ok(string_method(name).map_or(Value::Undefined, |f| self.native(f)))
+                self.charge(s.len() / 8)?; // (a string's length and characters are counted by walking it)
+                Ok(string_method(name).map_or(Value::Undefined, |f| self.method(f, name)))
             }
             Value::Num(_) => Ok(match name {
-                "toString" => self.native(num_to_string),
-                "toFixed" => self.native(num_to_fixed),
+                "toString" => self.method(num_to_string, name),
+                "toFixed" => self.method(num_to_fixed, name),
                 _ => Value::Undefined,
             }),
-            Value::Bool(_) => Ok(if name == "toString" { self.native(bool_to_string) } else { Value::Undefined }),
+            Value::Bool(_) => Ok(if name == "toString" { self.method(bool_to_string, name) } else { Value::Undefined }),
             Value::Obj(o) => {
                 // an element or text node of the page: what the script set on the object itself, else the DOM
                 let node = if let Kind::Node(id) = o.borrow().kind { Some(id) } else { None };
@@ -975,7 +1175,7 @@ impl Interp {
                     }
                 };
                 if let Some(f) = kind_method {
-                    return Ok(self.native(f));
+                    return Ok(self.method(f, name));
                 }
                 if name == "prototype" && matches!(o.borrow().kind, Kind::Closure(_)) {
                     let proto = Value::Obj(self.new_object());
@@ -1006,8 +1206,8 @@ impl Interp {
                     });
                 }
                 Ok(match name {
-                    "hasOwnProperty" => self.native(obj_has_own),
-                    "toString" => self.native(obj_to_string),
+                    "hasOwnProperty" => self.method(obj_has_own, name),
+                    "toString" => self.method(obj_to_string, name),
                     _ => Value::Undefined,
                 })
             }
@@ -1164,13 +1364,15 @@ impl Interp {
         self.depth += 1;
         let result = match target {
             Target::Native(f) => {
-                // a method on a big array or string does work in proportion to its size
+                // a method on a big array or string does work in proportion to its size (except the
+                // ones that don't: `push` and `pop` take the same time however long the array is)
+                let cheap = matches!(func, Value::Obj(fo) if fo.borrow().props.contains_key("__cheap"));
                 let size = match this {
-                    Value::Obj(t) => match &t.borrow().kind {
-                        Kind::Array(a) => a.len(),
+                    Value::Obj(t) if !cheap => match &t.borrow().kind {
+                        Kind::Array(a) => a.len() / 4,
                         _ => 0,
                     },
-                    Value::Str(s) => s.len(),
+                    Value::Str(s) => s.len() / 8,
                     _ => 0,
                 };
                 match self.charge(size) {
@@ -1193,7 +1395,7 @@ impl Interp {
         for (i, p) in c.func.params.iter().enumerate() {
             Interp::declare(&scope, p, args.get(i).cloned().unwrap_or(Value::Undefined), true);
         }
-        if !c.func.arrow {
+        if !c.func.arrow && c.func.uses_arguments {
             let arguments = self.new_array(args.to_vec());
             Interp::declare(&scope, "arguments", arguments, true);
         }
@@ -2987,6 +3189,62 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_loops_are_not_stopped_by_the_limits() {
+        assert_eq!(run("var a=[]; for(var i=0;i<30000;i++)a.push(i); console.log(a.length)"), "30000");
+        assert_eq!(run("var s=''; for(var i=0;i<25000;i++){s+='x'} console.log(s.length)"), "25000");
+        assert_eq!(run("function f(x){return x+1} var n=0; for(var i=0;i<300000;i++){n=f(n)} console.log(n)"), "300000");
+        assert_eq!(run("function fib(n){return n<2?n:fib(n-1)+fib(n-2)} console.log(fib(22))"), "17711");
+        assert_eq!(run("var t=0; for(var i=0;i<300000;i++){var o={a:i}; t+=o.a>0?1:0} console.log(t)"), "299999");
+        assert_eq!(run("var s='x'.repeat(30000),c=0; for(var i=0;i<s.length;i++){c+=s.charCodeAt(i)>0?1:0} console.log(c)"), "30000");
+    }
+
+    #[test]
+    fn dropping_deep_object_graphs_and_cycles_does_not_overflow_or_leak() {
+        // a long chain freed on a small stack
+        let made = on_big_stack(|| {
+            let mut js = Interp::new();
+            js.run("var a={}; for(var i=0;i<100000;i++){a={x:a}} function helper(){return a}").unwrap();
+            Unsend(js)
+        });
+        std::thread::Builder::new().stack_size(2 * 1024 * 1024).spawn(move || {
+            let made = made;
+            drop(made.0);
+        }).unwrap().join().unwrap();
+        // memory held by a script that declared a function is given back
+        let leaked = on_big_stack(|| {
+            let before = crate::memcount::live_bytes();
+            for _ in 0..5 {
+                let mut js = Interp::new();
+                js.run("function helper(){} var a=[]; for(var i=0;i<20000;i++){a.push({i:i})}").unwrap();
+            }
+            crate::memcount::live_bytes() - before
+        });
+        assert!(leaked < 4 * 1024 * 1024, "leaked {leaked} bytes");
+    }
+
+    #[test]
+    fn arguments_is_built_only_when_a_function_uses_it() {
+        assert_eq!(run("function f(){return arguments.length} console.log(f(1,2,3))"), "3");
+        assert_eq!(run("function f(){return (function(){return 1})() + arguments[0]} console.log(f(5))"), "6");
+        assert_eq!(run("function f(){var g=()=>arguments[1]; return g()} console.log(f(1,7))"), "7");
+        assert_eq!(run("function f(){return typeof arguments} function g(){return 1} console.log(f(), g(9))"), "object 1");
+    }
+
+    #[test]
+    fn a_script_that_takes_all_the_memory_is_stopped() {
+        // (a small allowance: memory is counted for the whole process, and tests run side by side)
+        let out = on_big_stack(|| {
+            let mut js = Interp::new();
+            js.mem_limit = crate::memcount::live_bytes() + 48 * 1024 * 1024;
+            match js.run("var s='x'.repeat(4000000); var a=[]; while(true){a.push(`${s}y`)}") {
+                Ok(_) => "finished".to_string(),
+                Err(e) => e,
+            }
+        });
+        assert!(out.contains("too much memory"), "{out}");
+    }
+
+    #[test]
     fn a_script_cannot_grow_the_page_without_bound() {
         let (log, _) = page("<body></body>", &["while (true) { document.body.appendChild(document.createElement('div')) }"]);
         assert!(log.contains("script 1:") && (log.contains("too big") || log.contains("too long") || log.contains("too many")), "{log}");
@@ -3000,9 +3258,10 @@ mod tests {
         assert_eq!(run("var a=[]; a[0]=a; console.log(String(a) === '', a.join() === '', (a + '') === '')"), "true true true");
         assert_eq!(run("var a=[1]; var b=[a]; a.push(b); console.log(String(b))"), "1,");
         assert_eq!(run("var a=[1]; for (var i=0;i<20000;i++){a=[a]} console.log(String(a).length)"), "ERR script nested too deeply and was stopped");
-        // a million nested arrays: refused (too many objects), and dropping what exists is safe
-        assert_eq!(run("var a=[1]; for (var i=0;i<1000000;i++){a=[a]} console.log('built')"), "ERR script made too many objects and was stopped");
-        assert_eq!(run("var o={}; for (var i=0;i<1000000;i++){o={x:o}} console.log('built')"), "ERR script made too many objects and was stopped");
+        // a million nested arrays: allowed (memory, not object count, is what is limited), and
+        // dropping them is iterative, so it can't overflow the stack
+        assert_eq!(run("var a=[1]; for (var i=0;i<1000000;i++){a=[a]} console.log('built')"), "built");
+        assert_eq!(run("var o={}; for (var i=0;i<1000000;i++){o={x:o}} console.log('built')"), "built");
         // deeply nested expressions with calls cannot use unbounded stack
         let deep = format!("function f(n) {{ return {}n{} }} console.log(f(1))", "(".repeat(100) + &"1+".repeat(2900), ")".repeat(100));
         let out = run(Box::leak(deep.into_boxed_str()));

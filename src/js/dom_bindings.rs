@@ -39,6 +39,15 @@ pub(super) struct Timer {
     runs: u32,
 }
 
+impl Timer {
+    /// The values a timer keeps alive.
+    pub(super) fn roots(&self) -> Vec<Value> {
+        let mut v = vec![self.func.clone()];
+        v.extend(self.args.iter().cloned());
+        v
+    }
+}
+
 // ------------------------------------------------------------------ plumbing
 
 fn this_node(i: &mut Interp, this: &Value) -> Result<NodeId, Ctrl> {
@@ -867,6 +876,7 @@ impl Interp {
             let timer = self.timers.remove(next);
             self.clock = self.clock.max(timer.due);
             runs += 1;
+            self.steps = MAX_STEPS - TIMER_STEPS; // (each callback gets its own, smaller, budget)
             let result = self.call(&timer.func, &Value::Undefined, &timer.args);
             match result {
                 Ok(_) => {}

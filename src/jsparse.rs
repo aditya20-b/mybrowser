@@ -432,6 +432,8 @@ pub struct Func {
     pub body: Vec<Stmt>,
     /// An arrow function: `this` is the enclosing one's.
     pub arrow: bool,
+    /// The body mentions `arguments` (so a call has to build the arguments array).
+    pub uses_arguments: bool,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -512,6 +514,8 @@ struct Parser {
     depth: usize,
     /// Links of operator / call chains currently being built (see `MAX_CHAIN`).
     chain: usize,
+    /// `arguments` was mentioned in the function being parsed.
+    arguments_seen: bool,
 }
 
 type PResult<T> = Result<T, String>;
@@ -856,8 +860,11 @@ impl Parser {
             }
         }
         self.expect_punct(")")?;
-        let body = self.block()?;
-        Ok(Func { name, params, body, arrow: false })
+        // (`arguments` seen in the body belongs to this function, not the one around it)
+        let outer = std::mem::take(&mut self.arguments_seen);
+        let body = self.block();
+        let uses_arguments = std::mem::replace(&mut self.arguments_seen, outer);
+        Ok(Func { name, params, body: body?, arrow: false, uses_arguments })
     }
 
     // ---- expressions
@@ -915,12 +922,14 @@ impl Parser {
             params.push(self.ident()?);
         }
         self.expect_punct("=>")?;
+        // an arrow function has no `arguments` of its own: a mention is the enclosing function's
+        // (it stays flagged on the parser, so the enclosing function sees it)
         let body = if self.is_punct("{") {
             self.block()?
         } else {
             vec![Stmt::Return(Some(self.assignment()?))]
         };
-        Ok(Expr::Function(Rc::new(Func { name: None, params, body, arrow: true })))
+        Ok(Expr::Function(Rc::new(Func { name: None, params, body, arrow: true, uses_arguments: false })))
     }
 
     pub fn assignment(&mut self) -> PResult<Expr> {
@@ -997,7 +1006,7 @@ impl Parser {
     fn template_exprs(&mut self, sources: Vec<(String, u32)>) -> PResult<Vec<Expr>> {
         let mut exprs = vec![];
         for (src, line) in sources {
-            let mut inner = Parser { toks: tokenize_at(&src, line)?, pos: 0, depth: self.depth, chain: self.chain };
+            let mut inner = Parser { toks: tokenize_at(&src, line)?, pos: 0, depth: self.depth, chain: self.chain, arguments_seen: false };
             let e = inner.expression()?;
             if *inner.peek() != Tok::Eof {
                 return inner.err("bad expression in template");
@@ -1193,7 +1202,12 @@ impl Parser {
                     self.pos = self.pos.saturating_sub(1);
                     self.err(&format!("unexpected '{w}'"))
                 }
-                _ => Ok(Expr::Ident(w)),
+                _ => {
+                    if w == "arguments" {
+                        self.arguments_seen = true;
+                    }
+                    Ok(Expr::Ident(w))
+                }
             },
             Tok::Punct("(") => {
                 let e = self.expression()?;
@@ -1283,7 +1297,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
 }
 
 fn parse_here(src: &str) -> Result<Vec<Stmt>, String> {
-    let mut p = Parser { toks: tokenize(src)?, pos: 0, depth: 0, chain: 0 };
+    let mut p = Parser { toks: tokenize(src)?, pos: 0, depth: 0, chain: 0, arguments_seen: false };
     p.program()
 }
 
@@ -1292,7 +1306,7 @@ mod tests {
     use super::*;
 
     fn expr(src: &str) -> Expr {
-        let mut p = Parser { toks: tokenize(src).unwrap(), pos: 0, depth: 0, chain: 0 };
+        let mut p = Parser { toks: tokenize(src).unwrap(), pos: 0, depth: 0, chain: 0, arguments_seen: false };
         let e = p.expression().unwrap_or_else(|e| panic!("{src}: {e}"));
         assert_eq!(*p.peek(), Tok::Eof, "{src}: leftover tokens");
         e

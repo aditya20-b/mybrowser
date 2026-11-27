@@ -11,6 +11,10 @@ mod html;
 mod images;
 mod js;
 mod jsparse;
+mod memcount;
+
+#[global_allocator]
+static ALLOCATOR: memcount::Counting = memcount::Counting;
 mod layout;
 mod net;
 mod page;

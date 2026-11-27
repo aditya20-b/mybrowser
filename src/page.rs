@@ -7,6 +7,7 @@ use crate::fonts::Fonts;
 use crate::forms::{self, FormState};
 use crate::html;
 use crate::images::{self, Image};
+use crate::js::{self, ScriptHost};
 use crate::layout::{self, Layout};
 use crate::net::{self, Fetched};
 use crate::style::{self, Style};
@@ -54,6 +55,90 @@ pub struct Page {
     pub is_error: bool,
     /// The server said `Cache-Control: no-store`: this page is not kept in memory for Back.
     pub no_store: bool,
+    /// The page's scripts, kept running so events can reach their handlers (None if it had none).
+    pub scripts: Option<ScriptHost>,
+    /// What the scripts logged, and why one failed to load or run.
+    pub console: Vec<String>,
+}
+
+/// The most scripts a page may run, and the most source text.
+const MAX_SCRIPTS: usize = 60;
+const MAX_SCRIPT_BYTES: usize = 3 * 1024 * 1024;
+
+/// Is this `<script type=...>` JavaScript we run? (No `type` means yes; modules and data blocks no.)
+fn runs_as_javascript(type_attr: Option<&str>) -> bool {
+    match type_attr.map(|t| t.split(';').next().unwrap_or("").trim().to_ascii_lowercase()) {
+        None => true,
+        Some(t) => matches!(t.as_str(), "" | "text/javascript" | "application/javascript" | "text/ecmascript" | "application/ecmascript" | "text/jscript"),
+    }
+}
+
+/// Fetch and run a document's scripts. Returns the DOM as the scripts left it, the running scripts
+/// (if there were any), and their console output. `src` is the markup, to start over from if the
+/// scripts could not even be started.
+fn run_scripts(dom: Dom, src: &str, url: &Url, resolve: &dyn Fn(&str) -> Option<Url>) -> (Dom, Option<ScriptHost>, Vec<String>) {
+    enum Entry {
+        Inline(String),
+        External(Url),
+    }
+    let mut entries = vec![];
+    for id in 0..dom.nodes.len() {
+        if dom.tag(id) != Some("script") || !runs_as_javascript(dom.attr(id, "type")) {
+            continue;
+        }
+        if entries.len() >= MAX_SCRIPTS {
+            break;
+        }
+        match dom.attr(id, "src") {
+            Some(s) => {
+                if let Some(u) = resolve(s) {
+                    entries.push(Entry::External(u));
+                }
+            }
+            None => {
+                let text = dom.text_content(id);
+                if !text.trim().is_empty() {
+                    entries.push(Entry::Inline(text));
+                }
+            }
+        }
+    }
+    if entries.is_empty() {
+        return (dom, None, vec![]);
+    }
+    let urls: Vec<Url> = entries.iter().filter_map(|e| if let Entry::External(u) = e { Some(u.clone()) } else { None }).collect();
+    let mut fetched = if urls.is_empty() { HashMap::new() } else { fetch_parallel(urls, url, SUBRESOURCE_DEADLINE) };
+    let mut console = vec![];
+    let mut list = vec![];
+    let mut total = 0usize;
+    for e in entries {
+        let (text, name) = match e {
+            Entry::Inline(t) => (t, "inline script".to_string()),
+            Entry::External(u) => match fetched.remove(u.as_str()).filter(|f| f.status < 400) {
+                Some(f) => (net::decode_text(&f.body, f.charset.as_deref(), false), u.to_string()),
+                None => {
+                    console.push(format!("could not load script {u}"));
+                    continue;
+                }
+            },
+        };
+        total += text.len();
+        if total > MAX_SCRIPT_BYTES {
+            console.push("too much script: the rest was skipped".into());
+            break;
+        }
+        list.push((text, name));
+    }
+    match js::run_page_scripts(dom, url.as_str(), list) {
+        Some(done) => {
+            console.extend(done.console);
+            (done.dom, Some(done.host), console)
+        }
+        None => {
+            console.push("scripts could not be started".into());
+            (html::parse(src), None, console)
+        }
+    }
 }
 
 fn esc(s: &str) -> String {
@@ -349,6 +434,10 @@ impl Page {
         // Resource URLs are compared without their `#fragment` (it never reaches the server).
         let resolve = |href: &str| base.join(href.trim()).ok().map(|u| without_fragment(&u)).filter(&allowed);
 
+        // Scripts: fetch the external ones and run them all, in order, against the DOM; what the
+        // page has become afterwards is what gets styled and laid out.
+        let (dom, scripts, console) = run_scripts(dom, &src, url, &resolve);
+
         // Pass 1: find stylesheets and images, and the URLs that need fetching.
         let mut sheets: Vec<Sheet> = vec![];
         let mut title = String::new();
@@ -423,7 +512,7 @@ impl Page {
         }
 
         let layout = Layout { items: vec![], links: vec![], controls: vec![], anchors: vec![], height: 0.0, canvas_bg: None };
-        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false, no_store: false }
+        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false, no_store: false, scripts, console }
     }
 
     /// Re-run layout for a new viewport width (logical pixels), or after the
@@ -636,6 +725,69 @@ mod tests {
         let p = render("<style>body{margin:0}p{margin:0;height:40px}</style><p>a</p><div id='a%20b'>x</div><div id='c d'>y</div>", 400.0);
         assert_eq!(p.fragment_y("a%20b"), Some(40.0), "the raw spelling is tried before decoding");
         assert!(p.fragment_y("c%20d").is_some(), "and the decoded one still works");
+    }
+
+    fn words(p: &Page) -> Vec<String> {
+        p.layout.items.iter().filter_map(|i| match i {
+            Item::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn scripts_change_what_is_laid_out_and_styled() {
+        let dir = std::env::temp_dir().join(format!("mybrowser-scripts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ext.js"), "document.getElementById('b').textContent = 'from external'; console.log('external ran');").unwrap();
+        let fonts = Fonts::load();
+        let src = "<style>.big{font-size:40px} body{margin:0}</style><body><p id=a>before</p><p id=b>x</p><ul id=l></ul>\
+            <script>var a = document.getElementById('a'); a.textContent = 'after'; a.className = 'big';
+                    for (var i = 1; i <= 3; i++) { var li = document.createElement('li'); li.textContent = 'item ' + i; document.getElementById('l').appendChild(li) }
+                    console.log('inline ran');</script>\
+            <script src='ext.js'></script><script>this is not javascript</script><script type='text/template'>ignored {{x}}</script>\
+            <script src='missing.js'></script><script>console.log('still going')</script>\
+            <noscript><p>needs scripts</p></noscript></body>";
+        let mut p = Page::from_source(&url_of(&dir.join("t.html")), src);
+        p.relayout(&fonts, 400.0);
+        let w = words(&p);
+        assert!(w.contains(&"after".to_string()) && !w.contains(&"before".to_string()), "{w:?}");
+        assert!(w.contains(&"from".to_string()) && w.contains(&"external".to_string()), "the external script ran: {w:?}");
+        assert!(w.contains(&"•".to_string()) && w.contains(&"item".to_string()), "created elements are laid out as list items: {w:?}");
+        assert!(!w.contains(&"needs".to_string()), "noscript content is not shown when scripts run");
+        assert!(!w.contains(&"ignored".to_string()));
+        // the class a script set was styled
+        let big = p.layout.items.iter().find_map(|i| match i { Item::Text { text, size, .. } if text == "after" => Some(*size), _ => None }).unwrap();
+        assert_eq!(big, 40.0);
+        // (scripts that couldn't be fetched are reported first, then each script's own output, in order)
+        assert!(p.console[0].starts_with("could not load script file://") && p.console[0].ends_with("missing.js"), "{:?}", p.console);
+        assert_eq!(p.console[1..].join("|"), "inline ran|external ran|inline script: line 1: expected ';'|still going");
+        assert!(p.scripts.is_some());
+        // a page with no scripts has no script host at all
+        assert!(Page::from_source(&url_of(&dir.join("t.html")), "<p>plain</p>").scripts.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_web_page_cannot_run_a_local_file_as_a_script() {
+        let dir = std::env::temp_dir().join(format!("mybrowser-scripts2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = url_of(&dir.join("secret.js"));
+        std::fs::write(dir.join("secret.js"), "document.body.textContent = 'pwned'").unwrap();
+        let p = Page::from_source(&Url::parse("http://example.invalid/").unwrap(), &format!("<body><p>safe</p><script src='{secret}'></script></body>"));
+        assert!(words(&p).contains(&"safe".to_string()) || p.dom.text_content(0).contains("safe"));
+        assert!(!p.dom.text_content(0).contains("pwned"));
+        assert!(p.scripts.is_none(), "nothing was loaded, so nothing runs");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_runaway_script_does_not_stop_the_page_from_loading() {
+        let fonts = Fonts::load();
+        let mut p = Page::from_source(&Url::parse("file:///tmp/loop.html").unwrap(), "<body><p>still here</p><script>while (true) {}</script><script>console.log('next')</script></body>");
+        p.relayout(&fonts, 400.0);
+        assert!(words(&p).contains(&"still".to_string()));
+        assert!(p.console[0].starts_with("inline script: script ran for too long"), "{:?}", p.console);
+        assert_eq!(p.console[1], "next");
     }
 
     #[test]

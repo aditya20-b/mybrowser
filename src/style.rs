@@ -651,7 +651,7 @@ pub fn compute(dom: &Dom, rules: &[Rule]) -> Vec<Style> {
 
 /// The browser's built-in default stylesheet.
 pub const USER_AGENT_CSS: &str = "
-head, style, script, title, meta, link, template, base, col, colgroup { display: none }
+head, style, script, title, meta, link, template, base, col, colgroup, noscript { display: none }
 [hidden] { display: none }
 html, body, div, section, article, header, footer, nav, main, aside, p, h1, h2, h3, h4, h5,
 h6, ul, ol, dl, dt, dd, pre, blockquote, hr, form, figure, figcaption, fieldset, address,

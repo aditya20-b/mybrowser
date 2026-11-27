@@ -1885,6 +1885,11 @@ impl<'a> Ctx<'a> {
             height = height.max(h + pad[0] + pad[2] + bw[0] + bw[2]);
         }
         let decor = self.emit_decor(s, bg_slot, x, y, outer_w, y + height, bw, color);
+        // the cell's own box (after its content's, so the content is found first; it is not in the
+        // range that is shifted when the content is aligned, because the cell itself stays put)
+        if self.boxes.len() < MAX_BOXES {
+            self.boxes.push(BoxRegion { x, y, w: outer_w, h: height, node: id });
+        }
         CellOut { height, decor, content, links, controls, blocks, boxes }
     }
 

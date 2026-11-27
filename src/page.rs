@@ -978,7 +978,7 @@ mod tests {
         let fonts = Fonts::load();
         let src = "<style>body{margin:0} div{margin:0;padding:0} #a{height:50px} #b{height:50px} table{border-collapse:collapse} td{padding:0;height:40px;vertical-align:bottom}</style>\
             <body><div id=outer><div id=a>first</div><div id=b><p id=inner>second</p></div></div>\
-            <table><tr><td id=cell><div id=incell>x</div></td></tr></table>\
+            <table><tr><td id=cell><div id=incell>x</div></td></tr><tr><td id=textcell>just text</td></tr></table>\
             <script>
               function log(e) { console.log(this.id + ' <- ' + e.target.id) }
               ['outer', 'a', 'inner', 'cell'].forEach(function (id) { document.getElementById(id).addEventListener('click', log) });
@@ -1003,6 +1003,10 @@ mod tests {
         assert_eq!(p.dom.attr(target, "id"), Some("incell"));
         p.run_event(target, "click");
         assert_eq!(p.console, ["a <- a", "outer <- a", "inner <- inner", "outer <- inner", "cell <- incell"], "{:?}", p.console);
+        // the cell itself is a click target too (where its content isn't)
+        let cell = (0..p.dom.nodes.len()).find(|&n| p.dom.attr(n, "id") == Some("textcell")).unwrap();
+        let b = p.layout.boxes.iter().find(|b| b.node == cell).expect("cells have boxes");
+        assert_eq!(p.element_at(b.x + 1.0, b.y + 1.0), Some(cell));
     }
 
     #[test]

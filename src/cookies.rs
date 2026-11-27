@@ -179,7 +179,9 @@ impl Jar {
             }
             let (host_only, domain, path, name, value) = (f[1] == "1", f[2], f[3], f[4], f[5]);
             let Ok(expires) = f[6].parse::<i64>() else { continue };
-            if expires <= now || domain.is_empty() || domain.contains([':', '/', '@', ' ', ';']) || !path.starts_with('/') {
+            // (a colon is only for an IPv6 address, which is written in brackets)
+            let colon_ok = domain.starts_with('[') && domain.ends_with(']');
+            if expires <= now || domain.is_empty() || (domain.contains(':') && !colon_ok) || domain.contains(['/', '@', ' ', ';']) || !path.starts_with('/') {
                 continue;
             }
             // (a value that holds `;` would add attributes to the cookie it is spliced into)
@@ -453,6 +455,17 @@ mod tests {
         // Secure and SameSite survive
         assert_eq!(header(&fresh, "http://shop.example.com/cart/"), "wide=2");
         assert_eq!(header_in(&fresh, "https://shop.example.com/cart/", Ctx::CrossSiteGet), "wide=2");
+    }
+
+    #[test]
+    fn ipv6_host_cookies_survive_a_restart() {
+        let mut jar = Jar::new();
+        jar.accept(&u("http://[::1]:8080/"), "c=1; Max-Age=1000; Path=/");
+        let text = jar.to_text();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        let mut fresh = Jar::new();
+        fresh.load_text(&text);
+        assert_eq!(header(&fresh, "http://[::1]:8080/"), "c=1");
     }
 
     #[test]

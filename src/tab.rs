@@ -632,7 +632,12 @@ impl Tab {
     /// fragment-entry counts around it). Pages that failed to load are not kept (Back should try
     /// again), and a page is only kept while the pages held stay within a memory budget.
     fn cache_page(&mut self, page: Page, depth: usize, frags: (usize, usize)) {
-        if page.url.scheme() == "about" || page.is_error || page.status.is_some_and(|s| s >= 400) || page.image_bytes() > MAX_CACHED_IMAGE_BYTES {
+        if page.url.scheme() == "about"
+            || page.is_error
+            || page.no_store
+            || page.status.is_some_and(|s| s >= 400)
+            || page.image_bytes() > MAX_CACHED_IMAGE_BYTES
+        {
             return;
         }
         let key = (page.url.clone(), depth);
@@ -1647,6 +1652,23 @@ mod tests {
         tab.go_back();
         assert!(!tab.is_loading());
         assert_eq!(tab.page.form.value(&tab.page.dom, input), "1typed");
+    }
+
+    #[test]
+    fn a_no_store_page_is_never_kept_for_back() {
+        let (_dir, a, b) = site("nostore");
+        let (notify, rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        tab.open(a.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.page.no_store = true; // (as if the server had sent Cache-Control: no-store)
+        tab.open(b.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.go_back();
+        assert!(tab.is_loading(), "fetched again instead of restored from memory");
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.page.url, a);
+        assert!(!tab.page.no_store);
     }
 
     #[test]

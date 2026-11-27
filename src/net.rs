@@ -51,6 +51,14 @@ pub struct Fetched {
     pub content_type: String,
     pub charset: Option<String>,
     pub body: Vec<u8>,
+    /// The response said `Cache-Control: no-store`: nothing of it may be kept for later (the
+    /// page is not held in memory for Back).
+    pub no_store: bool,
+}
+
+/// Does a `Cache-Control` header value contain the `no-store` directive?
+pub fn has_no_store(value: &str) -> bool {
+    value.split(',').any(|d| d.trim().split('=').next().unwrap_or("").trim().eq_ignore_ascii_case("no-store"))
 }
 
 /// What we say we accept: pages and styles, and the image formats we can decode (so a
@@ -124,7 +132,7 @@ fn fetch_file(url: &Url) -> Result<Fetched, String> {
         "js" => "text/javascript",
         _ => sniff(&body),
     };
-    Ok(Fetched { url: url.clone(), status: 200, content_type: content_type.into(), charset: None, body })
+    Ok(Fetched { url: url.clone(), status: 200, content_type: content_type.into(), charset: None, body, no_store: false })
 }
 
 fn agent() -> &'static ureq::Agent {
@@ -211,6 +219,7 @@ fn fetch_http(start: &Url, top: Option<&Url>, post: Option<&str>) -> Result<Fetc
                 continue;
             }
         }
+        let no_store = resp.headers().get_all("cache-control").iter().any(|v| v.to_str().is_ok_and(has_no_store));
         let content_type = resp.body().mime_type().unwrap_or("").to_ascii_lowercase();
         let charset = resp.body().charset().map(|c| c.to_ascii_lowercase());
         let body = resp
@@ -220,7 +229,7 @@ fn fetch_http(start: &Url, top: Option<&Url>, post: Option<&str>) -> Result<Fetc
             .read_to_vec()
             .map_err(|e| format!("reading {url}: {e}"))?;
         let content_type = if content_type.is_empty() { sniff(&body).to_string() } else { content_type };
-        return Ok(Fetched { url, status: status.as_u16(), content_type, charset, body });
+        return Ok(Fetched { url, status: status.as_u16(), content_type, charset, body, no_store });
     }
     Err(format!("{start}: too many redirects"))
 }
@@ -244,7 +253,7 @@ fn fetch_data(url: &Url) -> Result<Fetched, String> {
     if body.len() as u64 > MAX_BODY {
         return Err("data: URL too large".into());
     }
-    Ok(Fetched { url, status: 200, content_type: mime, charset, body })
+    Ok(Fetched { url, status: 200, content_type: mime, charset, body, no_store: false })
 }
 
 /// Guess a content type from the bytes themselves.
@@ -471,6 +480,24 @@ mod tests {
         h.join().unwrap();
         assert_eq!((f.status, f.content_type.as_str(), f.charset.as_deref()), (200, "text/html", Some("iso-8859-1")));
         assert_eq!(f.body, b"<p>hi</p>");
+    }
+
+    #[test]
+    fn cache_control_no_store_is_noticed() {
+        for yes in ["no-store", "No-Store", "no-cache, no-store, must-revalidate", "private,max-age=0 , no-store", "no-store=\"x\""] {
+            assert!(has_no_store(yes), "{yes}");
+        }
+        for no in ["", "no-cache", "max-age=3600", "public", "no-storefront", "x-no-store"] {
+            assert!(!has_no_store(no), "{no}");
+        }
+        let (port, h) = serve(vec![
+            http("200 OK", "Content-Type: text/plain\r\nCache-Control: private, no-store\r\n", "secret"),
+            http("200 OK", "Content-Type: text/plain\r\nCache-Control: max-age=60\r\n", "fine"),
+        ]);
+        let url = |p: &str| Url::parse(&format!("http://127.0.0.1:{port}{p}")).unwrap();
+        let (a, b) = (fetch(&url("/a")).unwrap(), fetch(&url("/b")).unwrap());
+        h.join().unwrap();
+        assert!(a.no_store && !b.no_store);
     }
 
     #[test]

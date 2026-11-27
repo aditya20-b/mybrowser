@@ -52,6 +52,8 @@ pub struct Page {
     /// This is the page we built to say a load failed (it is never kept for Back: going back
     /// should try again).
     pub is_error: bool,
+    /// The server said `Cache-Control: no-store`: this page is not kept in memory for Back.
+    pub no_store: bool,
 }
 
 fn esc(s: &str) -> String {
@@ -306,6 +308,7 @@ impl Page {
             other => Page::error(&f.url, &format!("Cannot display content of type '{other}'")),
         };
         page.status = Some(f.status);
+        page.no_store = f.no_store;
         page
     }
 
@@ -420,7 +423,7 @@ impl Page {
         }
 
         let layout = Layout { items: vec![], links: vec![], controls: vec![], anchors: vec![], height: 0.0, canvas_bg: None };
-        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false }
+        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false, no_store: false }
     }
 
     /// Re-run layout for a new viewport width (logical pixels), or after the

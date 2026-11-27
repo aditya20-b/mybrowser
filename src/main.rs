@@ -9,6 +9,7 @@ mod fonts;
 mod forms;
 mod html;
 mod images;
+mod js;
 mod jsparse;
 mod layout;
 mod net;

@@ -24,6 +24,15 @@ pub enum ControlKind {
     Hidden,
 }
 
+/// A keyboard step through a select's options.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SelectStep {
+    Prev,
+    Next,
+    First,
+    Last,
+}
+
 /// A caret movement in a text field.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum CaretMove {
@@ -381,6 +390,23 @@ impl FormState {
         self.selected.insert(id, next);
     }
 
+    /// Arrow keys on a focused select: move to the next or previous option (stopping at the ends,
+    /// and also using Home / End via `to_first` / `to_last`).
+    pub fn step_select(&mut self, dom: &Dom, id: NodeId, step: SelectStep) {
+        let n = options(dom, id).len();
+        if n == 0 || is_disabled(dom, id) || kind_of(dom, id) != Some(ControlKind::Select) {
+            return;
+        }
+        let cur = self.selected_index(dom, id);
+        let next = match step {
+            SelectStep::Prev => cur.saturating_sub(1),
+            SelectStep::Next => (cur + 1).min(n - 1),
+            SelectStep::First => 0,
+            SelectStep::Last => n - 1,
+        };
+        self.selected.insert(id, next);
+    }
+
     /// Move focus to the next (or previous) focusable control, wrapping around.
     /// With nothing focused, Tab goes to the first and Shift+Tab to the last.
     pub fn focus_next(&mut self, dom: &Dom, forward: bool) {
@@ -506,6 +532,27 @@ mod tests {
 
     fn find(dom: &Dom, tag: &str, nth: usize) -> NodeId {
         (0..dom.nodes.len()).filter(|&i| dom.tag(i) == Some(tag)).nth(nth).unwrap_or_else(|| panic!("no {tag} #{nth}"))
+    }
+
+    #[test]
+    fn arrow_keys_step_through_a_selects_options() {
+        let dom = html::parse("<select name=s><option value=a>A<option value=b selected>B<option value=c>C</select><select name=e></select><input name=i>");
+        let (s, e, i) = (by_name(&dom, "s"), by_name(&dom, "e"), by_name(&dom, "i"));
+        let mut st = FormState::default();
+        assert_eq!(st.value(&dom, s), "b");
+        st.step_select(&dom, s, SelectStep::Next);
+        assert_eq!(st.value(&dom, s), "c");
+        st.step_select(&dom, s, SelectStep::Next);
+        assert_eq!(st.value(&dom, s), "c", "stops at the last option");
+        st.step_select(&dom, s, SelectStep::First);
+        assert_eq!(st.value(&dom, s), "a");
+        st.step_select(&dom, s, SelectStep::Prev);
+        assert_eq!(st.value(&dom, s), "a", "stops at the first");
+        st.step_select(&dom, s, SelectStep::Last);
+        assert_eq!(st.value(&dom, s), "c");
+        st.step_select(&dom, e, SelectStep::Next); // no options: nothing happens
+        st.step_select(&dom, i, SelectStep::Next); // not a select
+        assert_eq!(st.value(&dom, i), "");
     }
 
     #[test]

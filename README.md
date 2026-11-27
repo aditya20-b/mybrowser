@@ -38,7 +38,7 @@ The window has a tab strip, a toolbar with back, forward and reload buttons, and
 | `Cmd+[`, `Cmd+]`, `Alt+←`, `Alt+→`, `Backspace` | Back and forward |
 | `Cmd+R`, `F5`, `R` | Reload |
 | Wheel, arrow keys, `Space`, `PgUp`, `PgDn`, `Home`, `End` | Scroll |
-| Click a field, then type | Edit it. `Tab` / `Shift+Tab` move between controls, `Enter` submits, `Esc` leaves the field, `Space` toggles checkboxes and presses buttons |
+| Click a field, then type | Edit it. `Tab` / `Shift+Tab` move between controls, `Enter` submits, `Esc` leaves the field, `Space` toggles checkboxes and presses buttons. In a text field the arrow keys, `Home`, `End` and `Delete` move the caret and edit; on a focused select, `↑`/`↓`/`Home`/`End` step through the options |
 
 To render a page to a PNG without opening a window (this works on URLs too):
 

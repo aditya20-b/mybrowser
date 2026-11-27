@@ -645,6 +645,19 @@ impl App {
                 self.tab_mut().form_changed();
                 true
             }
+            Key::Named(key @ (NamedKey::ArrowUp | NamedKey::ArrowDown | NamedKey::Home | NamedKey::End)) if kind == Some(ControlKind::Select) => {
+                let tab = self.tab_mut();
+                let Page { dom, form, .. } = &mut tab.page;
+                let step = match key {
+                    NamedKey::ArrowUp => forms::SelectStep::Prev,
+                    NamedKey::ArrowDown => forms::SelectStep::Next,
+                    NamedKey::Home => forms::SelectStep::First,
+                    _ => forms::SelectStep::Last,
+                };
+                form.step_select(dom, id, step);
+                tab.form_changed();
+                true
+            }
             Key::Named(key @ (NamedKey::ArrowLeft | NamedKey::ArrowRight | NamedKey::Home | NamedKey::End | NamedKey::Delete)) if text_like => {
                 let tab = self.tab_mut();
                 let Page { dom, form, .. } = &mut tab.page;

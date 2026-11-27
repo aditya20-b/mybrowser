@@ -851,6 +851,20 @@ mod tests {
                         }
                         seen.extend_from_slice(&buf[..k]);
                     }
+                    // Read a POST body in full before answering: closing a socket that still has
+                    // unread data makes the OS reset the connection, which can destroy the reply.
+                    let head_end = seen.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                    let declared = String::from_utf8_lossy(&seen[..head_end])
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                        .unwrap_or(0);
+                    while seen.len() < head_end + declared {
+                        let k = sock.read(&mut buf).unwrap_or(0);
+                        if k == 0 {
+                            break;
+                        }
+                        seen.extend_from_slice(&buf[..k]);
+                    }
                     let line = String::from_utf8_lossy(&seen).lines().next().unwrap_or("").to_string();
                     let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
                     let (status, ctype, body) = match routes.iter().find(|(p, _, _)| *p == path) {

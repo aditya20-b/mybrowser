@@ -253,6 +253,8 @@ pub struct Tab {
     inflight_initiator: Option<Url>,
     /// Where each page left behind in this tab was scrolled to (by full URL, fragment included).
     scroll_memory: HashMap<(Url, usize), f32>,
+    /// Pages recently left, by (address, depth in the back history), for instant Back / Forward.
+    page_cache: std::collections::VecDeque<((Url, usize), Page)>,
     /// How many meta-refresh redirects led to the page on screen, and to the load in flight.
     /// What happened to the last file the tab was asked to download (shown once).
     notice: Option<String>,
@@ -273,6 +275,9 @@ pub struct Tab {
 
 /// A chain of zero-delay meta refreshes is cut off after this many.
 const MAX_REFRESH_HOPS: u8 = 5;
+
+/// A tab keeps this many recently left pages in memory for Back and Forward.
+const MAX_CACHED_PAGES: usize = 6;
 
 /// A tab remembers the scroll position of at most this many pages.
 const MAX_REMEMBERED_SCROLLS: usize = 200;
@@ -304,6 +309,7 @@ impl Tab {
             next_initiator: None,
             inflight_initiator: None,
             scroll_memory: HashMap::new(),
+            page_cache: std::collections::VecDeque::new(),
             notice: None,
             on_download_page: false,
             frag_back: 0,
@@ -393,6 +399,8 @@ impl Tab {
         if !self.placeholder {
             self.remember_scroll(pending.from.clone());
         }
+        let leave_depth = self.history.back.len();
+        let was_placeholder = self.placeholder;
         self.history.apply(pending.hist, pending.from, &page.url);
         // (positions are kept per place in the history, so visiting a URL twice keeps two)
         let depth = self.history.back.len();
@@ -405,7 +413,15 @@ impl Tab {
         if restored.is_some() {
             self.pending_fragment = None;
         }
-        self.page = page;
+        let old = std::mem::replace(&mut self.page, page);
+        // keep the page just left, whole (typed form data included), for Back and Forward; a
+        // reload or a landing on the same address replaces it instead
+        if !was_placeholder && pending.hist != Hist::Replace && old.url != self.page.url {
+            if pending.hist == Hist::Push {
+                self.page_cache.retain(|(k, _)| k.1 <= leave_depth); // the forward entries are gone
+            }
+            self.cache_page(old, leave_depth);
+        }
         self.placeholder = false;
         self.laid_out_width = -1.0; // force relayout on the next redraw
         self.scroll = restored.or(pending.keep_scroll).unwrap_or(0.0); // clamped on the next redraw
@@ -568,7 +584,7 @@ impl Tab {
 
     pub fn go_back(&mut self) {
         if let Some(prev) = self.history.back_target().cloned() {
-            if self.same_document_move(&prev, true) {
+            if self.same_document_move(&prev, true) || self.restore_cached(&prev, true) {
                 return;
             }
             self.begin_load(prev, Hist::Back, None);
@@ -577,11 +593,54 @@ impl Tab {
 
     pub fn go_forward(&mut self) {
         if let Some(next) = self.history.forward_target().cloned() {
-            if self.same_document_move(&next, false) {
+            if self.same_document_move(&next, false) || self.restore_cached(&next, false) {
                 return;
             }
             self.begin_load(next, Hist::Forward, None);
         }
+    }
+
+    /// Remember a page that was just left, at this depth of the back history.
+    fn cache_page(&mut self, page: Page, depth: usize) {
+        if page.url.scheme() == "about" {
+            return;
+        }
+        let key = (page.url.clone(), depth);
+        self.page_cache.retain(|(k, _)| *k != key);
+        self.page_cache.push_back((key, page));
+        while self.page_cache.len() > MAX_CACHED_PAGES {
+            self.page_cache.pop_front();
+        }
+    }
+
+    /// Back or Forward onto a page we still hold: swap it in, with what was typed into it and
+    /// where it was scrolled, without touching the network (so a page a POST produced comes
+    /// back as it was, not re-fetched with a GET). Not while a load is in flight.
+    fn restore_cached(&mut self, target: &Url, back: bool) -> bool {
+        if self.nav.pending().is_some() || self.placeholder {
+            return false;
+        }
+        let depth_after = if back { self.history.back.len().saturating_sub(1) } else { self.history.back.len() + 1 };
+        let Some(pos) = self.page_cache.iter().position(|(k, _)| k.0 == *target && k.1 == depth_after) else { return false };
+        let (_, cached) = self.page_cache.remove(pos).unwrap();
+        let here = self.page.url.clone();
+        self.remember_scroll(here.clone());
+        let leave_depth = self.history.back.len();
+        let old = std::mem::replace(&mut self.page, cached);
+        self.cache_page(old, leave_depth);
+        if back {
+            self.history.back.pop();
+            self.history.forward.push(here);
+        } else {
+            self.history.forward.pop();
+            self.history.back.push(here);
+        }
+        self.on_download_page = false;
+        (self.frag_back, self.frag_forward) = (0, 0);
+        self.pending_fragment = None;
+        self.laid_out_width = -1.0;
+        self.scroll = self.scroll_memory.get(&(target.clone(), depth_after)).copied().unwrap_or(0.0);
+        true
     }
 
     /// Back / forward between two `#fragment`s of the page on screen needs no load: just
@@ -1076,10 +1135,10 @@ mod tests {
         assert_eq!((tab.title().as_str(), tab.history.back.clone()), ("Page B", vec![a.clone()]));
         // back, then forward
         tab.go_back();
-        assert!(deliver(&mut tab, &rx));
+        assert!(!tab.is_loading(), "Back shows the page we still hold, without a load");
         assert_eq!((tab.title().as_str(), tab.history.forward.clone()), ("Page A", vec![b.clone()]));
         tab.go_forward();
-        assert!(deliver(&mut tab, &rx));
+        assert!(!tab.is_loading());
         assert_eq!(tab.title(), "Page B");
         // reload keeps history and your scroll position
         tab.scroll = 33.0;
@@ -1277,10 +1336,8 @@ mod tests {
         assert_eq!(tab.scroll, 0.0, "a new page starts at the top");
         tab.scroll = 40.0;
         tab.go_back();
-        assert!(deliver(&mut tab, &rx));
         assert_eq!((tab.page.url.clone(), tab.scroll), (long.clone(), 700.0), "Back restores the position");
         tab.go_forward();
-        assert!(deliver(&mut tab, &rx));
         assert_eq!((tab.page.url.clone(), tab.scroll), (b.clone(), 40.0), "and so does Forward");
         // a page never visited before has nothing to restore
         tab.open(a.clone());
@@ -1524,6 +1581,80 @@ mod tests {
     }
 
     #[test]
+    fn back_and_forward_bring_back_the_page_as_it_was_including_what_was_typed() {
+        let (dir, a, b) = site("bfcache");
+        std::fs::write(dir.join("c.html"), "<title>C</title><p>third</p>").unwrap();
+        let c = Url::from_file_path(dir.join("c.html")).unwrap();
+        let (notify, rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        tab.open(a.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.page.relayout(&crate::fonts::Fonts::load(), 400.0);
+        let input = tab.page.layout.controls[0].node;
+        {
+            let Page { dom, form, .. } = &mut tab.page;
+            form.type_text(dom, input, "typed");
+        }
+        tab.scroll = 33.0;
+        tab.open(b.clone());
+        assert!(deliver(&mut tab, &rx));
+        // Back: no load, the same page, with the text still in its field and its scroll position
+        tab.go_back();
+        assert!(!tab.is_loading());
+        assert_eq!((tab.page.url.clone(), tab.scroll), (a.clone(), 33.0));
+        assert_eq!(tab.page.form.value(&tab.page.dom, input), "1typed", "the field keeps what was typed");
+        // and Forward brings back the page we left, too
+        tab.go_forward();
+        assert!(!tab.is_loading());
+        assert_eq!(tab.page.url, b);
+        // a third page, then back twice: both come from memory
+        tab.open(c.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.go_back();
+        tab.go_back();
+        assert!(!tab.is_loading());
+        assert_eq!(tab.page.form.value(&tab.page.dom, input), "1typed");
+    }
+
+    #[test]
+    fn the_page_cache_is_bounded_and_forgets_forward_entries() {
+        let (dir, a, b) = site("bfcache2");
+        let (notify, rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        // more pages than the cache holds: the oldest fall out and are loaded again
+        let mut urls = vec![a.clone(), b.clone()];
+        for i in 0..(MAX_CACHED_PAGES + 3) {
+            std::fs::write(dir.join(format!("p{i}.html")), format!("<title>P{i}</title><p>p{i}</p>")).unwrap();
+            urls.push(Url::from_file_path(dir.join(format!("p{i}.html"))).unwrap());
+        }
+        for u in &urls {
+            tab.open(u.clone());
+            assert!(deliver(&mut tab, &rx));
+        }
+        assert!(tab.page_cache.len() <= MAX_CACHED_PAGES);
+        let mut loaded = 0;
+        for _ in 0..urls.len() - 2 {
+            tab.go_back();
+            if tab.is_loading() {
+                loaded += 1;
+                assert!(deliver(&mut tab, &rx));
+            }
+        }
+        assert!(loaded >= 3, "the oldest pages had to be fetched again: {loaded}");
+        assert_eq!(tab.page.url, urls[1]);
+        // a new navigation throws away the pages that were ahead
+        tab.open(urls[3].clone());
+        assert!(deliver(&mut tab, &rx));
+        assert!(tab.history.forward.is_empty());
+        assert!(tab.page_cache.iter().all(|(k, _)| k.1 <= tab.history.back.len()), "nothing cached from the abandoned future");
+        // a reload replaces the page rather than caching the old copy as a history entry
+        let before = tab.page_cache.len();
+        tab.reload();
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.page_cache.len(), before);
+    }
+
+    #[test]
     fn back_only_skips_loading_between_fragments_of_the_same_document() {
         let (dir, _a, _b) = site("fragdoc");
         std::fs::write(dir.join("doc.html"), "<style>p{height:900px}</style><p id=x>one</p><p id=y>two</p>").unwrap();
@@ -1540,9 +1671,9 @@ mod tests {
         assert!(deliver(&mut tab, &rx));
         assert_eq!(tab.history.back.last(), Some(&with_x));
         tab.go_back();
-        assert!(tab.is_loading(), "a real load, not a same-document move");
-        assert!(deliver(&mut tab, &rx));
+        // (not a same-document move: the page held for doc#x is swapped back in, a different document)
         assert_eq!(tab.page.url, with_x);
+        assert_eq!(tab.frag_back, 0);
         // fragment clicks on one document still walk without loading
         tab.follow("#y");
         tab.go_back();
@@ -1555,7 +1686,8 @@ mod tests {
         tab.open(doc.clone());
         assert!(deliver(&mut tab, &rx));
         tab.go_back();
-        assert!(tab.is_loading());
+        assert!(!tab.is_loading());
+        assert_eq!(tab.frag_back, 0, "no same-document walking after a fresh load");
     }
 
     #[test]
@@ -1647,15 +1779,11 @@ mod tests {
         assert!(deliver(&mut tab, &rx));
         tab.scroll = 900.0;
         tab.go_back();
-        assert!(deliver(&mut tab, &rx));
         assert_eq!((tab.page.url.clone(), tab.scroll), (b.clone(), 55.0));
         tab.go_back();
-        assert!(deliver(&mut tab, &rx));
         assert_eq!((tab.page.url.clone(), tab.scroll), (long.clone(), 100.0), "the first visit's position, not the second's");
         tab.go_forward();
-        assert!(deliver(&mut tab, &rx));
         tab.go_forward();
-        assert!(deliver(&mut tab, &rx));
         assert_eq!(tab.scroll, 900.0);
         // lots of fragment visits on one page: the recent ones all still come back right
         for i in 0..250 {

@@ -991,7 +991,18 @@ impl Interp {
         Interp::set_prop(&ev, "stopPropagation", stop);
         let event_value = Value::Obj(ev.clone());
         'levels: for node in chain {
-            let handlers: Vec<Value> = self.listeners.iter().filter(|l| l.target == node && l.event == event).map(|l| l.handler.clone()).collect();
+            let mut handlers: Vec<Value> = self.listeners.iter().filter(|l| l.target == node && l.event == event).map(|l| l.handler.clone()).collect();
+            if node == DOCUMENT {
+                // `document.onclick = fn` and `window.onload = fn`: plain properties of those objects
+                let window = self.global.borrow().vars.get("window").map(|b| b.value.clone());
+                for holder in [Some(self.document.clone()), window].into_iter().flatten() {
+                    if let Value::Obj(o) = holder {
+                        if let Some(h) = o.borrow().props.get(&format!("on{event}")).filter(|h| h.is_callable()) {
+                            handlers.push(h.clone());
+                        }
+                    }
+                }
+            }
             let this = if node == DOCUMENT { self.document.clone() } else { wrap(self, node) };
             Interp::set_prop(&ev, "currentTarget", this.clone());
             for h in handlers {

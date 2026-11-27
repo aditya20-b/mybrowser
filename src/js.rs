@@ -3286,6 +3286,16 @@ mod tests {
     }
 
     #[test]
+    fn window_and_document_event_properties_fire() {
+        let (log, _) = page(
+            "<body><p id=a>x</p></body>",
+            &["window.onload = function () { console.log('load') }; document.onclick = function (e) { console.log('click ' + e.type) };
+               document.getElementById('a').click(); document.getElementById('a').click()"],
+        );
+        assert_eq!(log, "click click\nclick click\nload");
+    }
+
+    #[test]
     fn element_style_reads_and_writes_the_style_attribute() {
         let (log, body) = page(
             "<body><p id=a style='color: red; margin: 0'>x</p></body>",

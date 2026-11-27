@@ -53,7 +53,9 @@ pub struct Fetched {
     pub body: Vec<u8>,
 }
 
-const ACCEPT: &str = "text/html,application/xhtml+xml,text/css,image/png,*/*;q=0.8";
+/// What we say we accept: pages and styles, and the image formats we can decode (so a
+/// server that picks a format by `Accept` sends WebP rather than something we can't show).
+const ACCEPT: &str = "text/html,application/xhtml+xml,text/css,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.8";
 
 /// Load a top-level document (what the user navigated to).
 pub fn fetch(url: &Url) -> Result<Fetched, String> {
@@ -117,6 +119,7 @@ fn fetch_file(url: &Url) -> Result<Fetched, String> {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
+        "webp" => "image/webp",
         "svg" => "image/svg+xml",
         "js" => "text/javascript",
         _ => sniff(&body),
@@ -252,8 +255,11 @@ pub fn sniff(body: &[u8]) -> &'static str {
     if body.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return "image/jpeg";
     }
-    if body.starts_with(b"GIF8") {
+    if body.starts_with(b"GIF87a") || body.starts_with(b"GIF89a") {
         return "image/gif";
+    }
+    if body.len() >= 12 && body.starts_with(b"RIFF") && &body[8..12] == b"WEBP" {
+        return "image/webp";
     }
     if body.starts_with(&[0xFF, 0xFE]) || body.starts_with(&[0xFE, 0xFF]) {
         return "text/plain"; // UTF-16 text
@@ -465,6 +471,17 @@ mod tests {
         h.join().unwrap();
         assert_eq!((f.status, f.content_type.as_str(), f.charset.as_deref()), (200, "text/html", Some("iso-8859-1")));
         assert_eq!(f.body, b"<p>hi</p>");
+    }
+
+    #[test]
+    fn the_accept_header_offers_the_image_formats_we_can_decode() {
+        let (port, heads, h) = serve_recording(vec![http("200 OK", "Content-Type: text/plain\r\n", "x")]);
+        fetch(&Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap()).unwrap();
+        h.join().unwrap();
+        let req = &heads.lock().unwrap()[0];
+        for kind in ["image/webp", "image/png", "image/jpeg", "image/gif"] {
+            assert!(req.contains(kind), "{kind} in {req}");
+        }
     }
 
     #[test]
@@ -711,14 +728,9 @@ mod tests {
         // same-site page -> open redirector -> another site -> back: the last hop used to look
         // same-site again and carried Strict cookies
         let page = Url::parse("http://127.0.0.1:1/page.html").unwrap();
-        let (port_b, h_b) = serve(vec![]); // placeholder so the port is reserved below
-        drop(h_b);
-        let (hop_port, hop_heads, hop) = serve_recording(vec![]);
-        drop((hop_heads, hop, port_b));
         // the real servers: A (127.0.0.1) handles seed, start, final; B (localhost) handles the middle hop
         let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
         let port_b = listener_b.local_addr().unwrap().port();
-        let _ = hop_port;
         let (port_a, heads_a, ha) = {
             // A needs to know where to send the first redirect, so bind it by hand
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -811,9 +823,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.html"), "<p>x</p>").unwrap();
         std::fs::write(dir.join("noext"), "<html>sniffed</html>").unwrap();
+        std::fs::write(dir.join("pic.webp"), b"RIFF\x04\x00\x00\x00WEBPxxxx").unwrap();
+        std::fs::write(dir.join("pic-noext"), b"RIFF\x04\x00\x00\x00WEBPxxxx").unwrap();
         let f = fetch(&Url::from_file_path(dir.join("a.html")).unwrap()).unwrap();
         assert_eq!((f.content_type.as_str(), f.body.as_slice()), ("text/html", &b"<p>x</p>"[..]));
         assert_eq!(fetch(&Url::from_file_path(dir.join("noext")).unwrap()).unwrap().content_type, "text/html");
+        assert_eq!(fetch(&Url::from_file_path(dir.join("pic.webp")).unwrap()).unwrap().content_type, "image/webp");
+        assert_eq!(fetch(&Url::from_file_path(dir.join("pic-noext")).unwrap()).unwrap().content_type, "image/webp", "sniffed");
         assert!(fetch(&Url::from_file_path(&dir).unwrap()).is_err(), "directories are not documents");
     }
 
@@ -906,6 +922,13 @@ mod tests {
     #[test]
     fn sniffing() {
         assert_eq!(sniff(b"\x89PNG\r\n\x1a\n...."), "image/png");
+        assert_eq!(sniff(b"GIF89a\x01\x00"), "image/gif");
+        assert_eq!(sniff(b"GIF87a\x01\x00"), "image/gif");
+        // "GIF8" alone isn't a GIF header, so it is not an image (and not binary either)
+        assert_eq!(sniff(b"GIF8 is a good name"), "text/plain");
+        assert_eq!(sniff(b"RIFF\x24\x00\x00\x00WEBPVP8 "), "image/webp");
+        assert_eq!(sniff(b"RIFF\x24\x00\x00\x00WAVEfmt "), "application/octet-stream", "other RIFF files");
+        assert_eq!(sniff(b"RIFF"), "text/plain", "too short to be anything");
         assert_eq!(sniff(b"  \n<!doctype html>"), "text/html");
         assert_eq!(sniff(b"<p>hi"), "text/html");
         assert_eq!(sniff(b"just words"), "text/plain");

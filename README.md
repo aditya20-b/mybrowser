@@ -50,7 +50,7 @@ One heads-up: fonts are loaded from the macOS system font folder (see `src/fonts
 
 ## What it can do
 
-**Networking.** It loads `http://` and `https://` pages (TLS through rustls, gzip, timeouts, a size limit), as well as local files and `data:` URLs. It sends `GET` requests and form `POST`s. Redirects are followed by hand so cookies carry across each hop and a redirect can never lead to a `file:` or `data:` URL; after a `POST`, 301/302/303 redirects are followed with a `GET` and 307/308 repeat the `POST` (never from https down to http), like in other browsers. Stylesheets and images are fetched in parallel by a small worker pool with a deadline. It honours `<base href>` for links, form actions, images and stylesheets, decodes UTF-8, UTF-16, Latin-1 and Windows-1252 text, and shows readable pages for plain text, images and errors (including HTTP 404s with their bodies). A web page can't load local files or send you to one.
+**Networking.** It loads `http://` and `https://` pages (TLS through rustls, gzip, timeouts, a size limit), as well as local files and `data:` URLs. It sends `GET` requests and form `POST`s. Redirects are followed by hand so cookies carry across each hop and a redirect can never lead to a `file:` or `data:` URL; after a `POST`, 301/302/303 redirects are followed with a `GET` and 307/308 repeat the `POST` (never from https down to http), like in other browsers. Stylesheets and images are fetched in parallel by a small worker pool with a deadline, and the `Accept` header lists the image formats it can decode. It honours `<base href>` for links, form actions, images and stylesheets, decodes UTF-8, UTF-16, Latin-1 and Windows-1252 text, and shows readable pages for plain text, images and errors (including HTTP 404s with their bodies). A web page can't load local files or send you to one.
 
 **Cookies and privacy.** One in-memory cookie jar is shared by every request and never written to disk. Beyond the usual host, path and expiry rules it refuses a `Domain` that is a public suffix (so `Domain=co.uk` can't make a supercookie), refuses `Secure` cookies from plain http, never sends them over it and doesn't let a plain-http response overwrite one, enforces the `__Secure-` and `__Host-` prefixes, and caps cookie size and count. When a site goes over its limit it loses its own oldest cookies, never another site's. `SameSite` works the way browsers now do it: cookies without the attribute count as `Lax`, so a form on another site can't POST with your login cookie (no CSRF), `Strict` cookies never leave their site (even if a redirect chain leaves the site and comes back), and `SameSite=None` needs `Secure`. Images and stylesheets from a different site than the page get no cookies at all, in either direction, so a tracking pixel can't recognise you. No `Referer` is sent.
 
@@ -60,11 +60,11 @@ One heads-up: fonts are loaded from the macOS system font folder (see `src/fonts
 
 **HTML.** Entities, void tags, messy markup (unclosed `<p>` and `<li>`, misnested tags, stray end tags, implied table rows and cells), and a synthesized `<head>` and `<body>` when a page leaves them out. The parser runs in linear time, even on hostile input.
 
-**CSS.** `<style>` blocks, linked stylesheets and inline styles. Selectors: tag, class, ID, `*`, attribute selectors (`[href]`, `[type=text]`, `^=`, `$=`, `*=`, `~=`, `|=`, and the `i`/`s` flags; values of HTML keyword attributes like `type` and `lang` ignore case, as in browsers), `:first-child`, `:last-child`, `:only-child`, `:nth-child()` and its `last`/`of-type` relatives, `:link`, `:root` and `:not()`, with descendant, `>`, `+` and `~` combinators. Selectors that need state the browser doesn't keep (`:hover`, `:focus`, `:visited`) or pseudo-elements (`::before`) are dropped rather than misapplied. Specificity, source order, `!important`, origin (author rules beat the built-in stylesheet), inheritance, and `inherit`/`initial`/`unset`. Most of the box model: width, max-width, height, padding, borders, auto margins, `box-sizing`, and margin collapsing including the awkward cases. Colors in hex, `rgb()`, `hsl()` and by name; the `font` and `border` shorthands.
+**CSS.** `<style>` blocks, linked stylesheets and inline styles. Selectors: tag, class, ID, `*`, attribute selectors (`[href]`, `[type=text]`, `^=`, `$=`, `*=`, `~=`, `|=`, and the `i`/`s` flags; values of HTML keyword attributes like `type` and `lang` ignore case, as in browsers), `:first-child`, `:last-child`, `:only-child`, `:nth-child()` and its `last`/`of-type` relatives, `:link`, `:root` and `:not()`, with descendant, `>`, `+` and `~` combinators. Selectors that need state the browser doesn't keep (`:hover`, `:focus`, `:visited`) or pseudo-elements (`::before`) are dropped rather than misapplied. Specificity, source order, `!important`, origin (author rules beat the built-in stylesheet), inheritance, and `inherit`/`initial`/`unset`. Most of the box model: width, max-width, height, padding, borders, auto margins, `box-sizing`, and margin collapsing including the awkward cases. Colors in hex, `rgb()`, `hsl()` and by name; the `font` and `border` shorthands. The `hidden` attribute hides an element.
 
 **Layout.** Block and inline flow, lists, `<pre>`, and **tables**: column widths from min and max content, percentage and fixed widths, `colspan` and `rowspan`, captions, row and cell backgrounds that stretch to the row, vertical alignment, nested tables, and the legacy attributes older pages rely on (`border`, `cellpadding`, `cellspacing`, `bgcolor`, `align`, `valign`, `<font>`).
 
-**Text and images.** Text wraps using real glyph widths with alignment, bold, italic, monospace, underlines, highlights and clickable links. Characters missing from the main fonts (arrows, CJK) fall back to a wide-coverage font. PNG, JPEG (including CMYK) and GIF images flow inline with the text, scaled with bilinear filtering, with alt text as the fallback. The format is recognised from the bytes (a JPEG named `.png` still works), a GIF shows its first frame, and every decoder checks the size a file claims before allocating, so a tiny file can't demand gigabytes.
+**Text and images.** Text wraps using real glyph widths with alignment, bold, italic, monospace, underlines, highlights and clickable links. Characters missing from the main fonts (arrows, CJK) fall back to a wide-coverage font. PNG, JPEG (including CMYK), GIF and WebP (lossy, lossless and with transparency) images flow inline with the text, scaled with bilinear filtering, with alt text as the fallback. The format is recognised from the bytes (a JPEG named `.png` still works), a GIF or an animated WebP shows its first frame, and every decoder checks the size a file claims before allocating, so a tiny file can't demand gigabytes.
 
 ## How it works
 
@@ -84,7 +84,7 @@ URL -> fetch -> HTML -> DOM --\
 | Styles | `src/style.rs` | Walks the DOM once, collects every matching declaration, sorts by importance, origin, specificity and order, and fills in a typed `Style` for each node. Legacy presentational attributes act as very low-priority rules. |
 | Forms | `src/forms.rs` | Pure logic: which elements are controls, their typed or chosen values, Tab order, and turning a submitted form into a request. |
 | Layout | `src/layout.rs` | Stacks blocks, collapses margins, breaks text into lines, sizes and positions table cells and form controls. The output is a flat list of "draw this rect" and "draw this text" commands, plus where every `id` landed. |
-| Painting | `src/paint.rs`, `src/fonts.rs`, `src/images.rs` | Fills rectangles into a `u32` buffer, blends glyph bitmaps and scaled images on top; also draws the toolbar, tab strip and find overlay. `images.rs` decodes PNG, JPEG and GIF. |
+| Painting | `src/paint.rs`, `src/fonts.rs`, `src/images.rs` | Fills rectangles into a `u32` buffer, blends glyph bitmaps and scaled images on top; also draws the toolbar, tab strip and find overlay. `images.rs` decodes PNG, JPEG, GIF and WebP. |
 | Browser | `src/page.rs`, `src/tab.rs`, `src/tabbar.rs`, `src/chrome.rs`, `src/find.rs`, `src/main.rs` | A page ties the stages together; a tab owns a page, its history and its loads; the tab strip, toolbar and find state are pure logic and geometry; `main` runs the window and routes input. |
 
 A few choices worth explaining:
@@ -110,7 +110,7 @@ The engine itself is hand-written. I only used crates for the parts that talk to
 - `fontdue` to turn a TrueType glyph into a bitmap and report its metrics
 - `ureq` (with rustls) for HTTP and TLS, and `url` for parsing and resolving URLs
 - `cookie_store` and `cookie` to parse and match cookies, and `psl` (the public suffix list) to know which domains cookies must never be shared across
-- `png`, `jpeg-decoder` and `gif` to decode images (`png` also saves screenshots)
+- `png`, `jpeg-decoder`, `gif` and `image-webp` to decode images (`png` also saves screenshots)
 
 ## Tests
 
@@ -118,7 +118,7 @@ The engine itself is hand-written. I only used crates for the parts that talk to
 cargo test
 ```
 
-There are about three hundred tests. They cover the parsers, selector matching, the cascade, layout, tables and form controls, address editing, tabs, in-page anchors, find in page, image decoding, URL handling, history, form submission, the cookie rules, and networking (against throwaway local HTTP servers, so no internet is needed). Many are regression tests for real bugs found by throwing nasty input at the engine and by independent review passes: quadratic-time parsing, exponential selector matching, crashes on odd Unicode and huge values, unbounded memory use, history desyncs, and so on. The tests load system fonts, so they also need macOS for now.
+There are about three hundred tests. They cover the parsers, selector matching, the cascade, layout, tables and form controls, address editing, tabs, in-page anchors, find in page, image decoding, URL handling, history, form submission, the cookie rules, and networking (against throwaway local HTTP servers, so no internet is needed). Many are regression tests for real bugs found by throwing nasty input at the engine and by independent review passes: quadratic-time parsing, exponential selector matching, crashes on odd Unicode and huge values, unbounded memory use, history desyncs, and so on. The tests load system fonts, so they also need macOS for now. A few tests check that something runs fast; they can fail on a heavily loaded machine and pass when run alone.
 
 ## What's missing
 
@@ -132,7 +132,7 @@ The honest list, roughly by how much it matters for a real browser:
 - **Cookies.** Nothing persists between runs, and there's no UI to see or clear them.
 - **Browser features.** No caching, bookmarks or downloads. Clicking a `#fragment` link doesn't add a history entry, so Back skips over it. A `<base>` tag inside a `<template>` is honoured, and a bad `href` on the first `<base>` doesn't stop the search for the next one.
 - **Find and anchors.** Placeholder text in empty fields (and the dots of a password field) is found by search; browsers skip them. An empty `<a name=x></a>` in the middle of a paragraph points at the top of that paragraph rather than its own line.
-- **Media.** Animated GIFs show their first frame only; no WebP or SVG. No fonts from the web (`@font-face`).
+- **Media.** Animated GIFs and WebPs show their first frame only; no SVG or AVIF. No fonts from the web (`@font-face`). The error page for an image it can't decode still lists only "PNG, JPEG and GIF" as supported.
 - **Text.** No shaping, so no kerning, ligatures or complex scripts, and no right-to-left text.
 - **Platform.** macOS fonts only, for now.
 

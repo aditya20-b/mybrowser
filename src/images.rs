@@ -1,6 +1,7 @@
-//! Image decoding: PNG (`png` crate), JPEG (`jpeg-decoder`) and GIF (`gif`, the
-//! first frame). The format is sniffed from the bytes, never from a file name or
-//! Content-Type, and every decoder checks the claimed size before allocating.
+//! Image decoding: PNG (`png` crate), JPEG (`jpeg-decoder`), GIF (`gif`, the first
+//! frame) and WebP (`image-webp`, lossy and lossless, the first frame of an animation).
+//! The format is sniffed from the bytes, never from a file name or Content-Type, and
+//! every decoder checks the claimed size before allocating.
 use std::io::Cursor;
 use std::num::NonZeroU64;
 
@@ -42,6 +43,8 @@ pub fn decode(bytes: &[u8]) -> Option<Image> {
         decode_jpeg(bytes)
     } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
         decode_gif(bytes)
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        decode_webp(bytes)
     } else {
         None
     }
@@ -161,6 +164,35 @@ fn decode_gif(bytes: &[u8]) -> Option<Image> {
     Some(Image { w, h, rgba })
 }
 
+/// A WebP image, lossy or lossless, with or without transparency. An animated one shows
+/// its first frame. The size is checked from the header before any pixel buffer exists.
+fn decode_webp(bytes: &[u8]) -> Option<Image> {
+    let mut decoder = image_webp::WebPDecoder::new(Cursor::new(bytes)).ok()?;
+    let (w, h) = decoder.dimensions();
+    if !size_ok(w, h) {
+        return None;
+    }
+    let mut buf = vec![0u8; decoder.output_buffer_size()?];
+    if decoder.is_animated() {
+        decoder.read_frame(&mut buf).ok()?;
+    } else {
+        decoder.read_image(&mut buf).ok()?;
+    }
+    let n = (w * h) as usize;
+    let rgba = if buf.len() == n * 4 {
+        buf
+    } else if buf.len() == n * 3 {
+        let mut rgba = Vec::with_capacity(n * 4);
+        for px in buf.chunks_exact(3) {
+            rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+        }
+        rgba
+    } else {
+        return None;
+    };
+    Some(Image { w, h, rgba })
+}
+
 impl Image {
     /// Bilinear sample at continuous pixel coordinates (texel centres at +0.5).
     pub fn sample(&self, fx: f32, fy: f32) -> [f32; 4] {
@@ -203,6 +235,13 @@ mod tests {
         out
     }
 
+    /// A lossless WebP.
+    fn webp(w: u32, h: u32, color: image_webp::ColorType, data: &[u8]) -> Vec<u8> {
+        let mut out = vec![];
+        image_webp::WebPEncoder::new(&mut out).encode(data, w, h, color).unwrap();
+        out
+    }
+
     /// A GIF with a 4x3 logical screen, a 2-colour palette and one frame at (`left`, `top`).
     fn gif_bytes(frame: (u16, u16, u16, u16), indices: &[u8]) -> Vec<u8> {
         let mut out = vec![];
@@ -237,6 +276,44 @@ mod tests {
         assert_eq!(gray.rgba, [9, 9, 9, 255, 200, 200, 200, 255]);
         let ga = decode(&encode(1, 1, png::ColorType::GrayscaleAlpha, &[7, 128])).unwrap();
         assert_eq!(ga.rgba, [7, 7, 7, 128]);
+    }
+
+    #[test]
+    fn decodes_webp_with_and_without_transparency() {
+        // lossless, so the pixels come back exactly
+        let px = [10, 20, 30, 255, 200, 100, 50, 128, 0, 0, 0, 0, 255, 255, 255, 255];
+        let img = decode(&webp(2, 2, image_webp::ColorType::Rgba8, &px)).expect("a WebP decodes");
+        assert_eq!((img.w, img.h), (2, 2));
+        assert_eq!(pixel(&img, 0, 0), [10, 20, 30, 255]);
+        assert_eq!(pixel(&img, 1, 0)[3], 128, "the alpha channel survives");
+        assert_eq!(pixel(&img, 0, 1)[3], 0);
+        assert_eq!(pixel(&img, 1, 1), [255, 255, 255, 255]);
+        // no alpha channel: opaque
+        let rgb = decode(&webp(3, 1, image_webp::ColorType::Rgb8, &[1, 2, 3, 4, 5, 6, 7, 8, 9])).unwrap();
+        assert_eq!(rgb.rgba, [1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255]);
+        // grayscale input comes back as grey
+        let gray = decode(&webp(2, 1, image_webp::ColorType::L8, &[9, 200])).unwrap();
+        assert_eq!((pixel(&gray, 0, 0), pixel(&gray, 1, 0)), ([9, 9, 9, 255], [200, 200, 200, 255]));
+    }
+
+    #[test]
+    fn webp_damage_and_oversize_never_panic_or_allocate_gigabytes() {
+        let good = webp(8, 8, image_webp::ColorType::Rgba8, &[77u8; 8 * 8 * 4]);
+        for cut in [0, 4, 11, 12, 20, good.len() / 2, good.len() - 1] {
+            let _ = decode(&good[..cut]);
+        }
+        assert!(decode(&good[..good.len() / 2]).is_none());
+        // a header claiming a huge canvas: patch the VP8L width/height field of a lossless file
+        let mut huge = good.clone();
+        let sig = huge.windows(5).position(|w| w == [0x2f, 0x07, 0x00, 0xc0, 0x01] || w[0] == 0x2f).unwrap();
+        huge[sig + 1..sig + 5].copy_from_slice(&[0xff, 0xff, 0xff, 0x0f]);
+        assert!(decode(&huge).is_none(), "16384 x 16384 or more is refused or fails to decode");
+        // random bytes behind a valid RIFF/WEBP header
+        for tail in [&b"VP8 \x04\x00\x00\x00abcd"[..], b"VP8L\x01\x00\x00\x00\x2f", b"VP8X\x0a\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff", b"junk"] {
+            let mut file = b"RIFF\x00\x00\x00\x00WEBP".to_vec();
+            file.extend_from_slice(tail);
+            let _ = decode(&file);
+        }
     }
 
     #[test]
@@ -309,7 +386,9 @@ mod tests {
     #[test]
     fn rejects_garbage_truncated_and_unknown_formats() {
         assert!(decode(b"").is_none());
-        assert!(decode(b"RIFF....WEBPVP8 ").is_none(), "formats we can't decode");
+        assert!(decode(b"RIFF....WEBPVP8 ").is_none(), "a WebP header with nothing behind it");
+        assert!(decode(b"RIFF....WAVEfmt ").is_none(), "other RIFF files");
+        assert!(decode(b"BM\x00\x00").is_none(), "formats we can't decode");
         assert!(decode(b"\x89PNG\r\n\x1a\nnot really").is_none());
         assert!(decode(b"\xFF\xD8\xFFnot really").is_none());
         assert!(decode(b"GIF89a not really").is_none());
@@ -342,6 +421,10 @@ mod tests {
         let mut huge_gif = gif_bytes((0, 0, 4, 3), &[0; 12]);
         huge_gif[6..10].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // logical screen width and height
         assert!(decode(&huge_gif).is_none());
+        // and for WebP: a flat 5000 x 4000 image is tiny once compressed
+        let big_webp = webp(5000, 4000, image_webp::ColorType::L8, &vec![0u8; 5000 * 4000]);
+        assert!(big_webp.len() < 1_000_000, "{} bytes", big_webp.len());
+        assert!(decode(&big_webp).is_none());
     }
 
     #[test]

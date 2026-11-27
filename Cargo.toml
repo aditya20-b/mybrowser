@@ -9,6 +9,7 @@ cookie = { version = "0.18", default-features = false }
 cookie_store = { version = "0.22", default-features = false }
 fontdue = "0.9.5"
 gif = "0.13"
+image-webp = "0.2"
 jpeg-decoder = "0.3"
 png = "0.18.1"
 psl = "2"

@@ -3393,6 +3393,36 @@ mod tests {
     }
 
     #[test]
+    fn classes_work_as_constructors_with_inheritance() {
+        assert_eq!(
+            run("class Animal {
+                   constructor(name) { this.name = name }
+                   speak() { return this.name + ' makes a sound' }
+                   static create(n) { return new Animal(n) }
+                   describe() { return 'animal ' + this.name }
+                 }
+                 class Dog extends Animal {
+                   constructor(name, tricks) { super(name); this.tricks = tricks }
+                   speak() { return super.speak() + ' (woof)' }
+                   describe() { return 'dog/' + super.describe() }
+                 }
+                 class Puppy extends Dog {}
+                 var d = new Dog('Rex', 2), p = new Puppy('Bit', 1), a = Animal.create('Cat');
+                 console.log(d.speak(), d.tricks, d instanceof Dog, d instanceof Animal, a instanceof Dog);
+                 console.log(p.speak(), p.tricks, p.describe(), p.constructor === Puppy);
+                 console.log(a.speak(), typeof Animal, Animal.create === Animal.create);
+                 var Anon = class { hi() { return 'hi' } }; console.log(new Anon().hi());
+                 var Named = class Inner extends Animal { hi() { return 'inner ' + this.name } }; console.log(new Named('N').hi());
+                 var f = () => { class Local { v() { return 7 } } return new Local().v() }; console.log(f());"),
+            "Rex makes a sound (woof) 2 true true false\nBit makes a sound (woof) 1 dog/animal Bit true\nCat makes a sound function true\nhi\ninner N\n7"
+        );
+        // what isn't supported is a clear error, not a silent misparse
+        assert!(run("class A { get x() { return 1 } }").starts_with("ERR"), "accessors");
+        assert!(run("class A { x = 1 }").contains("not supported"));
+        assert_eq!(run("class A { 'quoted name'() { return 1 } } console.log(new A()['quoted name']())"), "1");
+    }
+
+    #[test]
     fn finally_waits_for_what_its_callback_returns() {
         let (log, _) = page(
             "<body></body>",

@@ -687,6 +687,12 @@ impl Parser {
                 let name = self.ident()?;
                 return Ok(Stmt::Function(Rc::new(self.function_rest(Some(name))?)));
             }
+            "class" => {
+                self.advance();
+                let name = self.ident()?;
+                let class = self.class_rest(Some(name.clone()))?;
+                return Ok(Stmt::Decl(DeclKind::Let, vec![(name, Some(class))]));
+            }
             "return" => {
                 self.advance();
                 // `return` followed by a line break returns nothing
@@ -1165,6 +1171,104 @@ impl Parser {
         }
     }
 
+    /// After `class` and its name: `extends X { constructor() {...} method() {...} static s() {...} }`.
+    /// A class is written out as what it stands for in older JavaScript: a function that
+    /// is the constructor, with the methods assigned to its `prototype` (and the statics to the
+    /// function), inside a function that is given the parent class as `__super`. `super(...)` and
+    /// `super.m(...)` become calls through `__super`. Accessors (`get`/`set`), class fields and
+    /// computed method names aren't supported.
+    fn class_rest(&mut self, name: Option<String>) -> PResult<Expr> {
+        let cname = name.unwrap_or_else(|| "__class".to_string());
+        let parent = if self.eat_word("extends") { Some(self.assignment()?) } else { None };
+        self.expect_punct("{")?;
+        let id = |s: &str| Expr::Ident(s.to_string());
+        let dot = |e: Expr, n: &str| Expr::Dot(Box::new(e), n.to_string());
+        let mut constructor: Option<Func> = None;
+        let mut body: Vec<Stmt> = vec![];
+        let mut members: Vec<Stmt> = vec![];
+        while !self.is_punct("}") {
+            if self.eat_punct(";") {
+                continue;
+            }
+            let is_static = self.is_word("static") && !matches!(self.peek_at(1), Tok::Punct("("));
+            if is_static {
+                self.advance();
+            }
+            let key = match self.advance() {
+                Tok::Ident(n) => n,
+                Tok::Str(s) => s,
+                Tok::Num(n) => n.to_string(),
+                other => {
+                    self.back(&other);
+                    return self.err("expected a method name");
+                }
+            };
+            if !self.is_punct("(") {
+                return self.err(&format!("'{key}': accessors and class fields are not supported"));
+            }
+            let func = self.function_rest(None)?;
+            if key == "constructor" && !is_static {
+                constructor = Some(Func { name: Some(cname.clone()), ..func });
+                continue;
+            }
+            let holder = if is_static { id(&cname) } else { dot(id(&cname), "prototype") };
+            let target = if key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') && !key.starts_with(|c: char| c.is_ascii_digit()) {
+                dot(holder, &key)
+            } else {
+                Expr::Index(Box::new(holder), Box::new(Expr::Str(key)))
+            };
+            members.push(Stmt::Expr(Expr::Assign("=", Box::new(target), Box::new(Expr::Function(Rc::new(func))))));
+        }
+        self.expect_punct("}")?;
+        let ctor = match constructor {
+            Some(c) => c,
+            None if parent.is_some() => Func {
+                name: Some(cname.clone()),
+                params: vec![],
+                // (the default constructor of a derived class passes its arguments on)
+                body: vec![Stmt::Expr(Expr::Call(Box::new(dot(id("__super"), "apply")), vec![Expr::This, id("arguments")]))],
+                arrow: false,
+                uses_arguments: true,
+            },
+            None => Func { name: Some(cname.clone()), params: vec![], body: vec![], arrow: false, uses_arguments: false },
+        };
+        body.push(Stmt::Function(Rc::new(ctor)));
+        if parent.is_some() {
+            let proto = dot(id(&cname), "prototype");
+            let made = Expr::Call(Box::new(dot(id("Object"), "create")), vec![dot(id("__super"), "prototype")]);
+            body.push(Stmt::Expr(Expr::Assign("=", Box::new(proto), Box::new(made))));
+            let back = Expr::Assign("=", Box::new(dot(dot(id(&cname), "prototype"), "constructor")), Box::new(id(&cname)));
+            body.push(Stmt::Expr(back));
+        }
+        body.extend(members);
+        body.push(Stmt::Return(Some(id(&cname))));
+        let wrapper = Func { name: None, params: vec!["__super".to_string()], body, arrow: false, uses_arguments: false };
+        Ok(Expr::Call(Box::new(Expr::Function(Rc::new(wrapper))), vec![parent.unwrap_or(Expr::Null)]))
+    }
+
+    /// `super(...)` and `super.name(...)` / `super.name`, as calls through the `__super` of the
+    /// class being written out (see `class_rest`).
+    fn super_expression(&mut self) -> PResult<Expr> {
+        let id = |s: &str| Expr::Ident(s.to_string());
+        let dot = |e: Expr, n: &str| Expr::Dot(Box::new(e), n.to_string());
+        if self.is_punct("(") {
+            let mut args = vec![Expr::This];
+            args.extend(self.arguments()?);
+            return Ok(Expr::Call(Box::new(dot(id("__super"), "call")), args));
+        }
+        if self.eat_punct(".") {
+            let name = self.property_name()?;
+            let member = dot(dot(id("__super"), "prototype"), &name);
+            if self.is_punct("(") {
+                let mut args = vec![Expr::This];
+                args.extend(self.arguments()?);
+                return Ok(Expr::Call(Box::new(dot(member, "call")), args));
+            }
+            return Ok(member);
+        }
+        self.err("'super' must be followed by '(' or '.'")
+    }
+
     /// A property name after `.`: any word, reserved ones included.
     fn property_name(&mut self) -> PResult<String> {
         match self.advance() {
@@ -1189,6 +1293,17 @@ impl Parser {
                 "false" => Ok(Expr::Bool(false)),
                 "null" => Ok(Expr::Null),
                 "this" => Ok(Expr::This),
+                "super" => self.super_expression(),
+                "class" => {
+                    let name = match self.peek().clone() {
+                        Tok::Ident(n) if n != "extends" && !RESERVED.contains(&n.as_str()) => {
+                            self.advance();
+                            Some(n)
+                        }
+                        _ => None,
+                    };
+                    self.class_rest(name)
+                }
                 "function" => {
                     let name = match self.peek().clone() {
                         Tok::Ident(n) if !RESERVED.contains(&n.as_str()) => {

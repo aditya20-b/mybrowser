@@ -64,6 +64,8 @@ pub enum Kind {
     Array(Vec<Value>),
     Closure(Rc<Closure>),
     Native(NativeFn),
+    /// `f.bind(thisArg, ...args)`: the function, the `this` it is called with, and leading arguments.
+    Bound(Box<(Value, Value, Vec<Value>)>),
     Error,
 }
 
@@ -72,6 +74,18 @@ pub struct Object {
     props: HashMap<String, Value>,
     order: Vec<String>,
     proto: Option<ObjRef>,
+}
+
+/// What an assignment writes to: a variable, or a property of an object (already evaluated).
+enum Place {
+    Var(String),
+    Member(Value, String),
+}
+
+/// An array index written the canonical way (`"3"`, not `"03"` or `"+3"`).
+fn array_index(name: &str) -> Option<usize> {
+    let n: usize = name.parse().ok()?;
+    (n.to_string() == name).then_some(n)
 }
 
 struct Binding {
@@ -137,9 +151,8 @@ fn number_to_string(n: f64) -> String {
             _ => s,
         };
     }
-    if n.fract() == 0.0 {
-        return format!("{}", n as i128);
-    }
+    // (Rust writes the shortest digits that read back as the same number, padded with zeros:
+    // 2**64 is 18446744073709552000, as in JavaScript)
     format!("{n}")
 }
 
@@ -148,8 +161,14 @@ fn string_to_number(s: &str) -> f64 {
     if t.is_empty() {
         return 0.0;
     }
-    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        return i64::from_str_radix(h, 16).map_or(f64::NAN, |v| v as f64);
+    for (prefixes, radix) in [(["0x", "0X"], 16u32), (["0b", "0B"], 2), (["0o", "0O"], 8)] {
+        if let Some(digits) = t.strip_prefix(prefixes[0]).or_else(|| t.strip_prefix(prefixes[1])) {
+            if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+                return f64::NAN;
+            }
+            // (folded as floats: a hex number too big for an integer is just a big number)
+            return digits.chars().fold(0.0, |acc, c| acc * radix as f64 + c.to_digit(radix).unwrap_or(0) as f64);
+        }
     }
     match t {
         "Infinity" | "+Infinity" => return f64::INFINITY,
@@ -161,6 +180,43 @@ fn string_to_number(s: &str) -> f64 {
         return f64::NAN;
     }
     t.parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// `parseFloat`: the longest prefix that reads as a decimal number (`1.5e3px` is 1500).
+fn parse_float_prefix(s: &str) -> f64 {
+    let t = s.trim_start();
+    let bytes = t.as_bytes();
+    let mut i = 0;
+    if i < bytes.len() && matches!(bytes[i], b'+' | b'-') {
+        i += 1;
+    }
+    if t[i..].starts_with("Infinity") {
+        return if bytes.first() == Some(&b'-') { f64::NEG_INFINITY } else { f64::INFINITY };
+    }
+    let digits = |from: usize| bytes[from..].iter().take_while(|b| b.is_ascii_digit()).count();
+    let int = digits(i);
+    i += int;
+    let mut frac = 0;
+    if i < bytes.len() && bytes[i] == b'.' {
+        frac = digits(i + 1);
+        if int > 0 || frac > 0 {
+            i += 1 + frac;
+        }
+    }
+    if int == 0 && frac == 0 {
+        return f64::NAN;
+    }
+    if i < bytes.len() && matches!(bytes[i], b'e' | b'E') {
+        let mut j = i + 1;
+        if j < bytes.len() && matches!(bytes[j], b'+' | b'-') {
+            j += 1;
+        }
+        let exp = digits(j);
+        if exp > 0 {
+            i = j + exp;
+        }
+    }
+    t[..i].parse::<f64>().unwrap_or(f64::NAN)
 }
 
 fn to_int32(n: f64) -> i32 {
@@ -189,7 +245,7 @@ impl Value {
             Value::Num(_) => "number",
             Value::Str(_) => "string",
             Value::Obj(o) => match o.borrow().kind {
-                Kind::Closure(_) | Kind::Native(_) => "function",
+                Kind::Closure(_) | Kind::Native(_) | Kind::Bound(_) => "function",
                 _ => "object",
             },
         }
@@ -288,9 +344,27 @@ impl Interp {
         Ok(last)
     }
 
+    /// An error object, or anything whose prototype chain includes `Error.prototype`
+    /// (the pre-class way to write an error subclass).
+    fn is_error_like(&self, o: &ObjRef) -> bool {
+        let mut cur = Some(o.clone());
+        let mut hops = 0;
+        while let Some(c) = cur {
+            if matches!(c.borrow().kind, Kind::Error) || Rc::ptr_eq(&c, &self.error_proto) {
+                return true;
+            }
+            hops += 1;
+            if hops > 1000 {
+                return false;
+            }
+            cur = c.borrow().proto.clone();
+        }
+        false
+    }
+
     fn describe_error(&mut self, v: &Value) -> String {
         if let Value::Obj(o) = v {
-            if matches!(o.borrow().kind, Kind::Error) {
+            if self.is_error_like(o) {
                 let name = self.get_member(v, "name").ok().map(|n| self.to_string_lossy(&n)).unwrap_or_default();
                 let message = self.get_member(v, "message").ok().map(|n| self.to_string_lossy(&n)).unwrap_or_default();
                 return if message.is_empty() { name } else { format!("{name}: {message}") };
@@ -564,6 +638,10 @@ impl Interp {
             Stmt::Switch(subject, cases) => {
                 let value = self.eval(subject, scope, this)?;
                 let inner = new_scope(Some(scope.clone()));
+                // function declarations inside the cases exist from the start of the switch
+                for (_, body) in cases {
+                    self.hoist_functions(body, &inner);
+                }
                 let mut matched = None;
                 for (i, (test, _)) in cases.iter().enumerate() {
                     if let Some(t) = test {
@@ -692,7 +770,12 @@ impl Interp {
                     Kind::Array(a) => (0..a.len()).map(|i| i.to_string()).collect(),
                     _ => vec![],
                 };
-                keys.extend(o.order.iter().filter(|k| !matches!(o.kind, Kind::Error) || !matches!(k.as_str(), "message" | "name")).cloned());
+                // integer-like keys come first, in ascending order; the rest in the order they were added
+                let named = o.order.iter().filter(|k| !matches!(o.kind, Kind::Error) || !matches!(k.as_str(), "message" | "name"));
+                let (mut ints, others): (Vec<&String>, Vec<&String>) = named.partition(|k| array_index(k).is_some());
+                ints.sort_by_key(|k| array_index(k));
+                keys.extend(ints.into_iter().cloned());
+                keys.extend(others.into_iter().cloned());
                 keys
             }
             Value::Str(s) => (0..s.chars().count()).map(|i| i.to_string()).collect(),
@@ -718,7 +801,7 @@ impl Interp {
                 if name == "length" {
                     return Ok(Value::Num(s.chars().count() as f64));
                 }
-                if let Ok(i) = name.parse::<usize>() {
+                if let Some(i) = array_index(name) {
                     return Ok(s.chars().nth(i).map_or(Value::Undefined, |c| str_value(&c.to_string())));
                 }
                 Ok(string_method(name).map_or(Value::Undefined, |f| self.native(f)))
@@ -739,7 +822,7 @@ impl Interp {
                             if name == "length" {
                                 return Ok(Value::Num(a.len() as f64));
                             }
-                            if let Ok(i) = name.parse::<usize>() {
+                            if let Some(i) = array_index(name) {
                                 return Ok(a.get(i).cloned().unwrap_or(Value::Undefined));
                             }
                         }
@@ -754,7 +837,7 @@ impl Interp {
                     let b = o.borrow();
                     match &b.kind {
                         Kind::Array(_) => array_method(name),
-                        Kind::Closure(_) | Kind::Native(_) => function_method(name),
+                        Kind::Closure(_) | Kind::Native(_) | Kind::Bound(_) => function_method(name),
                         _ => None,
                     }
                 };
@@ -768,6 +851,26 @@ impl Interp {
                     }
                     Interp::set_prop(o, "prototype", proto.clone());
                     return Ok(proto);
+                }
+                if name == "constructor" {
+                    // the constructor of the built-in kinds (a function's own prototype object has its own)
+                    let kind_ctor = match &o.borrow().kind {
+                        Kind::Plain => Some(self.object_ctor.clone()),
+                        Kind::Array(_) => Some(self.array_ctor.clone()),
+                        Kind::Error => match o.borrow().props.get("name") {
+                            Some(Value::Str(n)) => Some(n.to_string()).map(|n| Value::Str(Rc::from(n.as_str()))),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    return Ok(match kind_ctor {
+                        Some(Value::Str(n)) => {
+                            let global = self.global.clone();
+                            self.lookup(&global, &n).unwrap_or(Value::Undefined)
+                        }
+                        Some(v) => v,
+                        None => Value::Undefined,
+                    });
                 }
                 Ok(match name {
                     "hasOwnProperty" => self.native(obj_has_own),
@@ -784,7 +887,7 @@ impl Interp {
             Value::Obj(o) => {
                 let mut b = o.borrow_mut();
                 if let Kind::Array(a) = &mut b.kind {
-                    if let Ok(i) = name.parse::<usize>() {
+                    if let Some(i) = array_index(name) {
                         if i >= MAX_ARRAY {
                             drop(b);
                             return Err(Ctrl::Abort("array too big".into()));
@@ -910,10 +1013,12 @@ impl Interp {
         enum Target {
             Native(NativeFn),
             Closure(Rc<Closure>),
+            Bound(Value, Value, Vec<Value>),
         }
         let target = match &o.borrow().kind {
             Kind::Native(f) => Target::Native(*f),
             Kind::Closure(c) => Target::Closure(c.clone()),
+            Kind::Bound(b) => Target::Bound(b.0.clone(), b.1.clone(), b.2.clone()),
             _ => return self.throw("TypeError", "value is not a function"),
         };
         if self.depth >= MAX_CALL_DEPTH {
@@ -937,6 +1042,10 @@ impl Interp {
                 }
             }
             Target::Closure(c) => self.call_closure(&c, this, args),
+            Target::Bound(f, bound_this, mut leading) => {
+                leading.extend_from_slice(args);
+                self.call(&f, &bound_this, &leading)
+            }
         };
         self.depth -= 1;
         result
@@ -966,7 +1075,7 @@ impl Interp {
 
     fn construct(&mut self, ctor: &Value, args: &[Value]) -> Res {
         let Value::Obj(co) = ctor else { return self.throw("TypeError", "value is not a constructor") };
-        if !matches!(co.borrow().kind, Kind::Closure(_) | Kind::Native(_)) {
+        if !matches!(co.borrow().kind, Kind::Closure(_) | Kind::Native(_) | Kind::Bound(_)) {
             return self.throw("TypeError", "value is not a constructor");
         }
         let proto = self.get_member(ctor, "prototype")?;
@@ -1050,10 +1159,11 @@ impl Interp {
             }
             Expr::Unary(op, operand) => self.eval_unary(op, operand, scope, this),
             Expr::Update(op, prefix, target) => {
-                let old = self.eval(target, scope, this)?;
+                let place = self.eval_place(target, scope, this)?;
+                let old = self.read_place(&place, scope)?;
                 let n = self.to_number(&old)?;
                 let new = if *op == "++" { n + 1.0 } else { n - 1.0 };
-                self.assign_to(target, Value::Num(new), scope, this)?;
+                self.write_place(&place, Value::Num(new), scope)?;
                 Ok(Value::Num(if *prefix { new } else { n }))
             }
             Expr::Binary(op, l, r) => {
@@ -1171,7 +1281,7 @@ impl Interp {
                 self.steps += (b.order.len() / 16) as u64; // (finding the key in the order list is a scan)
                 b.order.retain(|k| k != name);
             }
-            if let (Kind::Array(a), Ok(i)) = (&mut b.kind, name.parse::<usize>()) {
+            if let (Kind::Array(a), Some(i)) = (&mut b.kind, array_index(name)) {
                 if i < a.len() {
                     a[i] = Value::Undefined;
                 }
@@ -1197,13 +1307,49 @@ impl Interp {
         }
     }
 
+    /// Work out what an assignment target refers to, once (its object and key are evaluated a
+    /// single time, before the right-hand side, as the language says).
+    fn eval_place(&mut self, target: &Expr, scope: &ScopeRef, this: &Value) -> Result<Place, Ctrl> {
+        match target {
+            Expr::Ident(name) => Ok(Place::Var(name.clone())),
+            Expr::Dot(obj, name) => Ok(Place::Member(self.eval(obj, scope, this)?, name.clone())),
+            Expr::Index(obj, index) => {
+                let o = self.eval(obj, scope, this)?;
+                let i = self.eval(index, scope, this)?;
+                let key = self.property_key(&i)?;
+                Ok(Place::Member(o, key))
+            }
+            _ => self.throw("SyntaxError", "invalid assignment target"),
+        }
+    }
+
+    fn read_place(&mut self, place: &Place, scope: &ScopeRef) -> Res {
+        match place {
+            Place::Var(name) => match name.as_str() {
+                "undefined" => Ok(Value::Undefined),
+                "NaN" => Ok(Value::Num(f64::NAN)),
+                "Infinity" => Ok(Value::Num(f64::INFINITY)),
+                _ => self.lookup(scope, name),
+            },
+            Place::Member(o, key) => self.get_member(o, key),
+        }
+    }
+
+    fn write_place(&mut self, place: &Place, value: Value, scope: &ScopeRef) -> Result<(), Ctrl> {
+        match place {
+            Place::Var(name) => self.assign_var(scope, name, value),
+            Place::Member(o, key) => self.set_member(o, key, value),
+        }
+    }
+
     fn eval_assign(&mut self, op: &str, target: &Expr, value: &Expr, scope: &ScopeRef, this: &Value) -> Res {
+        let place = self.eval_place(target, scope, this)?;
         if op == "=" {
             let v = self.eval(value, scope, this)?;
-            self.assign_to(target, v.clone(), scope, this)?;
+            self.write_place(&place, v.clone(), scope)?;
             return Ok(v);
         }
-        let old = self.eval(target, scope, this)?;
+        let old = self.read_place(&place, scope)?;
         // logical assignments only evaluate (and assign) the right side when needed
         let skip = match op {
             "&&=" => !old.truthy(),
@@ -1219,7 +1365,7 @@ impl Interp {
             "&&=" | "||=" | "??=" => right,
             _ => self.binary(&op[..op.len() - 1], &old, &right)?,
         };
-        self.assign_to(target, new.clone(), scope, this)?;
+        self.write_place(&place, new.clone(), scope)?;
         Ok(new)
     }
 
@@ -1326,7 +1472,7 @@ impl Interp {
         let fns: [(&str, NativeFn); 14] = [
             ("floor", nf(|i, _, a| math1(i, a, f64::floor))),
             ("ceil", nf(|i, _, a| math1(i, a, f64::ceil))),
-            ("round", nf(|i, _, a| math1(i, a, |x| (x + 0.5).floor()))),
+            ("round", nf(|i, _, a| math1(i, a, |x| { let f = x.floor(); if x - f >= 0.5 { f + 1.0 } else { f } }))),
             ("abs", nf(|i, _, a| math1(i, a, f64::abs))),
             ("sqrt", nf(|i, _, a| math1(i, a, f64::sqrt))),
             ("sin", nf(|i, _, a| math1(i, a, f64::sin))),
@@ -1363,6 +1509,8 @@ impl Interp {
         let json = self.new_object();
         let stringify = self.native(json_stringify);
         Interp::set_prop(&json, "stringify", stringify);
+        let parse = self.native(json_parse);
+        Interp::set_prop(&json, "parse", parse);
         Interp::declare(&g, "JSON", Value::Obj(json), true);
 
         let object = self.native(|i, _, _| Ok(Value::Obj(i.new_object())));
@@ -1373,14 +1521,68 @@ impl Interp {
             });
             Interp::set_prop(o, "keys", keys);
             Interp::set_prop(o, "prototype", Value::Obj(self.object_proto.clone()));
+            let assign = self.native(|i, _, a| {
+                let target = a.first().cloned().unwrap_or(Value::Undefined);
+                for source in a.iter().skip(1) {
+                    for k in i.own_keys(source) {
+                        let v = i.get_member(source, &k)?;
+                        i.set_member(&target, &k, v)?;
+                    }
+                }
+                Ok(target)
+            });
+            Interp::set_prop(o, "assign", assign);
+            let values = self.native(|i, _, a| {
+                let subject = a.first().cloned().unwrap_or(Value::Undefined);
+                let mut out = vec![];
+                for k in i.own_keys(&subject) {
+                    out.push(i.get_member(&subject, &k)?);
+                }
+                Ok(i.new_array(out))
+            });
+            Interp::set_prop(o, "values", values);
+            let entries = self.native(|i, _, a| {
+                let subject = a.first().cloned().unwrap_or(Value::Undefined);
+                let mut out = vec![];
+                for k in i.own_keys(&subject) {
+                    let v = i.get_member(&subject, &k)?;
+                    out.push(i.new_array(vec![str_value(&k), v]));
+                }
+                Ok(i.new_array(out))
+            });
+            Interp::set_prop(o, "entries", entries);
+            let create = self.native(|i, _, a| {
+                let obj = i.new_object();
+                if let Some(Value::Obj(p)) = a.first() {
+                    obj.borrow_mut().proto = Some(p.clone());
+                } else if matches!(a.first(), Some(Value::Null)) {
+                    obj.borrow_mut().proto = None;
+                }
+                Ok(Value::Obj(obj))
+            });
+            Interp::set_prop(o, "create", create);
         }
+        self.object_ctor = object.clone();
         Interp::declare(&g, "Object", object, true);
 
-        let array = self.native(|i, _, a| Ok(i.new_array(a.to_vec())));
+        let array = self.native(|i, _, a| {
+            // `Array(3)` is three empty slots; any other arguments are the elements
+            if let [Value::Num(n)] = a {
+                if *n >= 0.0 && n.fract() == 0.0 && *n <= MAX_ARRAY as f64 {
+                    return Ok(i.new_array(vec![Value::Undefined; *n as usize]));
+                }
+                return i.throw("RangeError", "Invalid array length");
+            }
+            Ok(i.new_array(a.to_vec()))
+        });
         if let Value::Obj(o) = &array {
             let is_array = self.native(|_, _, a| Ok(Value::Bool(matches!(a.first(), Some(Value::Obj(o)) if matches!(o.borrow().kind, Kind::Array(_))))));
             Interp::set_prop(o, "isArray", is_array);
+            // (`[] instanceof Array`, and `Array.prototype.slice.call(arguments)`)
+            Interp::set_prop(o, "prototype", Value::Obj(self.array_proto.clone()));
+            Interp::set_prop(&self.array_proto.clone(), "constructor", array.clone());
         }
+        self.array_ctor = array.clone();
         Interp::declare(&g, "Array", array, true);
 
         Interp::declare(&g, "String", self.native(|i, _, a| Ok(str_value(&match a.first() { Some(v) => i.to_string(v)?, None => String::new() }))), true);
@@ -1389,9 +1591,7 @@ impl Interp {
         Interp::declare(&g, "parseInt", self.native(parse_int), true);
         Interp::declare(&g, "parseFloat", self.native(|i, _, a| {
             let s = i.arg_string(a, 0)?;
-            let t = s.trim_start();
-            let end = t.char_indices().take_while(|(k, c)| c.is_ascii_digit() || *c == '.' || (*k == 0 && matches!(c, '-' | '+'))).map(|(k, c)| k + c.len_utf8()).last().unwrap_or(0);
-            Ok(Value::Num(t[..end].parse::<f64>().unwrap_or(f64::NAN)))
+            Ok(Value::Num(parse_float_prefix(&s)))
         }), true);
         Interp::declare(&g, "isNaN", self.native(|i, _, a| Ok(Value::Bool(i.arg_number(a, 0)?.is_nan()))), true);
         Interp::declare(&g, "isFinite", self.native(|i, _, a| Ok(Value::Bool(i.arg_number(a, 0)?.is_finite()))), true);
@@ -1454,7 +1654,7 @@ impl Interp {
             Value::Str(s) => s.chars().take(10_000).collect(),
             Value::Obj(o) if depth < 3 => {
                 let kind_array = matches!(o.borrow().kind, Kind::Array(_));
-                if matches!(o.borrow().kind, Kind::Closure(_) | Kind::Native(_)) {
+                if matches!(o.borrow().kind, Kind::Closure(_) | Kind::Native(_) | Kind::Bound(_)) {
                     return "[Function]".into();
                 }
                 if matches!(o.borrow().kind, Kind::Error) {
@@ -1561,10 +1761,10 @@ fn obj_has_own(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
 
 fn obj_to_string(i: &mut Interp, this: &Value, _: &[Value]) -> Res {
     if let Value::Obj(o) = this {
-        if matches!(o.borrow().kind, Kind::Error) {
+        if i.is_error_like(o) {
             return Ok(str_value(&i.describe_error(this)));
         }
-        if matches!(o.borrow().kind, Kind::Closure(_) | Kind::Native(_)) {
+        if matches!(o.borrow().kind, Kind::Closure(_) | Kind::Native(_) | Kind::Bound(_)) {
             return Ok(str_value("function () { [native code] }"));
         }
     }
@@ -1601,9 +1801,30 @@ fn num_to_string(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
 
 fn num_to_fixed(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
     let n = i.to_number(this)?;
-    let digits = i.arg_number(a, 0).unwrap_or(0.0).clamp(0.0, 100.0) as usize;
-    if !n.is_finite() {
+    let wanted = match a.first() {
+        None | Some(Value::Undefined) => 0.0,
+        Some(v) => i.to_number(v)?,
+    };
+    if !(0.0..=100.0).contains(&wanted) {
+        return i.throw("RangeError", "toFixed() digits argument must be between 0 and 100");
+    }
+    let digits = wanted as usize;
+    if !n.is_finite() || n.abs() >= 1e21 {
         return Ok(str_value(&number_to_string(n)));
+    }
+    let n = if n == 0.0 { 0.0 } else { n }; // (-0 prints without its sign)
+    // an exact tie rounds away from zero (2.5 -> "3"), where Rust's formatting rounds to even
+    let scaled = n.abs() * 10f64.powi(digits as i32);
+    if scaled < 1e15 && scaled.fract() == 0.5 {
+        let rounded = scaled.floor() as u128 + 1;
+        let mut text = rounded.to_string();
+        if digits > 0 {
+            while text.len() <= digits {
+                text.insert(0, '0');
+            }
+            text.insert(text.len() - digits, '.');
+        }
+        return Ok(str_value(&if n < 0.0 { format!("-{text}") } else { text }));
     }
     Ok(str_value(&format!("{n:.digits$}")))
 }
@@ -1667,6 +1888,189 @@ fn json_stringify(i: &mut Interp, _: &Value, a: &[Value]) -> Res {
     if go(i, &v, &mut out, 0)? { Ok(str_value(&out)) } else { Ok(Value::Undefined) }
 }
 
+fn json_parse(i: &mut Interp, _: &Value, a: &[Value]) -> Res {
+    let text = i.arg_string(a, 0)?;
+    if text.len() > MAX_STRING {
+        return Err(Ctrl::Abort("string too long".into()));
+    }
+    i.charge(text.len() * 4)?;
+    let chars: Vec<char> = text.chars().collect();
+    let mut p = 0usize;
+    let v = json_value(i, &chars, &mut p, 0)?;
+    json_ws(&chars, &mut p);
+    if p != chars.len() {
+        return i.throw("SyntaxError", &format!("Unexpected token in JSON at position {p}"));
+    }
+    Ok(v)
+}
+
+fn json_ws(c: &[char], p: &mut usize) {
+    while *p < c.len() && matches!(c[*p], ' ' | '\t' | '\n' | '\r') {
+        *p += 1;
+    }
+}
+
+fn json_error<T>(i: &mut Interp, p: usize) -> Result<T, Ctrl> {
+    i.throw("SyntaxError", &format!("Unexpected token in JSON at position {p}"))
+}
+
+fn json_value(i: &mut Interp, c: &[char], p: &mut usize, depth: usize) -> Res {
+    if depth > 100 {
+        return i.throw("SyntaxError", "JSON nested too deeply");
+    }
+    json_ws(c, p);
+    let Some(&ch) = c.get(*p) else { return json_error(i, *p) };
+    match ch {
+        '{' => {
+            *p += 1;
+            let obj = i.new_object();
+            json_ws(c, p);
+            if c.get(*p) == Some(&'}') {
+                *p += 1;
+                return Ok(Value::Obj(obj));
+            }
+            loop {
+                json_ws(c, p);
+                if c.get(*p) != Some(&'"') {
+                    return json_error(i, *p);
+                }
+                let key = json_string(i, c, p)?;
+                json_ws(c, p);
+                if c.get(*p) != Some(&':') {
+                    return json_error(i, *p);
+                }
+                *p += 1;
+                let v = json_value(i, c, p, depth + 1)?;
+                Interp::set_prop(&obj, &key, v);
+                i.tick()?;
+                json_ws(c, p);
+                match c.get(*p) {
+                    Some(',') => *p += 1,
+                    Some('}') => {
+                        *p += 1;
+                        return Ok(Value::Obj(obj));
+                    }
+                    _ => return json_error(i, *p),
+                }
+            }
+        }
+        '[' => {
+            *p += 1;
+            let mut items = vec![];
+            json_ws(c, p);
+            if c.get(*p) == Some(&']') {
+                *p += 1;
+                return Ok(i.new_array(items));
+            }
+            loop {
+                items.push(json_value(i, c, p, depth + 1)?);
+                i.tick()?;
+                json_ws(c, p);
+                match c.get(*p) {
+                    Some(',') => *p += 1,
+                    Some(']') => {
+                        *p += 1;
+                        return Ok(i.new_array(items));
+                    }
+                    _ => return json_error(i, *p),
+                }
+            }
+        }
+        '"' => Ok(str_value(&json_string(i, c, p)?)),
+        't' | 'f' | 'n' => {
+            for (word, value) in [("true", Value::Bool(true)), ("false", Value::Bool(false)), ("null", Value::Null)] {
+                if c[*p..].iter().take(word.len()).collect::<String>() == word {
+                    *p += word.len();
+                    return Ok(value);
+                }
+            }
+            json_error(i, *p)
+        }
+        '-' | '0'..='9' => {
+            let start = *p;
+            if c[*p] == '-' {
+                *p += 1;
+            }
+            let digits = |p: &mut usize| {
+                let from = *p;
+                while *p < c.len() && c[*p].is_ascii_digit() {
+                    *p += 1;
+                }
+                *p - from
+            };
+            let int_start = *p;
+            let int_digits = digits(p);
+            // (no digits, or a leading zero followed by more digits, is not JSON)
+            if int_digits == 0 || (int_digits > 1 && c[int_start] == '0') {
+                return json_error(i, *p);
+            }
+            if c.get(*p) == Some(&'.') {
+                *p += 1;
+                if digits(p) == 0 {
+                    return json_error(i, *p);
+                }
+            }
+            if matches!(c.get(*p), Some('e' | 'E')) {
+                *p += 1;
+                if matches!(c.get(*p), Some('+' | '-')) {
+                    *p += 1;
+                }
+                if digits(p) == 0 {
+                    return json_error(i, *p);
+                }
+            }
+            let text: String = c[start..*p].iter().collect();
+            Ok(Value::Num(text.parse::<f64>().unwrap_or(f64::NAN)))
+        }
+        _ => json_error(i, *p),
+    }
+}
+
+fn json_string(i: &mut Interp, c: &[char], p: &mut usize) -> Result<String, Ctrl> {
+    *p += 1; // the opening quote
+    let mut out = String::new();
+    loop {
+        let Some(&ch) = c.get(*p) else { return json_error(i, *p) };
+        *p += 1;
+        match ch {
+            '"' => return Ok(out),
+            '\\' => {
+                let Some(&e) = c.get(*p) else { return json_error(i, *p) };
+                *p += 1;
+                match e {
+                    '"' | '\\' | '/' => out.push(e),
+                    'b' => out.push('\u{8}'),
+                    'f' => out.push('\u{c}'),
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    'u' => {
+                        let hex = |p: usize| -> Option<u32> {
+                            let h: String = c.get(p..p + 4)?.iter().collect();
+                            if h.len() == 4 && h.chars().all(|d| d.is_ascii_hexdigit()) { u32::from_str_radix(&h, 16).ok() } else { None }
+                        };
+                        let Some(mut v) = hex(*p) else { return json_error(i, *p) };
+                        *p += 4;
+                        if (0xD800..0xDC00).contains(&v) && c.get(*p) == Some(&'\\') && c.get(*p + 1) == Some(&'u') {
+                            if let Some(low) = hex(*p + 2).filter(|l| (0xDC00..0xE000).contains(l)) {
+                                v = 0x10000 + ((v - 0xD800) << 10) + (low - 0xDC00);
+                                *p += 6;
+                            }
+                        }
+                        out.push(char::from_u32(v).unwrap_or('\u{fffd}'));
+                    }
+                    _ => return json_error(i, *p - 1),
+                }
+            }
+            c if (c as u32) < 0x20 => return json_error(i, *p - 1),
+            c => out.push(c),
+        }
+        if out.len() > MAX_STRING {
+            return Err(Ctrl::Abort("string too long".into()));
+        }
+    }
+}
+
 fn json_quote(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
@@ -1690,6 +2094,20 @@ fn function_method(name: &str) -> Option<NativeFn> {
         "call" => |i, this, a| {
             let this_arg = a.first().cloned().unwrap_or(Value::Undefined);
             i.call(this, &this_arg, a.get(1..).unwrap_or(&[]))
+        },
+        "bind" => |i, this, a| {
+            if !this.is_callable() {
+                return i.throw("TypeError", "bind called on a non-function");
+            }
+            let bound_this = a.first().cloned().unwrap_or(Value::Undefined);
+            let leading = a.get(1..).unwrap_or(&[]).to_vec();
+            i.objects += 1;
+            Ok(Value::Obj(Rc::new(RefCell::new(Object {
+                kind: Kind::Bound(Box::new((this.clone(), bound_this, leading))),
+                props: HashMap::new(),
+                order: vec![],
+                proto: Some(i.object_proto.clone()),
+            }))))
         },
         "apply" => |i, this, a| {
             let this_arg = a.first().cloned().unwrap_or(Value::Undefined);
@@ -1932,30 +2350,72 @@ fn array_method(name: &str) -> Option<NativeFn> {
         },
         "forEach" => |i, this, a| {
             let f = a.first().cloned().unwrap_or(Value::Undefined);
+            let this_arg = a.get(1).cloned().unwrap_or(Value::Undefined);
             for (k, item) in array_items(this).into_iter().enumerate() {
-                i.call(&f, &Value::Undefined, &[item, Value::Num(k as f64), this.clone()])?;
+                i.call(&f, &this_arg, &[item, Value::Num(k as f64), this.clone()])?;
             }
             Ok(Value::Undefined)
         },
         "map" => |i, this, a| {
             let f = a.first().cloned().unwrap_or(Value::Undefined);
+            let this_arg = a.get(1).cloned().unwrap_or(Value::Undefined);
             let mut out = vec![];
             for (k, item) in array_items(this).into_iter().enumerate() {
-                out.push(i.call(&f, &Value::Undefined, &[item, Value::Num(k as f64), this.clone()])?);
+                out.push(i.call(&f, &this_arg, &[item, Value::Num(k as f64), this.clone()])?);
             }
             Ok(i.new_array(out))
         },
+        "some" => |i, this, a| {
+            let f = a.first().cloned().unwrap_or(Value::Undefined);
+            let this_arg = a.get(1).cloned().unwrap_or(Value::Undefined);
+            for (k, item) in array_items(this).into_iter().enumerate() {
+                if i.call(&f, &this_arg, &[item, Value::Num(k as f64), this.clone()])?.truthy() {
+                    return Ok(Value::Bool(true));
+                }
+            }
+            Ok(Value::Bool(false))
+        },
+        "every" => |i, this, a| {
+            let f = a.first().cloned().unwrap_or(Value::Undefined);
+            let this_arg = a.get(1).cloned().unwrap_or(Value::Undefined);
+            for (k, item) in array_items(this).into_iter().enumerate() {
+                if !i.call(&f, &this_arg, &[item, Value::Num(k as f64), this.clone()])?.truthy() {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            Ok(Value::Bool(true))
+        },
+        "find" => |i, this, a| {
+            let f = a.first().cloned().unwrap_or(Value::Undefined);
+            let this_arg = a.get(1).cloned().unwrap_or(Value::Undefined);
+            for (k, item) in array_items(this).into_iter().enumerate() {
+                if i.call(&f, &this_arg, &[item.clone(), Value::Num(k as f64), this.clone()])?.truthy() {
+                    return Ok(item);
+                }
+            }
+            Ok(Value::Undefined)
+        },
+        "findIndex" => |i, this, a| {
+            let f = a.first().cloned().unwrap_or(Value::Undefined);
+            let this_arg = a.get(1).cloned().unwrap_or(Value::Undefined);
+            for (k, item) in array_items(this).into_iter().enumerate() {
+                if i.call(&f, &this_arg, &[item, Value::Num(k as f64), this.clone()])?.truthy() {
+                    return Ok(Value::Num(k as f64));
+                }
+            }
+            Ok(Value::Num(-1.0))
+        },
         "filter" => |i, this, a| {
             let f = a.first().cloned().unwrap_or(Value::Undefined);
+            let this_arg = a.get(1).cloned().unwrap_or(Value::Undefined);
             let mut out = vec![];
             for (k, item) in array_items(this).into_iter().enumerate() {
-                if i.call(&f, &Value::Undefined, &[item.clone(), Value::Num(k as f64), this.clone()])?.truthy() {
+                if i.call(&f, &this_arg, &[item.clone(), Value::Num(k as f64), this.clone()])?.truthy() {
                     out.push(item);
                 }
             }
             Ok(i.new_array(out))
         },
-        "some" | "every" | "find" | "findIndex" => return None,
         "reduce" => |i, this, a| {
             let f = a.first().cloned().unwrap_or(Value::Undefined);
             let items = array_items(this);
@@ -2010,26 +2470,101 @@ fn string_method(name: &str) -> Option<NativeFn> {
         "includes" => |i, t, a| Ok(Value::Bool(i.to_string(t)?.contains(&i.arg_string(a, 0)?))),
         "startsWith" => |i, t, a| Ok(Value::Bool(i.to_string(t)?.starts_with(&i.arg_string(a, 0)?))),
         "endsWith" => |i, t, a| Ok(Value::Bool(i.to_string(t)?.ends_with(&i.arg_string(a, 0)?))),
-        "slice" | "substring" | "substr" => |i, t, a| {
+        "slice" => |i, t, a| {
             let chars: Vec<char> = i.to_string(t)?.chars().collect();
             let from = rel_index(i, a, 0, chars.len(), 0)?;
             let to = rel_index(i, a, 1, chars.len(), chars.len())?;
             Ok(str_value(&if from < to { chars[from..to].iter().collect::<String>() } else { String::new() }))
         },
+        "substring" => |i, t, a| {
+            // (unlike slice: negatives and NaN are 0, and the two ends may come in either order)
+            let chars: Vec<char> = i.to_string(t)?.chars().collect();
+            let clamp = |n: f64| if n.is_nan() { 0 } else { n.clamp(0.0, chars.len() as f64) as usize };
+            let from = clamp(i.arg_number(a, 0)?);
+            let to = match a.get(1) {
+                None | Some(Value::Undefined) => chars.len(),
+                Some(v) => clamp(i.to_number(v)?),
+            };
+            let (lo, hi) = (from.min(to), from.max(to));
+            Ok(str_value(&chars[lo..hi].iter().collect::<String>()))
+        },
+        "substr" => |i, t, a| {
+            let chars: Vec<char> = i.to_string(t)?.chars().collect();
+            let from = rel_len(i.arg_number(a, 0)?, chars.len());
+            let count = match a.get(1) {
+                None | Some(Value::Undefined) => chars.len() - from,
+                Some(v) => {
+                    let n = i.to_number(v)?;
+                    (if n.is_nan() { 0.0 } else { n.trunc() }).clamp(0.0, (chars.len() - from) as f64) as usize
+                }
+            };
+            Ok(str_value(&chars[from..from + count].iter().collect::<String>()))
+        },
         "split" => |i, t, a| {
             let s = i.to_string(t)?;
-            let parts: Vec<Value> = match a.first() {
+            let limit = match a.get(1) {
+                None | Some(Value::Undefined) => usize::MAX,
+                Some(v) => i.to_number(v)?.clamp(0.0, 1e9) as usize,
+            };
+            let mut parts: Vec<Value> = match a.first() {
                 None | Some(Value::Undefined) => vec![str_value(&s)],
                 Some(sep) => {
                     let sep = i.to_string(sep)?;
                     if sep.is_empty() { s.chars().map(|c| str_value(&c.to_string())).collect() } else { s.split(&sep).map(str_value).collect() }
                 }
             };
+            parts.truncate(limit);
             Ok(i.new_array(parts))
         },
         "replace" => |i, t, a| {
             let (s, from, to) = (i.to_string(t)?, i.arg_string(a, 0)?, i.arg_string(a, 1)?);
-            Ok(str_value(&s.replacen(&from, &to, 1)))
+            let r = s.replacen(&from, &to, 1);
+            if r.len() > MAX_STRING {
+                return Err(Ctrl::Abort("string too long".into()));
+            }
+            Ok(str_value(&r))
+        },
+        "replaceAll" => |i, t, a| {
+            let (s, from, to) = (i.to_string(t)?, i.arg_string(a, 0)?, i.arg_string(a, 1)?);
+            if from.is_empty() || s.len().saturating_mul(to.len().max(1)) > MAX_STRING * 4 {
+                return Ok(str_value(&s));
+            }
+            let r = s.replace(&from, &to);
+            if r.len() > MAX_STRING {
+                return Err(Ctrl::Abort("string too long".into()));
+            }
+            i.spend_bytes(r.len())?;
+            Ok(str_value(&r))
+        },
+        "padStart" => |i, t, a| {
+            let s = i.to_string(t)?;
+            let target = i.arg_number(a, 0)?.clamp(0.0, MAX_STRING as f64) as usize;
+            let fill = match a.get(1) {
+                None | Some(Value::Undefined) => " ".to_string(),
+                Some(v) => i.to_string(v)?,
+            };
+            let have = s.chars().count();
+            if target <= have || fill.is_empty() {
+                return Ok(str_value(&s));
+            }
+            let pad: String = fill.chars().cycle().take(target - have).collect();
+            i.spend_bytes(pad.len() + s.len())?;
+            Ok(str_value(&(pad + &s)))
+        },
+        "padEnd" => |i, t, a| {
+            let s = i.to_string(t)?;
+            let target = i.arg_number(a, 0)?.clamp(0.0, MAX_STRING as f64) as usize;
+            let fill = match a.get(1) {
+                None | Some(Value::Undefined) => " ".to_string(),
+                Some(v) => i.to_string(v)?,
+            };
+            let have = s.chars().count();
+            if target <= have || fill.is_empty() {
+                return Ok(str_value(&s));
+            }
+            let pad: String = fill.chars().cycle().take(target - have).collect();
+            i.spend_bytes(pad.len() + s.len())?;
+            Ok(str_value(&(s + &pad)))
         },
         "repeat" => |i, t, a| {
             let (s, n) = (i.to_string(t)?, i.arg_number(a, 0)?);
@@ -2197,6 +2732,62 @@ mod tests {
         // splice when converting an argument changes the array
         assert_eq!(run("var a=[1,2,3,4,5,6]; a.splice(0, {toString:function(){ a.length=0; return '3' }}); console.log(a.length)"), "0");
         assert_eq!(run("var a=[1,2,3]; a.splice({toString:function(){ a.length=0; return '1' }}, 1); console.log(a.length)"), "0");
+    }
+
+    #[test]
+    fn review_correctness_fixes() {
+        // assignment targets are evaluated once, and before the right-hand side
+        assert_eq!(run("var a=[1,2,3]; var i=0; a[i++]+=10; console.log(a.join(), i)"), "11,2,3 1");
+        assert_eq!(run("var c=0; var o={x:1}; function t(){ c++; return o } t().x++; console.log(c, o.x)"), "1 2");
+        assert_eq!(run("var i=0; var o={}; o[i++]=i++; console.log(JSON.stringify(o), i)"), "{\"0\":1} 2");
+        // only canonical indexes are array indexes
+        assert_eq!(run("var a=[1,2,3]; console.log(a['01'], a['+1'], a['1'], 'abc'['01'])"), "undefined undefined 2 undefined");
+        assert_eq!(run("var a=[1,2,3]; a['01']=9; console.log(a.length, a['01'])"), "3 9");
+        // valueOf, toString and conversions
+        assert_eq!(run("var o={valueOf:function(){return 42}}; console.log(o+1, o*2, o>41, String(o))"), "43 84 true [object Object]");
+        assert_eq!(run("var o={toString:function(){return 'str'}, valueOf:function(){return 7}}; console.log(o+'', `${o}`, o*1, String(o))"), "7 str 7 str");
+        // constructors and prototypes of the built-ins
+        assert_eq!(run("console.log(Array(3).length, new Array(2).length, Array(1,2).length, [] instanceof Array, [].constructor === Array, ({}).constructor === Object)"), "3 2 2 true true true");
+        assert_eq!(run("function f() { return Array.prototype.slice.call(arguments, 1) } console.log(f(1,2,3).join())"), "2,3");
+        assert_eq!(run("var e=new TypeError('m'); console.log(e.constructor === TypeError, e.constructor.name, e instanceof Error)"), "true TypeError true");
+        // an ES5-style error subclass keeps its name through the prototype chain
+        assert_eq!(run("function MyErr(m){ this.message=m; this.name='MyErr' } MyErr.prototype=new Error(); var e=new MyErr('hi'); console.log(String(e), e instanceof Error)"), "MyErr: hi true");
+        assert_eq!(run("function E2(m){ this.message=m } E2.prototype=Object.create(Error.prototype); E2.prototype.name='E2'; try { throw new E2('boom') } catch (x) { console.log(String(x)) } throw new E2('final')"), "ERR Uncaught E2: final");
+        // numbers print like JavaScript
+        assert_eq!(run("console.log(2**64, 123456789012345678901, 2**63, 1e21, 0.000001, 1e-7, 100, -1e3)"), "18446744073709552000 123456789012345680000 9223372036854776000 1e+21 0.000001 1e-7 100 -1000");
+        assert_eq!(run("console.log(Object.keys({b:1,a:2,1:'x',0:'y'}).join(), JSON.stringify({b:1,2:2,1:1}))"), "0,1,b,a {\"1\":1,\"2\":2,\"b\":1}");
+        assert_eq!(run("console.log(parseFloat('1e3'), parseFloat('1.2.3'), parseFloat('Infinity'), parseFloat('-.5x'), parseFloat('x'), Number('0b11'), Number('0o7'), Number('0xff'), Number('0x'), Number('1e999'))"), "1000 1.2 Infinity -0.5 NaN 3 7 255 NaN Infinity");
+        assert_eq!(run("console.log((2.5).toFixed(0), (1.005).toFixed(2), (-1.5).toFixed(0), (0).toFixed(2), (-0).toFixed(1), (1234.5678).toFixed(1), (0.5).toFixed(0))"), "3 1.00 -2 0.00 0.0 1234.6 1");
+        assert_eq!(run("try { (1).toFixed(200) } catch (e) { console.log(e.name) } console.log(Math.round(2.5), Math.round(-2.5), Math.round(0.49999999999999994), Math.round(1.4))"), "RangeError\n3 -2 0 1");
+        // functions in switch cases, thisArg, bind
+        assert_eq!(run("switch(1){ case 1: function sw(){ return 'in switch' } console.log(sw()) }"), "in switch");
+        assert_eq!(run("console.log([1,2,3].map(function(x){return this.k+x},{k:10}).join(), [1].some(function(){ return this.ok }, {ok:true}))"), "11,12,13 true");
+        assert_eq!(run("function f(a,b){ return this.n + a + b } var g = f.bind({n:1}, 2); console.log(g(3), g.call({n:100}, 4), typeof g)"), "6 7 function");
+        assert_eq!(run("console.log([1,2,3].some(x=>x>2), [1,2,3].every(x=>x>0), [1,2,3].find(x=>x>1), [1,2,3].findIndex(x=>x>5), [].every(x=>false))"), "true true 2 -1 true");
+        // string methods
+        assert_eq!(run("console.log('abc'.substring(2,0), 'abc'.substring(-1), 'abc'.substr(1,1), 'abc'.substr(-2), 'a,b,c'.split(',', 2).join('|'), 'ab'.padStart(5, 'xy'), 'ab'.padEnd(4), 'a-b-c'.replaceAll('-', '+'))"), "ab abc b bc a|b xyxab ab   a+b+c");
+        // Object helpers and JSON.parse
+        assert_eq!(run("var t = Object.assign({a:1}, {b:2}, {a:3}); console.log(JSON.stringify(t), Object.values(t).join(), JSON.stringify(Object.entries(t)), Object.create({p:1}).p)"), "{\"a\":3,\"b\":2} 3,2 [[\"a\",3],[\"b\",2]] 1");
+        assert_eq!(run("var d = JSON.parse('{\"a\":[1,2.5e1,-3],\"b\":{\"c\":null,\"d\":true},\"e\":\"x\\\\ny\\\\u0041\\\\ud83d\\\\ude00\"}'); console.log(d.a.join(), d.b.c, d.b.d, d.e, Object.keys(d).join())"), "1,25,-3 null true x\nyA😀 a,b,e");
+        for bad in ["{", "[1,]", "{'a':1}", "01", "1.", "\"unterminated", "[1] x", "tru", "{\"a\" 1}", ""] {
+            let script = format!("try {{ JSON.parse({}); console.log('parsed') }} catch (e) {{ console.log(e.name) }}", serde_like_quote(bad));
+            assert_eq!(run(Box::leak(script.into_boxed_str())), "SyntaxError", "{bad:?}");
+        }
+        assert_eq!(run("var s='['.repeat(300) + ']'.repeat(300); try { JSON.parse(s) } catch (e) { console.log(e.name) }"), "SyntaxError", "deep JSON is refused");
+    }
+
+    /// A JavaScript string literal for `s` (for building test scripts).
+    fn serde_like_quote(s: &str) -> String {
+        let mut out = String::from("'");
+        for c in s.chars() {
+            match c {
+                '\'' => out.push_str("\\'"),
+                '\\' => out.push_str("\\\\"),
+                c => out.push(c),
+            }
+        }
+        out.push('\'');
+        out
     }
 
     #[test]

@@ -47,7 +47,7 @@ pub enum Ctrl {
 }
 
 pub struct Closure {
-    func: Rc<Func>,
+    func: std::sync::Arc<Func>,
     scope: ScopeRef,
     /// An arrow function's `this`, captured where it was created.
     this: Option<Value>,
@@ -382,7 +382,7 @@ impl Interp {
         }
     }
 
-    fn make_closure(&mut self, func: &Rc<Func>, scope: &ScopeRef, this: Option<Value>) -> Value {
+    fn make_closure(&mut self, func: &std::sync::Arc<Func>, scope: &ScopeRef, this: Option<Value>) -> Value {
         Value::Obj(Rc::new(RefCell::new(Object {
             kind: Kind::Closure(Rc::new(Closure { func: func.clone(), scope: scope.clone(), this })),
             props: HashMap::new(),

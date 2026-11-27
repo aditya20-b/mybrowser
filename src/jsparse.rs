@@ -8,10 +8,18 @@
 //! spread, getters and setters, regular expression literals, labels, `with`.
 //! Hostile input can't recurse without bound (nesting is limited) or make the parser loop.
 #![allow(dead_code)]
-use std::rc::Rc;
+// (the tree is shared between threads as `Arc`s: scripts are parsed on a thread with a big stack)
+use std::sync::Arc as Rc;
 
 /// How deeply expressions and statements may nest before parsing gives up.
-const MAX_DEPTH: usize = 100;
+const MAX_DEPTH: usize = 300;
+/// The most links in operator and call chains (`a+b+c...`, `a.b.c()()`) that may be open at once:
+/// such chains build a lopsided tree that is dropped recursively, which must stay shallow.
+const MAX_CHAIN: usize = 3000;
+/// Template literals nested inside `${}` of other templates.
+const MAX_TEMPLATE_DEPTH: usize = 20;
+/// The stack of the thread a script is parsed on (it is only touched as deep as the script nests).
+const PARSE_STACK: usize = 256 * 1024 * 1024;
 /// The longest script we are willing to tokenize.
 const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -22,7 +30,7 @@ pub enum Tok {
     Num(f64),
     Str(String),
     /// A template literal: the text pieces and the source of each `${...}` between them.
-    Template(Vec<String>, Vec<String>),
+    Template(Vec<String>, Vec<(String, u32)>),
     Ident(String),
     Punct(&'static str),
     Eof,
@@ -55,16 +63,31 @@ pub struct Lexer<'a> {
     chars: Vec<char>,
     pos: usize,
     line: u32,
+    template_depth: usize,
     _src: std::marker::PhantomData<&'a str>,
 }
 
 impl<'a> Lexer<'a> {
     fn new(src: &'a str) -> Lexer<'a> {
-        Lexer { chars: src.chars().collect(), pos: 0, line: 1, _src: std::marker::PhantomData }
+        Lexer { chars: src.chars().collect(), pos: 0, line: 1, template_depth: 0, _src: std::marker::PhantomData }
     }
 
     fn peek(&self, ahead: usize) -> Option<char> {
         self.chars.get(self.pos + ahead).copied()
+    }
+
+    /// Exactly `n` hex digits (no sign, no spaces), consumed; None if they aren't there.
+    fn hex_digits(&mut self, n: usize) -> Option<u32> {
+        let digits: Vec<char> = (0..n).filter_map(|i| self.peek(i)).collect();
+        if digits.len() != n || !digits.iter().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        self.pos += n;
+        Some(digits.iter().fold(0, |acc, c| acc * 16 + c.to_digit(16).unwrap_or(0)))
+    }
+
+    fn looking_at(&self, text: &str) -> bool {
+        text.chars().enumerate().all(|(i, c)| self.peek(i) == Some(c))
     }
 
     /// Skip whitespace and comments; returns whether a line break was crossed.
@@ -72,14 +95,17 @@ impl<'a> Lexer<'a> {
         let mut newline = false;
         loop {
             match self.peek(0) {
-                Some('\n') | Some('\u{2028}') | Some('\u{2029}') => {
+                Some('\n' | '\r' | '\u{2028}' | '\u{2029}') => {
                     newline = true;
+                    if self.peek(0) == Some('\r') && self.peek(1) == Some('\n') {
+                        self.pos += 1; // (a CR LF pair is one line break)
+                    }
                     self.line += 1;
                     self.pos += 1;
                 }
                 Some(c) if c.is_whitespace() || c == '\u{feff}' => self.pos += 1,
                 Some('/') if self.peek(1) == Some('/') => {
-                    while !matches!(self.peek(0), None | Some('\n')) {
+                    while !matches!(self.peek(0), None | Some('\n' | '\r' | '\u{2028}' | '\u{2029}')) {
                         self.pos += 1;
                     }
                 }
@@ -92,7 +118,7 @@ impl<'a> Lexer<'a> {
                                 self.pos += 2;
                                 break;
                             }
-                            Some('\n') => {
+                            Some('\n' | '\r' | '\u{2028}' | '\u{2029}') => {
                                 newline = true;
                                 self.line += 1;
                                 self.pos += 1;
@@ -101,9 +127,21 @@ impl<'a> Lexer<'a> {
                         }
                     }
                 }
+                // old-style `<!--` and (at the start of a line) `-->` comments, which scripts once
+                // wrapped themselves in to hide from browsers that didn't know <script>
+                Some('<') if self.looking_at("<!--") => {
+                    while !matches!(self.peek(0), None | Some('\n' | '\r' | '\u{2028}' | '\u{2029}')) {
+                        self.pos += 1;
+                    }
+                }
+                Some('-') if (newline || self.pos == 0) && self.looking_at("-->") => {
+                    while !matches!(self.peek(0), None | Some('\n' | '\r' | '\u{2028}' | '\u{2029}')) {
+                        self.pos += 1;
+                    }
+                }
                 // a `#!` line at the very start
                 Some('#') if self.pos == 0 && self.peek(1) == Some('!') => {
-                    while !matches!(self.peek(0), None | Some('\n')) {
+                    while !matches!(self.peek(0), None | Some('\n' | '\r' | '\u{2028}' | '\u{2029}')) {
                         self.pos += 1;
                     }
                 }
@@ -159,6 +197,10 @@ impl<'a> Lexer<'a> {
         if self.peek(0).is_some_and(is_ident_start) {
             return Err(format!("line {}: a number can't be followed by a letter", self.line));
         }
+        // a leading zero followed only by octal digits is a legacy octal number: 010 is 8
+        if text.len() > 1 && text.starts_with('0') && text.chars().all(|c| c.is_ascii_digit()) && text.chars().all(|c| c < '8') {
+            return Ok(text.chars().fold(0.0, |acc, c| acc * 8.0 + c.to_digit(8).unwrap_or(0) as f64));
+        }
         text.parse::<f64>().map_err(|_| format!("line {}: malformed number {text}", self.line))
     }
 
@@ -175,9 +217,7 @@ impl<'a> Lexer<'a> {
             'v' => out.push('\u{b}'),
             '0' if !self.peek(0).is_some_and(|d| d.is_ascii_digit()) => out.push('\0'),
             'x' => {
-                let h: String = (0..2).filter_map(|i| self.peek(i)).collect();
-                let v = u32::from_str_radix(&h, 16).map_err(|_| format!("line {}: bad \\x escape", self.line))?;
-                self.pos += 2;
+                let v = self.hex_digits(2).ok_or_else(|| format!("line {}: bad \\x escape", self.line))?;
                 out.push(char::from_u32(v).unwrap_or('\u{fffd}'));
             }
             'u' => {
@@ -185,13 +225,27 @@ impl<'a> Lexer<'a> {
                     let end = (self.pos..self.chars.len().min(self.pos + 10)).find(|&i| self.chars[i] == '}');
                     let Some(end) = end else { return Err(format!("line {}: bad \\u escape", self.line)) };
                     let h: String = self.chars[self.pos + 1..end].iter().collect();
+                    if h.is_empty() || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Err(format!("line {}: bad \\u escape", self.line));
+                    }
                     self.pos = end + 1;
                     u32::from_str_radix(&h, 16).map_err(|_| format!("line {}: bad \\u escape", self.line))?
                 } else {
-                    let h: String = (0..4).filter_map(|i| self.peek(i)).collect();
-                    let v = u32::from_str_radix(&h, 16).map_err(|_| format!("line {}: bad \\u escape", self.line))?;
-                    self.pos += 4;
-                    v
+                    let high = self.hex_digits(4).ok_or_else(|| format!("line {}: bad \\u escape", self.line))?;
+                    // a surrogate pair written as two escapes is one character
+                    if (0xD800..0xDC00).contains(&high) && self.peek(0) == Some('\\') && self.peek(1) == Some('u') {
+                        let save = self.pos;
+                        self.pos += 2;
+                        match self.hex_digits(4) {
+                            Some(low) if (0xDC00..0xE000).contains(&low) => 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00),
+                            _ => {
+                                self.pos = save;
+                                high
+                            }
+                        }
+                    } else {
+                        high
+                    }
                 };
                 out.push(char::from_u32(v).unwrap_or('\u{fffd}')); // (a lone surrogate becomes U+FFFD)
             }
@@ -230,12 +284,25 @@ impl<'a> Lexer<'a> {
     }
 
     /// A backtick template: the literal pieces, and the raw source of each `${ ... }`.
-    fn template(&mut self) -> Result<(Vec<String>, Vec<String>), String> {
+    fn template(&mut self) -> Result<(Vec<String>, Vec<(String, u32)>), String> {
+        // (templates nested inside `${}` recurse, and each level lexes its inner source again)
+        self.template_depth += 1;
+        if self.template_depth > MAX_TEMPLATE_DEPTH {
+            return Err(format!("line {}: templates nested too deeply", self.line));
+        }
+        let r = self.template_inner();
+        self.template_depth -= 1;
+        r
+    }
+
+    /// The source of each `${}` comes with the line it starts on, for error messages.
+    fn template_inner(&mut self) -> Result<(Vec<String>, Vec<(String, u32)>), String> {
+        let start_line = self.line;
         self.pos += 1;
         let (mut pieces, mut exprs, mut current) = (vec![], vec![], String::new());
         loop {
             match self.peek(0) {
-                None => return Err(format!("line {}: unterminated template", self.line)),
+                None => return Err(format!("line {start_line}: unterminated template")),
                 Some('`') => {
                     self.pos += 1;
                     pieces.push(current);
@@ -248,11 +315,30 @@ impl<'a> Lexer<'a> {
                 Some('$') if self.peek(1) == Some('{') => {
                     self.pos += 2;
                     pieces.push(std::mem::take(&mut current));
-                    // find the matching brace, skipping nested braces and strings
-                    let (start, mut depth) = (self.pos, 1usize);
+                    // find the matching brace, skipping nested braces, strings and comments
+                    let (start, mut depth, expr_line) = (self.pos, 1usize, self.line);
                     while depth > 0 {
                         match self.peek(0) {
-                            None => return Err(format!("line {}: unterminated template", self.line)),
+                            None => return Err(format!("line {start_line}: unterminated template")),
+                            Some('/') if self.peek(1) == Some('/') => {
+                                while !matches!(self.peek(0), None | Some('\n' | '\r' | '\u{2028}' | '\u{2029}')) {
+                                    self.pos += 1;
+                                }
+                                continue;
+                            }
+                            Some('/') if self.peek(1) == Some('*') => {
+                                self.pos += 2;
+                                while !(self.peek(0) == Some('*') && self.peek(1) == Some('/')) {
+                                    match self.peek(0) {
+                                        None => return Err(format!("line {start_line}: unterminated template")),
+                                        Some('\n') => self.line += 1,
+                                        _ => {}
+                                    }
+                                    self.pos += 1;
+                                }
+                                self.pos += 2;
+                                continue;
+                            }
                             Some('{') => depth += 1,
                             Some('}') => depth -= 1,
                             Some(q @ ('"' | '\'')) => {
@@ -268,7 +354,7 @@ impl<'a> Lexer<'a> {
                         }
                         self.pos += 1;
                     }
-                    exprs.push(self.chars[start..self.pos - 1].iter().collect());
+                    exprs.push((self.chars[start..self.pos - 1].iter().collect(), expr_line));
                 }
                 Some(c) => {
                     if c == '\n' {
@@ -316,10 +402,16 @@ impl<'a> Lexer<'a> {
 }
 
 fn tokenize(src: &str) -> Result<Vec<Token>, String> {
+    tokenize_at(src, 1)
+}
+
+/// Tokenize `src`, whose first line is line `first_line` of the script.
+fn tokenize_at(src: &str, first_line: u32) -> Result<Vec<Token>, String> {
     if src.len() > MAX_SOURCE_BYTES {
         return Err("script too big".into());
     }
     let mut lexer = Lexer::new(src);
+    lexer.line = first_line;
     let mut out = vec![];
     loop {
         let t = lexer.next_token()?;
@@ -418,13 +510,16 @@ struct Parser {
     toks: Vec<Token>,
     pos: usize,
     depth: usize,
+    /// Links of operator / call chains currently being built (see `MAX_CHAIN`).
+    chain: usize,
 }
 
 type PResult<T> = Result<T, String>;
 
-const RESERVED: [&str; 28] = [
+const RESERVED: [&str; 36] = [
     "break", "case", "catch", "continue", "default", "delete", "do", "else", "finally", "for", "function", "if", "in", "instanceof", "new",
-    "return", "switch", "this", "throw", "try", "typeof", "var", "void", "while", "const", "let", "true", "false",
+    "return", "switch", "this", "throw", "try", "typeof", "var", "void", "while", "const", "let", "true", "false", "null", "class", "enum",
+    "export", "import", "super", "with", "debugger",
 ];
 
 impl Parser {
@@ -534,11 +629,14 @@ impl Parser {
         Ok(out)
     }
 
-    fn declarators(&mut self) -> PResult<Vec<(String, Option<Expr>)>> {
+    fn declarators(&mut self, kind: DeclKind) -> PResult<Vec<(String, Option<Expr>)>> {
         let mut list = vec![];
         loop {
             let name = self.ident()?;
             let init = if self.eat_punct("=") { Some(self.assignment()?) } else { None };
+            if kind == DeclKind::Const && init.is_none() {
+                return self.err("a const needs a value");
+            }
             list.push((name, init));
             if !self.eat_punct(",") {
                 return Ok(list);
@@ -571,7 +669,7 @@ impl Parser {
         }
         if let Some(kind) = self.decl_kind() {
             self.advance();
-            let list = self.declarators()?;
+            let list = self.declarators(kind)?;
             self.semicolon()?;
             return Ok(Stmt::Decl(kind, list));
         }
@@ -636,6 +734,11 @@ impl Parser {
                 self.semicolon()?;
                 return Ok(Stmt::Continue);
             }
+            "debugger" => {
+                self.advance();
+                self.semicolon()?;
+                return Ok(Stmt::Empty);
+            }
             "throw" => {
                 self.advance();
                 if self.toks[self.pos].newline_before {
@@ -677,7 +780,7 @@ impl Parser {
             ForInit::None
         } else if let Some(kind) = self.decl_kind() {
             self.advance();
-            let list = self.declarators()?;
+            let list = self.declarators(kind)?;
             self.expect_punct(";")?;
             ForInit::Decl(kind, list)
         } else {
@@ -882,21 +985,53 @@ impl Parser {
         Some((op, prec))
     }
 
+    /// One more link in an operator or call chain: the chains open at once are bounded, because
+    /// the tree they build is dropped recursively.
+    fn chain_step(&mut self, added: &mut usize) -> PResult<()> {
+        *added += 1;
+        self.chain += 1;
+        if self.chain > MAX_CHAIN { self.err("expression too long") } else { Ok(()) }
+    }
+
+    /// Parse the sources of a template's `${}` parts (each knows the line it starts on).
+    fn template_exprs(&mut self, sources: Vec<(String, u32)>) -> PResult<Vec<Expr>> {
+        let mut exprs = vec![];
+        for (src, line) in sources {
+            let mut inner = Parser { toks: tokenize_at(&src, line)?, pos: 0, depth: self.depth, chain: self.chain };
+            let e = inner.expression()?;
+            if *inner.peek() != Tok::Eof {
+                return inner.err("bad expression in template");
+            }
+            exprs.push(e);
+        }
+        Ok(exprs)
+    }
+
     fn binary(&mut self, min: u8) -> PResult<Expr> {
         let mut left = self.unary()?;
+        let mut added = 0usize;
         while let Some((op, prec)) = self.binary_prec() {
             if prec < min {
                 break;
             }
             self.advance();
-            // `**` is right-associative; everything else is left-associative
-            let right = if op == "**" { self.binary(prec)? } else { self.binary(prec + 1)? };
+            self.chain_step(&mut added)?;
+            // `**` is right-associative (and recurses, so it counts as nesting); everything else is left-associative
+            let right = if op == "**" {
+                self.enter()?;
+                let r = self.binary(prec);
+                self.leave();
+                r?
+            } else {
+                self.binary(prec + 1)?
+            };
             left = if matches!(op, "&&" | "||" | "??") {
                 Expr::Logical(op, Box::new(left), Box::new(right))
             } else {
                 Expr::Binary(op, Box::new(left), Box::new(right))
             };
         }
+        self.chain -= added;
         Ok(left)
     }
 
@@ -959,27 +1094,33 @@ impl Parser {
         Ok(args)
     }
 
-    fn call_or_member(&mut self) -> PResult<Expr> {
-        let mut e = if self.is_word("new") {
-            self.advance();
-            // `new Foo(args)`, `new a.b.C()`, `new Foo` (no arguments)
-            let mut callee = self.primary()?;
-            loop {
-                if self.eat_punct(".") {
-                    callee = Expr::Dot(Box::new(callee), self.property_name()?);
-                } else if self.eat_punct("[") {
-                    let index = self.expression()?;
-                    self.expect_punct("]")?;
-                    callee = Expr::Index(Box::new(callee), Box::new(index));
-                } else {
-                    break;
-                }
+    /// `new Foo(args)`, `new a.b.C()`, `new Foo` (no arguments), `new new X()()`.
+    fn new_expression(&mut self) -> PResult<Expr> {
+        self.enter()?;
+        self.advance(); // `new`
+        let mut callee = if self.is_word("new") { self.new_expression()? } else { self.primary()? };
+        let mut added = 0usize;
+        loop {
+            if self.eat_punct(".") {
+                callee = Expr::Dot(Box::new(callee), self.property_name()?);
+            } else if self.eat_punct("[") {
+                let index = self.expression()?;
+                self.expect_punct("]")?;
+                callee = Expr::Index(Box::new(callee), Box::new(index));
+            } else {
+                break;
             }
-            let args = if self.is_punct("(") { self.arguments()? } else { vec![] };
-            Expr::New(Box::new(callee), args)
-        } else {
-            self.primary()?
-        };
+            self.chain_step(&mut added)?;
+        }
+        self.chain -= added;
+        let args = if self.is_punct("(") { self.arguments()? } else { vec![] };
+        self.leave();
+        Ok(Expr::New(Box::new(callee), args))
+    }
+
+    fn call_or_member(&mut self) -> PResult<Expr> {
+        let mut e = if self.is_word("new") { self.new_expression()? } else { self.primary()? };
+        let mut added = 0usize;
         loop {
             if self.eat_punct(".") {
                 e = Expr::Dot(Box::new(e), self.property_name()?);
@@ -988,13 +1129,29 @@ impl Parser {
                 self.expect_punct("]")?;
                 e = Expr::Index(Box::new(e), Box::new(index));
             } else if self.is_punct("(") {
-                self.enter()?;
-                let args = self.arguments();
-                self.leave();
-                e = Expr::Call(Box::new(e), args?);
+                let args = self.arguments()?;
+                e = Expr::Call(Box::new(e), args);
+            } else if matches!(self.peek(), Tok::Template(..)) && !self.toks[self.pos].newline_before {
+                // a tagged template: tag`a${x}b` calls tag(["a", "b"], x)
+                let Tok::Template(pieces, sources) = self.advance() else { unreachable!() };
+                let exprs = self.template_exprs(sources)?;
+                let strings = Expr::Array(pieces.into_iter().map(Expr::Str).collect());
+                let mut args = vec![strings];
+                args.extend(exprs);
+                e = Expr::Call(Box::new(e), args);
             } else {
+                self.chain -= added;
                 return Ok(e);
             }
+            self.chain_step(&mut added)?;
+        }
+    }
+
+    /// Step back over the token just consumed, so an error is reported where it was (but not
+    /// past the end of the script, where there is nothing to step back to).
+    fn back(&mut self, consumed: &Tok) {
+        if *consumed != Tok::Eof {
+            self.pos = self.pos.saturating_sub(1);
         }
     }
 
@@ -1002,8 +1159,8 @@ impl Parser {
     fn property_name(&mut self) -> PResult<String> {
         match self.advance() {
             Tok::Ident(n) => Ok(n),
-            _ => {
-                self.pos = self.pos.saturating_sub(1);
+            other => {
+                self.back(&other);
                 self.err("expected a property name")
             }
         }
@@ -1014,15 +1171,7 @@ impl Parser {
             Tok::Num(n) => Ok(Expr::Num(n)),
             Tok::Str(s) => Ok(Expr::Str(s)),
             Tok::Template(pieces, sources) => {
-                let mut exprs = vec![];
-                for src in sources {
-                    let mut inner = Parser { toks: tokenize(&src)?, pos: 0, depth: self.depth };
-                    let e = inner.expression()?;
-                    if *inner.peek() != Tok::Eof {
-                        return self.err("bad expression in template");
-                    }
-                    exprs.push(e);
-                }
+                let exprs = self.template_exprs(sources)?;
                 Ok(Expr::Template(pieces, exprs))
             }
             Tok::Ident(w) => match w.as_str() {
@@ -1054,6 +1203,11 @@ impl Parser {
             Tok::Punct("[") => {
                 let mut items = vec![];
                 while !self.is_punct("]") {
+                    // `[1,,2]`: an empty slot is undefined
+                    if self.eat_punct(",") {
+                        items.push(Expr::Ident("undefined".into()));
+                        continue;
+                    }
                     items.push(self.assignment()?);
                     if !self.eat_punct(",") {
                         break;
@@ -1065,6 +1219,11 @@ impl Parser {
             Tok::Punct("{") => {
                 let mut props = vec![];
                 while !self.is_punct("}") {
+                    let key_is_word = matches!(self.peek(), Tok::Ident(_));
+                    let key_text = match self.peek() {
+                        Tok::Ident(n) => n.clone(),
+                        _ => String::new(),
+                    };
                     let key = match self.advance() {
                         Tok::Ident(n) => PropKey::Name(n),
                         Tok::Str(s) => PropKey::Name(s),
@@ -1074,8 +1233,8 @@ impl Parser {
                             self.expect_punct("]")?;
                             PropKey::Computed(k)
                         }
-                        _ => {
-                            self.pos = self.pos.saturating_sub(1);
+                        other => {
+                            self.back(&other);
                             return self.err("expected a property name");
                         }
                     };
@@ -1088,8 +1247,8 @@ impl Parser {
                             _ => None,
                         };
                         Expr::Function(Rc::new(self.function_rest(name)?))
-                    } else if let PropKey::Name(n) = &key {
-                        // shorthand `{ x }`
+                    } else if let (PropKey::Name(n), true) = (&key, key_is_word && !RESERVED.contains(&key_text.as_str())) {
+                        // shorthand `{ x }` (only for a plain name, not `{ 1 }`, `{ "a" }` or `{ if }`)
                         Expr::Ident(n.clone())
                     } else {
                         return self.err("expected ':'");
@@ -1102,8 +1261,8 @@ impl Parser {
                 self.expect_punct("}")?;
                 Ok(Expr::Object(props))
             }
-            _ => {
-                self.pos = self.pos.saturating_sub(1);
+            other => {
+                self.back(&other);
                 self.err("unexpected token")
             }
         }
@@ -1112,7 +1271,19 @@ impl Parser {
 
 /// Parse a whole script.
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
-    let mut p = Parser { toks: tokenize(src)?, pos: 0, depth: 0 };
+    // The parser recurses as deep as the script nests, so it runs on a thread with a big stack
+    // (memory for it is only used as far as it is reached). The tree itself is `Send`.
+    let src = src.to_string();
+    std::thread::Builder::new()
+        .stack_size(PARSE_STACK)
+        .spawn(move || parse_here(&src))
+        .map_err(|e| format!("could not start the parser: {e}"))?
+        .join()
+        .map_err(|_| "the parser crashed".to_string())?
+}
+
+fn parse_here(src: &str) -> Result<Vec<Stmt>, String> {
+    let mut p = Parser { toks: tokenize(src)?, pos: 0, depth: 0, chain: 0 };
     p.program()
 }
 
@@ -1121,7 +1292,7 @@ mod tests {
     use super::*;
 
     fn expr(src: &str) -> Expr {
-        let mut p = Parser { toks: tokenize(src).unwrap(), pos: 0, depth: 0 };
+        let mut p = Parser { toks: tokenize(src).unwrap(), pos: 0, depth: 0, chain: 0 };
         let e = p.expression().unwrap_or_else(|e| panic!("{src}: {e}"));
         assert_eq!(*p.peek(), Tok::Eof, "{src}: leftover tokens");
         e
@@ -1294,6 +1465,82 @@ mod tests {
     }
 
     #[test]
+    fn long_chains_and_templates_cannot_overflow_the_stack() {
+        // each of these used to abort the process when the tree was dropped, or while it was built
+        for (name, src) in [
+            ("sum", vec!["1"; 100_000].join("+")),
+            ("or", vec!["a"; 100_000].join("||")),
+            ("member", format!("a{}", ".b".repeat(100_000))),
+            ("index", format!("a{}", "[0]".repeat(100_000))),
+            ("pow", vec!["2"; 100_000].join("**")),
+            ("calls", format!("a{}", "()".repeat(100_000))),
+            ("templates", format!("{}1{}", "`${".repeat(5_000), "}`".repeat(5_000))),
+            ("news", format!("{}x", "new ".repeat(5_000))),
+        ] {
+            let result = parse(&src);
+            assert!(result.is_err(), "{name}: refused, not parsed");
+            drop(result);
+        }
+        // a sensible chain is fine
+        assert!(parse(&vec!["1"; 2000].join("+")).is_ok());
+        assert!(parse(&vec!["2"; 150].join("**")).is_ok());
+        assert!(parse(&format!("{}1{}", "`${".repeat(15), "}`".repeat(15))).is_ok());
+    }
+
+    #[test]
+    fn realistic_nesting_is_accepted() {
+        // callbacks inside callbacks, nested calls, else-if ladders: well past what hand-written code does
+        let callbacks = format!("{}1{}", "f(function(){ ".repeat(40), " })".repeat(40));
+        assert!(parse(&callbacks).is_ok());
+        assert!(parse(&format!("{}1{}", "f(".repeat(60), ")".repeat(60))).is_ok());
+        let ladder: String = (0..150).map(|i| format!("if (x == {i}) y = {i}; else ")).collect::<String>() + "y = -1;";
+        assert!(parse(&ladder).is_ok());
+        assert!(parse(&format!("{}1{}", "(".repeat(100), ")".repeat(100))).is_ok());
+    }
+
+    #[test]
+    fn more_of_the_language_parses_like_ecmascript() {
+        ok("new new X()()");
+        assert!(matches!(expr("[1,,2]"), Expr::Array(v) if v.len() == 3));
+        assert_eq!(expr("010"), Expr::Num(8.0));
+        assert_eq!(expr("08"), Expr::Num(8.0));
+        assert_eq!(expr("0"), Expr::Num(0.0));
+        assert_eq!(expr(r#""😀""#), Expr::Str("😀".into()), "a surrogate pair is one character");
+        assert_eq!(expr(r#""\uD83D x""#), Expr::Str("\u{fffd} x".into()));
+        assert!(tokenize(r#""\x+f""#).is_err() && tokenize(r#""\u+123""#).is_err() && tokenize(r#""\u{}""#).is_err());
+        // comments inside a template substitution
+        assert!(matches!(expr("`a${ /* } */ 1 }d`"), Expr::Template(p, e) if p == ["a", "d"] && e.len() == 1));
+        assert!(matches!(expr("`a${ 1 // }\n }d`"), Expr::Template(p, _) if p == ["a", "d"]));
+        // tagged templates call the tag with the strings and the values
+        assert!(matches!(expr("tag`x${1}y`"), Expr::Call(_, args) if args.len() == 2 && matches!(&args[0], Expr::Array(p) if p.len() == 2)));
+        assert_eq!(ok("a\n`t`").len(), 2, "a template on a new line is not a tag");
+        // every kind of line break ends a // comment and a statement
+        assert_eq!(ok("a = 1 // c\rb = 2").len(), 2);
+        assert_eq!(ok("a = 1 // c\u{2028}b = 2").len(), 2);
+        assert!(matches!(&ok("function f() { return\r1 }")[0], Stmt::Function(f) if f.body.len() == 2));
+        assert_eq!(ok("/* a\rb */ x = 1").len(), 1);
+        // HTML-style comments
+        assert_eq!(ok("<!-- hide\nvar x = 1\n--> done\nvar y = 2").len(), 2);
+        assert_eq!(ok("a = b --> 0").len(), 1, "`-->` after code is `b-- > 0`");
+        assert!(matches!(&ok("debugger;")[0], Stmt::Empty));
+        // things that must be rejected
+        for src in ["var null = 1", "var class = 1", "var import = 1", "const x;", "({if})", "({1})", "({\"a\"})", "super", "with (a) b"] {
+            assert!(parse(src).is_err(), "{src}");
+        }
+        assert!(ok("({if: 1, null: 2, class: 3})").len() == 1, "reserved words are fine as keys");
+        assert!(ok("var o = {a, b}; const z = 1;").len() == 2);
+    }
+
+    #[test]
+    fn error_lines_are_where_the_problem_is() {
+        assert!(bad("a = 1;\nb = 2;\nx = `${ 1 # }`;").starts_with("line 3"), "{}", bad("a = 1;\nb = 2;\nx = `${ 1 # }`;"));
+        assert!(bad("a\nb\nx = `${ 1 + + }`").starts_with("line 3"), "{}", bad("a\nb\nx = `${ 1 + + }`"));
+        assert!(bad("a.\n\n\n\n").starts_with("line 5"), "{}", bad("a.\n\n\n\n"));
+        assert!(bad("x = 1;\ny = `never\nends\nhere").starts_with("line 2"), "{}", bad("x = 1;\ny = `never\nends\nhere"));
+        assert!(bad("function f(\n\n").starts_with("line 3"), "{}", bad("function f(\n\n"));
+    }
+
+    #[test]
     fn hostile_input_is_bounded() {
         // deep nesting stops with an error instead of overflowing the stack
         let deep = format!("{}1{}", "(".repeat(5000), ")".repeat(5000));
@@ -1304,8 +1551,9 @@ mod tests {
         assert!(parse(&arrays).is_err());
         let unary = format!("{}x", "!".repeat(5000));
         assert!(parse(&unary).is_err());
-        let calls = format!("x{}", "(1)".repeat(10_000));
+        let calls = format!("x{}", "(1)".repeat(2_000));
         assert!(parse(&calls).is_ok(), "a long chain of calls is flat, not nested");
+        assert!(parse(&format!("x{}", "(1)".repeat(10_000))).is_err(), "but an enormous one is refused (its tree is dropped recursively)");
         let arrows = "x=>".repeat(5000) + "1";
         assert!(parse(&arrows).is_err());
         // a big but flat script parses in reasonable time

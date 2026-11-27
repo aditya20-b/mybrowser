@@ -1251,6 +1251,37 @@ impl Interp {
         });
         Interp::set_prop(&location, "replace", replace);
         self.location_obj = Value::Obj(location.clone());
+        // `history`: Back/Forward go to the tab; pushState/replaceState only change what the page
+        // reads as its address (the tab's history and address bar are not changed)
+        let history = self.new_object();
+        for (name, f) in [
+            ("back", (|i: &mut Interp, _: &Value, _: &[Value]| {
+                i.history_request = Some(-1);
+                Ok(Value::Undefined)
+            }) as NativeFn),
+            ("forward", |i, _, _| {
+                i.history_request = Some(1);
+                Ok(Value::Undefined)
+            }),
+            ("go", |i, _, a| {
+                let n = i.arg_number(a, 0)?;
+                if n < 0.0 {
+                    i.history_request = Some(-1);
+                } else if n > 0.0 {
+                    i.history_request = Some(1);
+                }
+                Ok(Value::Undefined)
+            }),
+            ("pushState", history_set_url),
+            ("replaceState", history_set_url),
+        ] {
+            let v = self.native(f);
+            Interp::set_prop(&history, name, v);
+        }
+        Interp::set_prop(&history, "length", Value::Num(1.0));
+        Interp::set_prop(&history, "state", Value::Null);
+        Interp::declare(&g, "history", Value::Obj(history.clone()), true);
+        Interp::set_prop(&window, "history", Value::Obj(history));
         let reload = self.native(|_, _, _| Ok(Value::Undefined));
         Interp::set_prop(&location, "reload", reload);
         Interp::set_prop(&window, "location", Value::Obj(location.clone()));
@@ -1333,6 +1364,25 @@ impl Interp {
 fn clear_timer(i: &mut Interp, _: &Value, a: &[Value]) -> Res {
     let id = i.arg_number(a, 0)?;
     i.timers.retain(|t| t.id as f64 != id);
+    Ok(Value::Undefined)
+}
+
+/// `history.pushState(state, title, url)` and `replaceState`: the page's address, as scripts read
+/// it, becomes `url` (only on the page's own origin, as in a browser).
+fn history_set_url(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
+    if let Some(v) = a.first() {
+        i.set_member(this, "state", v.clone())?;
+    }
+    let Some(target) = a.get(2).filter(|v| !matches!(v, Value::Undefined | Value::Null)).cloned() else { return Ok(Value::Undefined) };
+    let target = i.to_string(&target)?;
+    let Ok(current) = url::Url::parse(&i.page_url) else { return Ok(Value::Undefined) };
+    let Ok(next) = current.join(target.trim()) else { return Ok(Value::Undefined) };
+    if next.origin() != current.origin() || next.as_str().len() > 2000 {
+        return i.throw("SecurityError", "pushState can't change the address to another site");
+    }
+    i.page_url = next.to_string();
+    let loc = i.location_obj.clone();
+    i.set_member(&loc, "href", str_value(&i.page_url.clone()))?;
     Ok(Value::Undefined)
 }
 

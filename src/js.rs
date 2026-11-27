@@ -303,6 +303,8 @@ pub struct Interp {
     net_time: std::time::Duration,
     /// The page's own `location` object (put back if a script replaces the global with a string).
     location_obj: Value,
+    /// `history.back()` / `forward()` was called: the direction.
+    history_request: Option<i32>,
     /// Promises created so far.
     promises: u32,
     /// Promise callbacks waiting to run (microtasks), in order.
@@ -345,6 +347,11 @@ unsafe impl Send for ScriptHost {}
 
 impl ScriptHost {
     /// A navigation the scripts asked for (by `location.href = ...`), if any: a link to follow.
+    /// Back (-1) or forward (1), if the scripts called `history.back()`, `forward()` or `go(n)`.
+    pub fn requested_history(&mut self) -> Option<i32> {
+        self.interp().history_request.take()
+    }
+
     pub fn requested_navigation(&mut self) -> Option<(String, bool)> {
         self.interp().pending_navigation()
     }
@@ -633,6 +640,7 @@ impl Interp {
             net_time: std::time::Duration::ZERO,
             promises: 0,
             location_obj: Value::Undefined,
+            history_request: None,
             jobs: std::collections::VecDeque::new(),
             joining: vec![],
             console: vec![],
@@ -3487,6 +3495,25 @@ mod tests {
                  try { var {boom} = null } catch (e) { console.log('null source throws') }"),
             "1 2 5 6\n10 30 40,50\nQ R0 R1 dflt\n6 24\nn2\n1,2,z 1,5,z 1,2,w\na1,b2\na1,b2,1none,2t\nu1,w2\nnull source throws"
         );
+    }
+
+    #[test]
+    fn history_push_state_changes_the_address_scripts_read_but_not_the_site() {
+        let dom = crate::html::parse("<body></body>");
+        let script = "history.pushState({n: 1}, '', '/app/page2?x=1'); console.log(location.href, history.state.n);
+                      history.replaceState(null, '', '#frag'); console.log(location.href);
+                      try { history.pushState(null, '', 'https://evil.example/') } catch (e) { console.log(e.name) }
+                      history.pushState(null, ''); console.log(location.href);
+                      history.back(); history.forward(); history.go(0)";
+        let mut done = run_page_scripts(dom, "https://app.example/app/", vec![(script.to_string(), "s".to_string())]).expect("ran");
+        assert_eq!(
+            done.console,
+            ["https://app.example/app/page2?x=1 1", "https://app.example/app/page2?x=1#frag", "SecurityError", "https://app.example/app/page2?x=1#frag"]
+        );
+        // the last of back/forward asked for is what the tab will do (and nothing here navigates the page)
+        assert_eq!(done.host.requested_history(), Some(1));
+        assert_eq!(done.host.requested_history(), None);
+        assert_eq!(done.host.requested_navigation(), None);
     }
 
     #[test]

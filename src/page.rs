@@ -61,6 +61,8 @@ pub struct Page {
     pub console: Vec<String>,
     /// Where the scripts asked to go (`location.href = ...`): the tab takes it from here.
     pub nav_request: Option<(String, bool)>,
+    /// `history.back()` (-1) or `forward()` (1) from a script, for the tab to carry out.
+    pub history_request: Option<i32>,
     /// The stylesheets, kept so styles can be recomputed after scripts change the page.
     rules: Vec<Rule>,
     /// Nodes below this index have had their `<style>` taken into `rules`.
@@ -549,8 +551,11 @@ impl Page {
         let dom_len = dom.nodes.len();
         let mut scripts = scripts;
         let nav_request = scripts.as_mut().and_then(|h| h.requested_navigation());
+        if let Some(h) = scripts.as_mut() {
+            h.requested_history(); // (a page can't go Back while it is loading)
+        }
         let layout = Layout { items: vec![], links: vec![], controls: vec![], boxes: vec![], anchors: vec![], height: 0.0, canvas_bg: None };
-        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false, no_store: false, scripts, console, nav_request, rules, styled_upto: dom_len }
+        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false, no_store: false, scripts, console, nav_request, history_request: None, rules, styled_upto: dom_len }
     }
 
     /// The innermost block element whose box contains layout position `(x, y)`: where a click
@@ -577,6 +582,9 @@ impl Page {
         let prevented = host.dispatch(&mut self.dom, node, event);
         if let Some(target) = host.requested_navigation() {
             self.nav_request = Some(target);
+        }
+        if let Some(direction) = host.requested_history() {
+            self.history_request = Some(direction);
         }
         for line in host.take_console() {
             if self.console.len() < MAX_CONSOLE_LINES {

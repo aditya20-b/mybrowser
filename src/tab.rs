@@ -847,6 +847,15 @@ impl Tab {
         let prevented = self.page.run_event(node, "click");
         self.form_changed(); // (the scripts may have changed what is on the page)
         // a handler that set `location.href` sends the tab there, as a followed link would
+        // `history.back()` / `forward()` from the handler: the tab goes back or forward
+        if let Some(direction) = self.page.history_request.take() {
+            if direction < 0 {
+                self.go_back();
+            } else {
+                self.go_forward();
+            }
+            return true;
+        }
         // (the click is only taken from the link if the handler's address went somewhere)
         if let Some((href, replace)) = self.page.nav_request.take() {
             let went = if replace {
@@ -1740,6 +1749,18 @@ mod tests {
         assert!(deliver(&mut tab, &rx));
         let l = (0..tab.page.dom.nodes.len()).find(|&n| tab.page.dom.tag(n) == Some("a")).unwrap();
         assert!(!tab.script_click(l), "the handler went nowhere, so the link keeps its own click");
+        // history.back() from a click handler is the Back button
+        std::fs::write(dir.join("backbtn.html"), "<p id=p>x</p><script>document.getElementById('p').onclick = function () { history.back() }</script>").unwrap();
+        tab.open(a.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.open(file("backbtn.html"));
+        assert!(deliver(&mut tab, &rx));
+        let p = (0..tab.page.dom.nodes.len()).find(|&n| tab.page.dom.attr(n, "id") == Some("p")).unwrap();
+        assert!(tab.script_click(p));
+        if tab.is_loading() {
+            assert!(deliver(&mut tab, &rx)); // (or the page came back from memory at once)
+        }
+        assert_eq!(tab.page.url, a, "Back went to the page before");
         // a click handler that sets location (and stops the link) sends the tab on
         tab.open(file("click.html"));
         assert!(deliver(&mut tab, &rx));

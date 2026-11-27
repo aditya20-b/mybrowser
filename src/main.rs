@@ -639,7 +639,7 @@ impl App {
                             self.submit_form(id, button);
                         }
                     }
-                    Some(ControlKind::Checkbox | ControlKind::Radio | ControlKind::Select) => self.activate_control(id),
+                    Some(ControlKind::Checkbox | ControlKind::Radio | ControlKind::Select | ControlKind::Button) => self.activate_control(id),
                     _ => {}
                 }
                 self.tab_mut().form_changed();

@@ -187,6 +187,22 @@ pub fn options(dom: &Dom, select: NodeId) -> Vec<(String, String)> {
     out
 }
 
+/// For each option of a select (in `options` order): can it be chosen? An option is
+/// disabled by its own attribute or by an enclosing `<optgroup disabled>`.
+pub fn option_enabled(dom: &Dom, select: NodeId) -> Vec<bool> {
+    let mut out = vec![];
+    let mut stack: Vec<(NodeId, bool)> = dom.nodes[select].children.iter().rev().map(|&c| (c, false)).collect();
+    while let Some((n, group_off)) = stack.pop() {
+        if dom.tag(n) == Some("option") {
+            out.push(!group_off && dom.attr(n, "disabled").is_none());
+        } else {
+            let off = group_off || (dom.tag(n) == Some("optgroup") && dom.attr(n, "disabled").is_some());
+            stack.extend(dom.nodes[n].children.iter().rev().map(|&c| (c, off)));
+        }
+    }
+    out
+}
+
 /// The most characters a text control accepts: its `maxlength`, capped.
 fn max_chars(dom: &Dom, id: NodeId) -> usize {
     dom.attr(id, "maxlength")
@@ -415,13 +431,17 @@ impl FormState {
             return;
         }
         let cur = self.selected_index(dom, id);
+        // disabled options are skipped, as in browsers
+        let enabled: Vec<usize> = option_enabled(dom, id).iter().enumerate().filter(|(_, e)| **e).map(|(i, _)| i).collect();
         let next = match step {
-            SelectStep::Prev => cur.saturating_sub(1),
-            SelectStep::Next => (cur + 1).min(n - 1),
-            SelectStep::First => 0,
-            SelectStep::Last => n - 1,
+            SelectStep::Prev => enabled.iter().rev().find(|&&i| i < cur),
+            SelectStep::Next => enabled.iter().find(|&&i| i > cur),
+            SelectStep::First => enabled.first(),
+            SelectStep::Last => enabled.last(),
         };
-        self.selected.insert(id, next);
+        if let Some(&next) = next {
+            self.selected.insert(id, next);
+        }
     }
 
     /// Move focus to the next (or previous) focusable control, wrapping around.
@@ -550,6 +570,33 @@ mod tests {
 
     fn find(dom: &Dom, tag: &str, nth: usize) -> NodeId {
         (0..dom.nodes.len()).filter(|&i| dom.tag(i) == Some(tag)).nth(nth).unwrap_or_else(|| panic!("no {tag} #{nth}"))
+    }
+
+    #[test]
+    fn stepping_through_a_select_skips_disabled_options() {
+        let step = |markup: &str, steps: &[SelectStep]| {
+            let dom = html::parse(markup);
+            let s = by_name(&dom, "s");
+            let mut st = FormState::default();
+            for &k in steps {
+                st.step_select(&dom, s, k);
+            }
+            st.value(&dom, s)
+        };
+        let one = "<select name=s><option value=a>A<option value=b disabled>B<option value=c>C</select>";
+        assert_eq!(step(one, &[SelectStep::Next]), "c");
+        assert_eq!(step(one, &[SelectStep::Last, SelectStep::Prev]), "a");
+        let group = "<select name=s><option value=a>A<optgroup disabled><option value=b>B</optgroup><option value=c>C</select>";
+        assert_eq!(step(group, &[SelectStep::Next]), "c");
+        // (unclosed options and groups still end up as siblings, not nested in each other)
+        let loose = "<select name=s><optgroup disabled><option value=a>A<option value=b>B<optgroup><option value=c>C<option value=d>D</select>";
+        assert_eq!(step(loose, &[SelectStep::Next]), "c");
+        assert_eq!(step(loose, &[SelectStep::Last, SelectStep::Prev]), "c");
+        let ends = "<select name=s><option value=a disabled>A<option value=b selected>B<option value=c disabled>C</select>";
+        assert_eq!((step(ends, &[SelectStep::First]).as_str(), step(ends, &[SelectStep::Last]).as_str()), ("b", "b"));
+        assert_eq!(step(ends, &[SelectStep::Next]), "b", "nowhere to go");
+        let all_off = "<select name=s><option value=a disabled>A<option value=b disabled>B</select>";
+        assert_eq!(step(all_off, &[SelectStep::Next, SelectStep::Last]), "a");
     }
 
     #[test]

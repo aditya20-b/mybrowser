@@ -177,7 +177,12 @@ fn close_implied(dom: &Dom, stack: &mut Vec<NodeId>, tag: &str) {
         "tr" => pop_to(dom, stack, &["tr"], &["table"]),
         "td" | "th" => pop_to(dom, stack, &["td", "th"], &["tr", "table"]),
         "thead" | "tbody" | "tfoot" => pop_to(dom, stack, &["thead", "tbody", "tfoot"], &["table"]),
-        "option" => pop_to(dom, stack, &["option"], &["select", "datalist"]),
+        "option" => pop_to(dom, stack, &["option"], &["select", "datalist", "optgroup"]),
+        "optgroup" => {
+            // a new group ends the open option and the open group
+            pop_to(dom, stack, &["option"], &["optgroup", "select", "datalist"]);
+            pop_to(dom, stack, &["optgroup"], &["select", "datalist"]);
+        }
         "a" => pop_to(dom, stack, &["a"], &[]),
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             let top = dom.tag(*stack.last().unwrap()).unwrap_or("");

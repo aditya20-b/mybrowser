@@ -271,10 +271,10 @@ impl App {
     }
 
     /// Cmd+Plus, Cmd+Minus, Cmd+0: zoom the page in this tab.
+    /// (the window title shows the level when it isn't 100%; the next redraw clamps the scroll)
     fn zoom_by(&mut self, direction: i32) {
-        let zoom = self.tab_mut().zoom_step(direction);
-        self.clamp_scroll();
-        self.bar.error = Some(format!("Zoom {}%", (zoom * 100.0).round()));
+        self.tab_mut().zoom_step(direction);
+        self.set_title();
         self.request_redraw();
     }
 
@@ -288,7 +288,8 @@ impl App {
         if let Some(w) = &self.window {
             let tab = self.tab();
             let title = if tab.is_loading() { "Loading…".to_string() } else { tab.title() };
-            w.set_title(&format!("{title} — mybrowser"));
+            let zoom = if (tab.zoom - 1.0).abs() > 0.001 { format!(" ({}%)", (tab.zoom * 100.0).round()) } else { String::new() };
+            w.set_title(&format!("{title} — mybrowser{zoom}"));
         }
     }
 
@@ -922,6 +923,19 @@ impl App {
                 true
             }
             Key::Character(c) if cmd => match c.as_str().to_ascii_lowercase().as_str() {
+                // zoom works wherever the focus is (also while typing an address)
+                "=" | "+" => {
+                    self.zoom_by(1);
+                    true
+                }
+                "-" => {
+                    self.zoom_by(-1);
+                    true
+                }
+                "0" => {
+                    self.zoom_by(0);
+                    true
+                }
                 "t" | "w" if event.repeat => true, // holding the key must not open or close dozens of tabs
                 "t" if self.modifiers.shift_key() => {
                     self.reopen_closed_tab();
@@ -981,9 +995,6 @@ impl App {
             Key::Character(c) if cmd => match c.as_str().to_ascii_lowercase().as_str() {
                 "l" => self.focus_address_bar(),
                 "d" => self.toggle_bookmark(),
-                "=" | "+" => self.zoom_by(1),
-                "-" => self.zoom_by(-1),
-                "0" => self.zoom_by(0),
                 "b" if self.modifiers.shift_key() => self.open(Url::parse("about:bookmarks").expect("a constant, valid URL")),
                 "r" => self.reload(),
                 "[" => self.go_back(),
@@ -1000,8 +1011,8 @@ impl App {
                 form.focus_next(dom, !shift);
                 tab.form_changed();
             }
-            Key::Named(NamedKey::ArrowDown) => self.scroll_by(48.0),
-            Key::Named(NamedKey::ArrowUp) => self.scroll_by(-48.0),
+            Key::Named(NamedKey::ArrowDown) => self.scroll_by(48.0 / self.tab().zoom),
+            Key::Named(NamedKey::ArrowUp) => self.scroll_by(-48.0 / self.tab().zoom),
             Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => self.scroll_by(page),
             Key::Named(NamedKey::PageUp) => self.scroll_by(-page),
             Key::Named(NamedKey::Home) => self.scroll_by(-1e9),
@@ -1108,7 +1119,9 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => -y * 48.0,
                     MouseScrollDelta::PixelDelta(p) => -(p.y as f32) / self.scale(),
                 };
-                self.scroll_by(dy);
+                // (window pixels moved, in page units)
+                let zoom = self.tab().zoom;
+                self.scroll_by(dy / zoom);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);

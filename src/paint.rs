@@ -145,9 +145,8 @@ impl Painter {
 
     /// Draw the find-in-page overlay on an already painted page: every match
     /// tinted yellow (the selected one orange), and a small search box at the top
-    /// right showing the query and "n of m". `scroll` is the page's scroll offset.
-    #[allow(clippy::too_many_arguments)]
-    /// `zoom` is the page zoom: match highlights follow the page, the search box stays its size.
+    /// right showing the query and "n of m". `scroll` is the page's scroll offset and `zoom`
+    /// the page zoom: match highlights follow the page, the search box stays its size.
     #[allow(clippy::too_many_arguments)]
     pub fn paint_find(&mut self, buf: &mut [u32], w: usize, h: usize, fonts: &Fonts, scale: f32, zoom: f32, scroll: f32, find: &Find) {
         let scale = sane_scale(scale);

@@ -517,11 +517,17 @@ impl Tab {
             .enumerate()
             .min_by(|a, b| (a.1 - self.zoom).abs().total_cmp(&(b.1 - self.zoom).abs()))
             .map_or(0, |(i, _)| i);
+        let before = self.zoom;
         self.zoom = match direction {
             0 => 1.0,
             d if d > 0 => ZOOM_STEPS[(at + 1).min(ZOOM_STEPS.len() - 1)],
             _ => ZOOM_STEPS[at.saturating_sub(1)],
         };
+        // A page laid out `zoom` times narrower is about that much taller, so scaling the scroll
+        // by the same factor keeps roughly the same part of it in view.
+        if before > 0.0 {
+            self.scroll *= self.zoom / before;
+        }
         self.laid_out_width = -1.0;
         self.zoom
     }
@@ -1719,6 +1725,13 @@ mod tests {
         // an odd value (say from a future setting) snaps to the nearest level first
         tab.zoom = 1.3;
         assert_eq!(tab.zoom_step(1), 1.5);
+        // zooming keeps roughly the same part of the page in view
+        tab.zoom = 1.0;
+        tab.scroll = 1000.0;
+        tab.zoom_step(1);
+        assert!((tab.scroll - 1100.0).abs() < 0.5, "{}", tab.scroll);
+        tab.zoom_step(0);
+        assert!((tab.scroll - 1000.0).abs() < 0.5, "{}", tab.scroll);
         // every level is distinct and ascending
         assert!(ZOOM_STEPS.windows(2).all(|w| w[0] < w[1]));
     }

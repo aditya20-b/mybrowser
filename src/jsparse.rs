@@ -1011,6 +1011,7 @@ impl Parser {
             if *inner.peek() != Tok::Eof {
                 return inner.err("bad expression in template");
             }
+            self.arguments_seen |= inner.arguments_seen;
             exprs.push(e);
         }
         Ok(exprs)

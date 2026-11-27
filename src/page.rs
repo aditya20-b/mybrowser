@@ -91,6 +91,19 @@ fn run_scripts(dom: Dom, src: &str, url: &Url, resolve: &dyn Fn(&str) -> Option<
         if dom.tag(id) != Some("script") || !runs_as_javascript(dom.attr(id, "type")) {
             continue;
         }
+        // a script inside `<noscript>` (which scripts replace) or `<template>` (inert) doesn't run
+        let mut up = dom.nodes[id].parent;
+        let mut inert = false;
+        while let Some(p) = up {
+            if matches!(dom.tag(p), Some("noscript" | "template")) {
+                inert = true;
+                break;
+            }
+            up = dom.nodes[p].parent;
+        }
+        if inert {
+            continue;
+        }
         if entries.len() >= MAX_SCRIPTS {
             break;
         }
@@ -116,16 +129,25 @@ fn run_scripts(dom: Dom, src: &str, url: &Url, resolve: &dyn Fn(&str) -> Option<
     let mut console = vec![];
     let mut list = vec![];
     let mut total = 0usize;
+    // (the same URL may be used twice: decode it once, keep the text)
+    let mut texts: HashMap<String, Option<String>> = HashMap::new();
     for e in entries {
         let (text, name) = match e {
             Entry::Inline(t) => (t, "inline script".to_string()),
-            Entry::External(u) => match fetched.remove(u.as_str()).filter(|f| f.status < 400) {
-                Some(f) => (net::decode_text(&f.body, f.charset.as_deref(), false), u.to_string()),
-                None => {
-                    console.push(format!("could not load script {u}"));
-                    continue;
+            Entry::External(u) => {
+                let key = u.to_string();
+                if !texts.contains_key(&key) {
+                    let text = fetched.remove(&key).filter(|f| f.status < 400).map(|f| net::decode_text(&f.body, f.charset.as_deref(), false));
+                    texts.insert(key.clone(), text);
                 }
-            },
+                match texts.get(&key).cloned().flatten() {
+                    Some(t) => (t, key),
+                    None => {
+                        console.push(format!("could not load script {u}"));
+                        continue;
+                    }
+                }
+            }
         };
         total += text.len();
         if total > MAX_SCRIPT_BYTES {
@@ -435,7 +457,8 @@ impl Page {
             }
         }
         // An http(s) page must never be able to read local files.
-        let allowed = |target: &Url| !(matches!(url.scheme(), "http" | "https") && target.scheme() == "file");
+        // (and a `data:` page can't either: local files are only for pages that are local files)
+        let allowed = |target: &Url| !(target.scheme() == "file" && url.scheme() != "file");
         // Resource URLs are compared without their `#fragment` (it never reaches the server).
         let resolve = |href: &str| base.join(href.trim()).ok().map(|u| without_fragment(&u)).filter(&allowed);
 
@@ -816,6 +839,25 @@ mod tests {
         // a page without scripts ignores events
         let mut plain = Page::from_source(&Url::parse("file:///tmp/d.html").unwrap(), "<a href=x>x</a>");
         assert!(!plain.run_event(1, "click"));
+    }
+
+    #[test]
+    fn script_edge_cases_from_review() {
+        // the same script twice, and scripts that are inert in <noscript> / <template>
+        let p = Page::from_source(
+            &Url::parse("http://example.invalid/").unwrap(),
+            "<body><script src='data:text/javascript,console.log(1)'></script><script src='data:text/javascript,console.log(1)'></script>\
+             <noscript><script>console.log('noscript')</script></noscript><template><script>console.log('template')</script></template></body>",
+        );
+        assert_eq!(p.console, vec!["1", "1"], "{:?}", p.console);
+        // a data: page can't load a local file either
+        let dir = std::env::temp_dir().join(format!("mybrowser-scripts3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("s.js"), "console.log('ran')").unwrap();
+        let src = format!("<body><script src='{}'></script></body>", url_of(&dir.join("s.js")));
+        let p = Page::from_source(&Url::parse("data:text/html,x").unwrap(), &src);
+        assert!(p.scripts.is_none() && !p.console.contains(&"ran".to_string()), "{:?}", p.console);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

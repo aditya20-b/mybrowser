@@ -681,7 +681,8 @@ fn el_by_class(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
 fn class_target(i: &mut Interp, this: &Value) -> Result<NodeId, Ctrl> {
     let n = i.get_member(this, "__node")?;
     match n {
-        Value::Num(n) if n >= 0.0 => Ok(n as usize),
+        // (the id is a plain property a script can forge: it must name a real node)
+        Value::Num(n) if n >= 0.0 && dom_ref(i).is_some_and(|d| (n as usize) < d.nodes.len()) => Ok(n as usize),
         _ => i.throw("TypeError", "not a class list"),
     }
 }
@@ -797,7 +798,10 @@ impl Interp {
                 }
             }
         }
-        chain.push(DOCUMENT);
+        // an event reaches the document only from a node that is in it (not a detached element)
+        if id == DOCUMENT || chain.last() == Some(&0) {
+            chain.push(DOCUMENT);
+        }
         let ev = self.new_object();
         Interp::set_prop(&ev, "type", str_value(event));
         let target = if id == DOCUMENT { Value::Null } else { wrap(self, id) };
@@ -877,6 +881,20 @@ impl Interp {
             self.clock = self.clock.max(timer.due);
             runs += 1;
             self.steps = MAX_STEPS - TIMER_STEPS; // (each callback gets its own, smaller, budget)
+            // an interval is queued again before it runs, so that `clearInterval` inside its own
+            // callback finds it
+            if let Some(every) = timer.interval {
+                if timer.runs + 1 < INTERVAL_RUNS && self.timers.len() < MAX_TIMERS {
+                    self.timers.push(Timer {
+                        id: timer.id,
+                        due: timer.due + every,
+                        func: timer.func.clone(),
+                        args: timer.args.clone(),
+                        interval: timer.interval,
+                        runs: timer.runs + 1,
+                    });
+                }
+            }
             let result = self.call(&timer.func, &Value::Undefined, &timer.args);
             match result {
                 Ok(_) => {}
@@ -889,11 +907,6 @@ impl Interp {
                     break;
                 }
                 Err(_) => {}
-            }
-            if let Some(every) = timer.interval {
-                if timer.runs + 1 < INTERVAL_RUNS && self.timers.len() < MAX_TIMERS {
-                    self.timers.push(Timer { due: timer.due + every, runs: timer.runs + 1, ..timer });
-                }
             }
         }
         self.timers.clear();

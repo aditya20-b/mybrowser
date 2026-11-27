@@ -3223,6 +3223,22 @@ mod tests {
     }
 
     #[test]
+    fn review_findings_about_page_scripts() {
+        // `arguments` inside a template literal
+        assert_eq!(run("function f(){ return `${arguments[0]}` } console.log(f(5))"), "5");
+        assert_eq!(run("function f(){ return [1].map(() => `${arguments[0]}`)[0] } console.log(f(9))"), "9");
+        // a forged class list target is refused, not a panic
+        let (log, _) = page("<body></body>", &["try { document.body.classList.add.call({__node: 1e9}, 'x') } catch (e) { console.log('refused') }"]);
+        assert_eq!(log, "refused");
+        // an interval can stop itself
+        let (log, _) = page("<body></body>", &["var n=0, id=setInterval(function(){ n++; console.log('tick ' + n); clearInterval(id) }, 10)"]);
+        assert_eq!(log, "tick 1");
+        // events from a detached element don't reach the document
+        let (log, _) = page("<body></body>", &["document.addEventListener('click', function(){ console.log('document') }); document.createElement('div').click(); document.body.click()"]);
+        assert_eq!(log, "document");
+    }
+
+    #[test]
     fn arguments_is_built_only_when_a_function_uses_it() {
         assert_eq!(run("function f(){return arguments.length} console.log(f(1,2,3))"), "3");
         assert_eq!(run("function f(){return (function(){return 1})() + arguments[0]} console.log(f(5))"), "6");

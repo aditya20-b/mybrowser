@@ -3,7 +3,7 @@
 use crate::dom::{Dom, Kind, NodeId};
 use std::collections::HashMap;
 
-const VOID: &[&str] = &[
+pub const VOID: &[&str] = &[
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source",
     "track", "wbr",
 ];

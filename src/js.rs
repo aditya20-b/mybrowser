@@ -9,10 +9,14 @@
 //! runs too long is stopped (the stop can't be caught by `try`), recursion has a depth limit, and
 //! strings and arrays have size limits.
 #![allow(dead_code)]
+use crate::dom::Dom;
 use crate::jsparse::{self, DeclKind, Expr, ForInit, Func, PropKey, Stmt};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+mod dom_bindings;
+use dom_bindings::{Listener, Timer};
 
 /// Evaluation steps a script may take in total.
 const MAX_STEPS: u64 = 20_000_000;
@@ -66,6 +70,8 @@ pub enum Kind {
     Native(NativeFn),
     /// `f.bind(thisArg, ...args)`: the function, the `this` it is called with, and leading arguments.
     Bound(Box<(Value, Value, Vec<Value>)>),
+    /// An element or text node of the page (see `dom_bindings`).
+    Node(usize),
     Error,
 }
 
@@ -128,6 +134,106 @@ pub struct Interp {
     pub console: Vec<String>,
     console_bytes: usize,
     rng: u64,
+    // ---- the page (see `dom_bindings`)
+    /// The page's DOM, held here while scripts run.
+    dom: Option<Dom>,
+    page_url: String,
+    document: Value,
+    wrappers: HashMap<usize, ObjRef>,
+    listeners: Vec<Listener>,
+    timers: Vec<Timer>,
+    timer_seq: u64,
+    /// Virtual time for timers, in milliseconds.
+    clock: f64,
+}
+
+// ------------------------------------------------------------------ running a page's scripts
+
+/// A value that is moved to another thread by hand: the interpreter is full of `Rc`s, which are
+/// not `Send`, but all of them live inside the one `Interp`, and an `Interp` only ever moves
+/// whole while nothing else holds a reference into it (the thread that ran it has finished).
+struct Unsend<T>(T);
+// SAFETY: see above. Every `Rc` the interpreter owns is reachable only through it, so moving the
+// whole interpreter to another thread, and using it from only one thread at a time, is sound.
+unsafe impl<T> Send for Unsend<T> {}
+
+/// The scripts of a page, kept alive after loading so events can reach their handlers.
+pub struct ScriptHost(Unsend<Interp>);
+// SAFETY: as `Unsend`: the interpreter inside is only touched by one thread at a time.
+unsafe impl Send for ScriptHost {}
+
+/// The stack scripts run on: they recurse as deep as they nest, up to the interpreter's limits.
+const SCRIPT_STACK: usize = 256 * 1024 * 1024;
+
+pub struct PageScripts {
+    /// The DOM after the scripts ran.
+    pub dom: Dom,
+    /// What they wrote to the console (and their uncaught errors).
+    pub console: Vec<String>,
+    pub host: ScriptHost,
+}
+
+/// Run a page's scripts in order (each is its source and a name for error messages), then fire
+/// `DOMContentLoaded` and `load` listeners and the timers they set. Scripts share one global scope and
+/// one budget; an error in one is logged and the next one still runs.
+pub fn run_page_scripts(dom: Dom, url: &str, scripts: Vec<(String, String)>) -> Option<PageScripts> {
+    let url = url.to_string();
+    let job = Unsend((dom, scripts));
+    let result = std::thread::Builder::new()
+        .stack_size(SCRIPT_STACK)
+        .spawn(move || {
+            let job = job;
+            let (dom, scripts) = job.0;
+            let mut interp = Interp::for_page(dom, &url);
+            for (source, name) in scripts {
+                if let Err(message) = interp.run(&source) {
+                    interp.log_line(format!("{name}: {message}"));
+                }
+                interp.refresh_document();
+            }
+            for event in ["DOMContentLoaded", "load"] {
+                let _ = interp.dispatch(dom_bindings::DOCUMENT, event);
+            }
+            interp.run_timers();
+            let dom = interp.dom.take().unwrap_or_else(Dom::new);
+            let console = std::mem::take(&mut interp.console);
+            Unsend((dom, console, interp))
+        })
+        .ok()?
+        .join()
+        .ok()?;
+    let (dom, console, interp) = result.0;
+    Some(PageScripts { dom, console, host: ScriptHost(Unsend(interp)) })
+}
+
+impl ScriptHost {
+    /// A click (or another event) on `node`: run the page's handlers for it, with the page's DOM.
+    /// Returns the DOM afterwards, and whether a handler called `preventDefault()`.
+    pub fn dispatch(&mut self, dom: &mut Dom, node: usize, event: &str) -> bool {
+        let event = event.to_string();
+        // the DOM goes into the interpreter for the duration, and comes back out (even if the thread fails)
+        self.0 .0.dom = Some(std::mem::replace(dom, Dom::new()));
+        let job = Unsend(&mut self.0 .0);
+        let outcome = std::thread::scope(|scope| {
+            let handle = std::thread::Builder::new().stack_size(SCRIPT_STACK).spawn_scoped(scope, move || {
+                let job = job;
+                let interp = job.0;
+                let prevented = interp.dispatch(node, &event).unwrap_or(false);
+                interp.run_timers();
+                prevented
+            });
+            handle.ok().and_then(|h| h.join().ok())
+        });
+        if let Some(back) = self.0 .0.dom.take() {
+            *dom = back;
+        }
+        outcome.unwrap_or(false)
+    }
+
+    /// Lines the scripts have logged since the last call.
+    pub fn take_console(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.0 .0.console)
+    }
 }
 
 // ------------------------------------------------------------------ conversions
@@ -290,8 +396,26 @@ impl Interp {
             console: vec![],
             console_bytes: 0,
             rng: 0x2545F4914F6CDD1D,
+            dom: None,
+            page_url: String::new(),
+            document: Value::Undefined,
+            wrappers: HashMap::new(),
+            listeners: vec![],
+            timers: vec![],
+            timer_seq: 0,
+            clock: 0.0,
         };
         interp.install_globals();
+        interp
+    }
+
+    /// An interpreter for a page: `document`, `window`, timers and the page's DOM.
+    pub fn for_page(dom: Dom, url: &str) -> Interp {
+        let mut interp = Interp::new();
+        interp.page_url = url.chars().take(2000).collect();
+        interp.dom = Some(dom);
+        interp.install_dom_globals();
+        interp.refresh_document();
         interp
     }
 
@@ -813,6 +937,15 @@ impl Interp {
             }),
             Value::Bool(_) => Ok(if name == "toString" { self.native(bool_to_string) } else { Value::Undefined }),
             Value::Obj(o) => {
+                // an element or text node of the page: what the script set on the object itself, else the DOM
+                let node = if let Kind::Node(id) = o.borrow().kind { Some(id) } else { None };
+                if let Some(id) = node {
+                    let own = o.borrow().props.get(name).cloned();
+                    return match own {
+                        Some(v) => Ok(v),
+                        None => dom_bindings::node_get(self, id, name),
+                    };
+                }
                 // own properties, then the prototype chain
                 let mut cur = Some(o.clone());
                 while let Some(obj) = cur {
@@ -885,6 +1018,10 @@ impl Interp {
         match target {
             Value::Undefined | Value::Null => self.throw("TypeError", &format!("Cannot set properties of {} (setting '{name}')", if matches!(target, Value::Null) { "null" } else { "undefined" })),
             Value::Obj(o) => {
+                let node = if let Kind::Node(id) = o.borrow().kind { Some(id) } else { None };
+                if let Some(id) = node {
+                    return dom_bindings::node_set(self, id, name, value);
+                }
                 let mut b = o.borrow_mut();
                 if let Kind::Array(a) = &mut b.kind {
                     if let Some(i) = array_index(name) {
@@ -2707,6 +2844,154 @@ mod tests {
         assert_eq!(run("var o = {}; o.o = o; JSON.stringify(o)"), "ERR JSON.stringify: too deeply nested (or circular)");
         // an error in the script text is reported, not a crash
         assert!(run("var = ;").starts_with("ERR line 1"));
+    }
+
+    /// Run scripts against a page; returns what they logged and the page's final markup (`<body>` content).
+    fn page(html: &'static str, scripts: &'static [&'static str]) -> (String, String) {
+        let dom = crate::html::parse(html);
+        let list = scripts.iter().enumerate().map(|(n, s)| (s.to_string(), format!("script {}", n + 1))).collect();
+        let done = run_page_scripts(dom, "http://test.example/page", list).expect("scripts ran");
+        let body = (0..done.dom.nodes.len()).find(|&n| done.dom.tag(n) == Some("body")).unwrap();
+        (done.console.join("\n"), dom_bindings::inner_html_for_tests(&done.dom, body))
+    }
+
+    #[test]
+    fn scripts_read_and_change_the_page() {
+        let (log, html) = page(
+            "<body><p id=a>hi <b>there</b></p><ul id=l></ul></body>",
+            &["var p = document.getElementById('a'); console.log(p.tagName, p.textContent, p.innerHTML, p.nodeType, document.getElementById('nope'));
+              p.textContent = 'changed';
+              var l = document.getElementById('l');
+              for (var i = 0; i < 3; i++) { var li = document.createElement('li'); li.textContent = 'item ' + i; li.className = 'x'; l.appendChild(li) }
+              console.log(l.children.length, l.firstChild.textContent, l.lastChild.className, l.childNodes.length)"],
+        );
+        assert_eq!(log, "P hi there hi <b>there</b> 1 null\n3 item 0 x 3");
+        assert_eq!(html, "<p id=\"a\">changed</p><ul id=\"l\"><li class=\"x\">item 0</li><li class=\"x\">item 1</li><li class=\"x\">item 2</li></ul>");
+    }
+
+    #[test]
+    fn queries_attributes_and_class_lists() {
+        let (log, html) = page(
+            "<body><div class='a b' id=d><span class=a>1</span><span>2</span><p class='a'>3</p></div><input id=i value=v></body>",
+            &["var d = document.querySelector('#d');
+              console.log(document.querySelectorAll('.a').length, d.querySelectorAll('span').length, d.querySelector('p.a').textContent, document.querySelector('.zzz'), document.querySelectorAll('span, p').length);
+              console.log(document.getElementsByTagName('span').length, document.getElementsByClassName('a b').length, d.getElementsByTagName('*').length);
+              console.log(d.getAttribute('class'), d.getAttribute('nope'), d.hasAttribute('id'));
+              d.setAttribute('data-x', '5'); d.removeAttribute('id'); d.classList.add('c'); d.classList.remove('a'); console.log(d.classList.contains('b'), d.classList.toggle('b'), d.classList.toggle('z'), d.className);
+              var i = document.querySelector('input'); console.log(i.value, i.id); i.value = 'new'; i.disabled = true; console.log(i.getAttribute('value'), i.hasAttribute('disabled'));
+              try { document.querySelector('<<<') } catch (e) { console.log(e.name) }"],
+        );
+        assert_eq!(log, "3 2 3 null 3\n2 1 3\na b null true\ntrue false true c z\nv i\nnew true\nSyntaxError");
+        assert!(html.contains("data-x=\"5\"") && html.contains("class=\"c z\"") && html.contains("disabled") && !html.contains("id=\"d\""), "{html}");
+    }
+
+    #[test]
+    fn inner_html_text_nodes_and_tree_moves() {
+        let (log, html) = page(
+            "<body><div id=box><i>old</i></div><div id=other></div></body>",
+            &["var box = document.getElementById('box');
+              box.innerHTML = '<p>one</p><p class=\"two\">t&amp;w<br>o</p><script>console.log(\"must not run\")</script>';
+              console.log(box.children.length, box.querySelector('.two').textContent, box.innerHTML);
+              var other = document.getElementById('other');
+              var p = box.firstChild; other.appendChild(p); console.log(box.children.length, other.children.length, p.parentNode === other, p === other.firstChild);
+              var t = document.createTextNode('txt'); other.insertBefore(t, p); console.log(other.childNodes.length, other.firstChild.nodeType, other.firstChild.nodeValue, other.textContent);
+              var q = other.removeChild(p); console.log(other.children.length, q.textContent);
+              var c = box.cloneNode(true); console.log(c.children.length, c.parentNode, c === box);
+              other.remove(); console.log(document.getElementById('other'));
+              var n = document.createElement('section'); n.innerHTML = '<em>x</em>'; document.body.appendChild(n); console.log(document.body.lastChild.innerHTML, document.querySelector('section em').textContent);
+              try { n.appendChild(document.body) } catch (e) { console.log(e.name) }"],
+        );
+        assert_eq!(
+            log,
+            "3 t&wo <p>one</p><p class=\"two\">t&amp;w<br>o</p><script>console.log(\"must not run\")</script>\n2 1 true true\n2 3 txt txtone\n0 one\n2 null false\nnull\n<em>x</em> x\nError"
+        );
+        assert!(html.contains("<section><em>x</em></section>") && !html.contains("id=\"other\""), "{html}");
+    }
+
+    #[test]
+    fn event_listeners_bubble_and_can_be_stopped() {
+        let dom = crate::html::parse("<body><div id=outer><button id=b>go</button></div></body>");
+        let scripts = vec![(
+            "var log = [];
+             document.getElementById('b').addEventListener('click', function(e) { console.log('button', e.type, e.target.id, this.id, e.currentTarget.id) });
+             document.getElementById('outer').addEventListener('click', function(e) { console.log('outer', e.target.id); e.preventDefault() });
+             document.addEventListener('click', function(e) { console.log('document') });
+             document.getElementById('b').onclick = function() { console.log('onclick property') };
+             document.getElementById('b').onclick = function() { console.log('onclick replaced') };
+             var gone = function() { console.log('never') };
+             document.getElementById('b').addEventListener('click', gone);
+             document.getElementById('b').removeEventListener('click', gone);
+             document.addEventListener('DOMContentLoaded', function() { console.log('ready') });
+             window.addEventListener('load', function() { console.log('loaded') });"
+                .to_string(),
+            "s".to_string(),
+        )];
+        let mut done = run_page_scripts(dom, "http://t.example/", scripts).unwrap();
+        assert_eq!(done.console.join(","), "ready,loaded");
+        let b = (0..done.dom.nodes.len()).find(|&n| done.dom.attr(n, "id") == Some("b")).unwrap();
+        let mut dom = done.dom;
+        let prevented = done.host.dispatch(&mut dom, b, "click");
+        assert!(prevented, "a handler called preventDefault");
+        assert_eq!(done.host.take_console().join(","), "button click b b b,onclick replaced,outer b,document");
+        // a click on something with no handlers still bubbles up to the ones above it
+        let outer = (0..dom.nodes.len()).find(|&n| dom.attr(n, "id") == Some("outer")).unwrap();
+        assert!(done.host.dispatch(&mut dom, outer, "click"));
+        assert_eq!(done.host.take_console().join(","), "outer outer,document");
+        assert!(!done.host.dispatch(&mut dom, b, "mouseover"));
+        assert_eq!(done.host.take_console().len(), 0);
+        assert!(dom.nodes.len() > 3, "the DOM came back");
+    }
+
+    #[test]
+    fn stop_propagation_and_errors_in_handlers() {
+        let dom = crate::html::parse("<body><div id=o><p id=p>x</p></div></body>");
+        let scripts = vec![(
+            "document.getElementById('p').addEventListener('click', function(e) { console.log('p'); e.stopPropagation() });
+             document.getElementById('o').addEventListener('click', function() { console.log('o') });
+             document.getElementById('p').addEventListener('click', function() { throw new Error('boom') });
+             document.getElementById('p').addEventListener('click', function() { console.log('after the error') });"
+                .to_string(),
+            "s".to_string(),
+        )];
+        let mut done = run_page_scripts(dom, "http://t.example/", scripts).unwrap();
+        let p = (0..done.dom.nodes.len()).find(|&n| done.dom.attr(n, "id") == Some("p")).unwrap();
+        let mut dom = done.dom;
+        done.host.dispatch(&mut dom, p, "click");
+        assert_eq!(done.host.take_console().join(","), "p,Uncaught Error: boom,after the error");
+    }
+
+    #[test]
+    fn timers_run_in_order_of_their_delay() {
+        let (log, _) = page(
+            "<body></body>",
+            &["setTimeout(function() { console.log('c 30') }, 30);
+              setTimeout(function() { console.log('a 0') });
+              setTimeout(function(x, y) { console.log('b 10', x, y) }, 10, 'X', 'Y');
+              var id = setTimeout(function() { console.log('cancelled') }, 5); clearTimeout(id);
+              var n = 0; var iv = setInterval(function() { n++; console.log('tick', n) }, 7);
+              setTimeout(function() { setTimeout(function() { console.log('nested 50+') }, 20); console.log('d 50') }, 50);
+              console.log('sync')"],
+        );
+        // (the interval ticks at 7, 14 and 21, then stops)
+        assert_eq!(log, "sync\na 0\ntick 1\nb 10 X Y\ntick 2\ntick 3\nc 30\nd 50\nnested 50+");
+    }
+
+    #[test]
+    fn script_errors_are_logged_and_later_scripts_still_run() {
+        let (log, _) = page(
+            "<body><p id=p>x</p></body>",
+            &["var shared = 1; missing.call()", "console.log(shared); syntax error here", "console.log('third', typeof window, typeof document, typeof location.href, window === self, typeof globalThis.document)"],
+        );
+        // (a script with a syntax error doesn't run at all, so its `console.log` never happens)
+        assert_eq!(log, "script 1: Uncaught ReferenceError: missing is not defined\nscript 2: line 1: expected ';'\nthird object object string true object");
+    }
+
+    #[test]
+    fn a_script_cannot_grow_the_page_without_bound() {
+        let (log, _) = page("<body></body>", &["while (true) { document.body.appendChild(document.createElement('div')) }"]);
+        assert!(log.contains("script 1:") && (log.contains("too big") || log.contains("too long") || log.contains("too many")), "{log}");
+        let (log, _) = page("<body></body>", &["var s = 'x'.repeat(100000); var t = ''; for (var i = 0; i < 100; i++) { t += s } document.body.innerHTML = t + t + t + t + t + t + t + t + t + t + t + t"]);
+        assert!(log.contains("script 1:"), "{log}");
     }
 
     #[test]

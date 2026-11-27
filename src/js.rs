@@ -202,6 +202,8 @@ impl Drop for Interp {
         work.extend(self.wrappers.values().cloned().map(Visit::Obj));
         work.extend(self.listeners.iter().map(|l| Visit::Value(l.handler.clone())));
         work.extend(self.timers.iter().flat_map(|t| t.roots()).map(Visit::Value));
+        work.extend(self.jobs.iter().flat_map(|(f, a)| std::iter::once(f.clone()).chain(a.iter().cloned())).map(Visit::Value));
+        self.jobs.clear();
         while let Some(v) = work.pop() {
             match v {
                 Visit::Scope(s) => {
@@ -299,6 +301,8 @@ pub struct Interp {
     net_time: std::time::Duration,
     /// Promises created so far.
     promises: u32,
+    /// Promise callbacks waiting to run (microtasks), in order.
+    jobs: std::collections::VecDeque<(Value, Vec<Value>)>,
     /// Arrays being joined right now (a cycle joins as an empty string).
     joining: Vec<ObjRef>,
     /// What the script wrote with `console.log` and friends.
@@ -384,6 +388,7 @@ pub fn run_page_scripts(dom: Dom, url: &str, scripts: Vec<(String, String)>) -> 
                 if let Err(message) = interp.run(&source) {
                     interp.log_line(format!("{name}: {message}"));
                 }
+                interp.run_jobs(); // (promise callbacks run once each script has finished)
                 interp.refresh_document();
             }
             for event in ["DOMContentLoaded", "load"] {
@@ -616,6 +621,7 @@ impl Interp {
             requests: 0,
             net_time: std::time::Duration::ZERO,
             promises: 0,
+            jobs: std::collections::VecDeque::new(),
             joining: vec![],
             console: vec![],
             console_bytes: 0,
@@ -3358,6 +3364,45 @@ mod tests {
         assert!(at("then 1") < at("then 2") && at("then 2") < at("caught boom") && at("caught boom") < at("finally") && at("finally") < at("after finally recovered"));
         assert!(at("then 1") < at("timeout"), "callbacks run before the next timer: {log}");
         assert!(at("timeout") < at("all 1,2,3"));
+    }
+
+    #[test]
+    fn promise_callbacks_are_never_dropped_and_run_before_timers() {
+        let (log, _) = page(
+            "<body></body>",
+            &["setTimeout(function () { console.log('timer') }, 0);
+               Promise.resolve().then(function () { console.log('micro') });
+               console.log('sync');
+               var a = []; for (var i = 0; i < 1100; i++) a.push(i);
+               Promise.all(a).then(function (v) { console.log('all ' + v.length) });
+               var n = 0, p = Promise.resolve(); for (var k = 0; k < 1200; k++) p.then(function () { n++ });
+               setTimeout(function () { console.log('n ' + n) }, 0);
+               var c = Promise.resolve(0); for (var j = 0; j < 3000; j++) c = c.then(function (v) { return v + 1 });
+               c.then(function (v) { console.log('chain ' + v) });
+               "],
+        );
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(&lines[..2], ["sync", "micro"], "{log}");
+        assert!(lines.contains(&"all 1100") && lines.contains(&"n 1200") && lines.contains(&"chain 3000") && lines.contains(&"timer"), "{log}");
+        // a callback that never ends is stopped, and the page's timers still run
+        let (log, _) = page(
+            "<body></body>",
+            &["setTimeout(function () { console.log('timer') }, 0); Promise.resolve().then(function () { while (true) {} })"],
+        );
+        assert!(log.contains("ran for too long") && log.contains("timer"), "{log}");
+    }
+
+    #[test]
+    fn finally_waits_for_what_its_callback_returns() {
+        let (log, _) = page(
+            "<body></body>",
+            &["Promise.resolve(1).finally(function () { return Promise.reject(new Error('f')) }).then(function (v) { console.log('then ' + v) }, function (e) { console.log('rej ' + e.message) });
+               Promise.resolve(2).finally(function () { return 99 }).then(function (v) { console.log('kept ' + v) });
+               Promise.reject('r').finally(function () {}).catch(function (e) { console.log('still ' + e) })"],
+        );
+        let mut lines: Vec<&str> = log.lines().collect();
+        lines.sort();
+        assert_eq!(lines, ["kept 2", "rej f", "still r"], "{log}");
     }
 
     #[test]

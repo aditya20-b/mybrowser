@@ -9,11 +9,11 @@ use super::dom_bindings::{queue_job, script_request};
 use super::*;
 
 /// Most promises one page may create (each is an object; a loop can't make millions).
-const MAX_PROMISES: u32 = 50_000;
+const MAX_PROMISES: u32 = 300_000;
 
 fn new_promise(i: &mut Interp) -> Result<Value, Ctrl> {
     if i.promises >= MAX_PROMISES {
-        return Err(Ctrl::Abort("script made too many promises and was stopped".into()));
+        return i.throw("RangeError", "too many promises");
     }
     i.promises += 1;
     let p = i.new_object();
@@ -86,11 +86,14 @@ fn queue_reaction(i: &mut Interp, reaction: &Value, state: &str, value: &Value) 
         return Ok(());
     }
     let job = i.native(reaction_job);
-    queue_job(i, job, vec![parts[0].clone(), parts[1].clone(), parts[2].clone(), str_value(state), value.clone()]);
-    Ok(())
+    queue_job(i, job, vec![parts[0].clone(), parts[1].clone(), parts[2].clone(), str_value(state), value.clone()])
 }
 
 fn reaction_job(i: &mut Interp, _: &Value, a: &[Value]) -> Res {
+    // (these are reachable from script code with whatever arguments it likes)
+    if a.len() < 5 || !is_promise(i, &a[2]) {
+        return Ok(Value::Undefined);
+    }
     let (on_ok, on_err, child, state, value) = (a[0].clone(), a[1].clone(), a[2].clone(), a[3].clone(), a[4].clone());
     let fulfilled = matches!(&state, Value::Str(s) if &**s == "fulfilled");
     let handler = if fulfilled { on_ok } else { on_err };
@@ -127,14 +130,16 @@ fn resolve(i: &mut Interp, p: &Value, v: Value) -> Result<(), Ctrl> {
         };
         if then_fn.is_callable() {
             let job = i.native(follow_job);
-            queue_job(i, job, vec![v, then_fn, p.clone()]);
-            return Ok(());
+            return queue_job(i, job, vec![v, then_fn, p.clone()]);
         }
     }
     settle(i, p, "fulfilled", v)
 }
 
 fn follow_job(i: &mut Interp, _: &Value, a: &[Value]) -> Res {
+    if a.len() < 3 || !is_promise(i, &a[2]) {
+        return Ok(Value::Undefined);
+    }
     let (thenable, then_fn, p) = (a[0].clone(), a[1].clone(), a[2].clone());
     let on_ok = bound(i, resolve_native, p.clone(), vec![]);
     let on_err = bound(i, reject_native, p.clone(), vec![]);
@@ -169,10 +174,15 @@ fn then(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
     match state_of(i, this)?.as_str() {
         "pending" => {
             if let Value::Obj(list) = i.get_member(this, "__reactions")? {
-                if let Kind::Array(items) = &mut list.borrow_mut().kind {
-                    if items.len() < 10_000 {
+                let full = match &mut list.borrow_mut().kind {
+                    Kind::Array(items) if items.len() < 100_000 => {
                         items.push(reaction);
+                        false
                     }
+                    _ => true,
+                };
+                if full {
+                    return Err(Ctrl::Abort("too many callbacks wait on one promise; the script was stopped".into()));
                 }
             }
         }
@@ -200,14 +210,32 @@ fn finally(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
     then(i, this, &[on_ok, on_err])
 }
 
+/// What `finally`'s callback returned is waited for (a rejected promise from it wins); then the
+/// original outcome carries on.
+fn finally_after(i: &mut Interp, f: Option<&Value>, value: Value, rethrow: bool) -> Res {
+    let result = match f.filter(|f| f.is_callable()) {
+        Some(f) => i.call(f, &Value::Undefined, &[])?,
+        None => Value::Undefined,
+    };
+    let waited = promise_resolve(i, &Value::Undefined, &[result])?;
+    let carry = bound(i, if rethrow { carry_error } else { carry_value }, Value::Undefined, vec![value]);
+    then(i, &waited, &[carry])
+}
+
+fn carry_value(_: &mut Interp, _: &Value, a: &[Value]) -> Res {
+    Ok(a.first().cloned().unwrap_or(Value::Undefined))
+}
+
+fn carry_error(_: &mut Interp, _: &Value, a: &[Value]) -> Res {
+    Err(Ctrl::Throw(a.first().cloned().unwrap_or(Value::Undefined)))
+}
+
 fn finally_ok(i: &mut Interp, _: &Value, a: &[Value]) -> Res {
-    i.call(&a[0], &Value::Undefined, &[])?;
-    Ok(a.get(1).cloned().unwrap_or(Value::Undefined))
+    finally_after(i, a.first(), a.get(1).cloned().unwrap_or(Value::Undefined), false)
 }
 
 fn finally_err(i: &mut Interp, _: &Value, a: &[Value]) -> Res {
-    i.call(&a[0], &Value::Undefined, &[])?;
-    Err(Ctrl::Throw(a.get(1).cloned().unwrap_or(Value::Undefined)))
+    finally_after(i, a.first(), a.get(1).cloned().unwrap_or(Value::Undefined), true)
 }
 
 fn promise_construct(i: &mut Interp, _: &Value, a: &[Value]) -> Res {
@@ -270,6 +298,9 @@ fn promise_all(i: &mut Interp, _: &Value, a: &[Value]) -> Res {
 
 fn all_item_ok(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
     // arguments: index, the values array, the counter, then the value that arrived
+    if a.len() < 3 || !is_promise(i, this) {
+        return Ok(Value::Undefined);
+    }
     let index = i.to_number(&a[0])? as usize;
     let value = a.get(3).cloned().unwrap_or(Value::Undefined);
     if let Value::Obj(list) = &a[1] {
@@ -281,6 +312,9 @@ fn all_item_ok(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
     }
     let count = i.get_member(&a[2], "n")?;
     let left = i.to_number(&count)? - 1.0;
+    if !left.is_finite() {
+        return Ok(Value::Undefined);
+    }
     i.set_member(&a[2], "n", Value::Num(left))?;
     if left <= 0.0 {
         resolve(i, this, a[1].clone())?;

@@ -1121,6 +1121,7 @@ impl Interp {
     /// Run the pending timers in order of their time (virtual: nothing waits), including ones they
     /// schedule, until none are left or a limit is reached. Intervals fire a few times, then stop.
     pub fn run_timers(&mut self) {
+        self.run_jobs();
         let mut runs = 0;
         let mut all_timers_spent: u64 = 0;
         while runs < MAX_TIMER_RUNS {
@@ -1168,6 +1169,7 @@ impl Interp {
                 }
                 Err(_) => {}
             }
+            self.run_jobs(); // (promise callbacks go before the next timer)
         }
         self.timers.clear();
     }
@@ -1355,11 +1357,46 @@ pub(super) fn script_request(i: &mut Interp, method: &str, url: &str, body: Opti
 }
 
 /// Run `func(args)` soon, after the code that is running now (a promise's callbacks).
-pub(super) fn queue_job(i: &mut Interp, func: Value, args: Vec<Value>) {
-    if i.timers.len() < MAX_TIMERS {
-        i.timer_seq += 1;
-        let (id, due) = (i.timer_seq, i.clock);
-        i.timers.push(Timer { id, due, func, args, interval: None, runs: 0 });
+pub(super) fn queue_job(i: &mut Interp, func: Value, args: Vec<Value>) -> Result<(), Ctrl> {
+    if i.jobs.len() >= MAX_JOBS {
+        // (never dropped quietly: a promise that never settles is much harder to understand than a stopped script)
+        return Err(Ctrl::Abort("too many promise callbacks are waiting; the script was stopped".into()));
+    }
+    i.jobs.push_back((func, args));
+    Ok(())
+}
+
+/// Most promise callbacks that may be waiting at once, and most one drain may run.
+const MAX_JOBS: usize = 200_000;
+const MAX_JOBS_PER_DRAIN: usize = 200_000;
+
+impl Interp {
+    /// Run the queued promise callbacks (microtasks), including those they queue, until none are
+    /// left. They run after the code that queued them and before the next timer or event.
+    pub(super) fn run_jobs(&mut self) {
+        let mut ran = 0;
+        while let Some((func, args)) = self.jobs.pop_front() {
+            ran += 1;
+            if ran > MAX_JOBS_PER_DRAIN {
+                self.log_line("promise callbacks ran for too long and were stopped".into());
+                self.jobs.clear();
+                return;
+            }
+            match self.call(&func, &Value::Undefined, &args) {
+                Ok(_) => {}
+                Err(Ctrl::Throw(e)) => {
+                    let msg = self.describe_error(&e);
+                    self.log_line(format!("Uncaught {msg}"));
+                }
+                Err(Ctrl::Abort(m)) => {
+                    // the budget is spent: what is still waiting would only run into it again
+                    self.log_line(m);
+                    self.jobs.clear();
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
     }
 }
 

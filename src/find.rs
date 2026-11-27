@@ -5,7 +5,9 @@
 //!
 //! The layout emits one text item per word, so the search first stitches the words
 //! of each visual line back together (a space wherever there is a gap). A match lies
-//! within one line: a phrase that wraps onto the next line isn't found.
+//! within one line: a phrase that wraps onto the next line isn't found. Every block
+//! and table cell starts with a `Nop` placeholder in the display list; that ends the line,
+//! so a phrase can't run from one cell into the next.
 use crate::fonts::Fonts;
 use crate::layout::{Item, Layout};
 
@@ -34,8 +36,19 @@ pub struct Find {
 
 /// Lower-case one character without changing how many characters there are,
 /// so character positions in the folded text are positions in the original.
+/// A no-break space counts as an ordinary space.
 fn fold(c: char) -> char {
+    if c == '\u{a0}' {
+        return ' ';
+    }
     c.to_lowercase().next().unwrap_or(c)
+}
+
+/// Characters that are never drawn and have no width (zero-width spaces and joiners,
+/// soft hyphens, byte-order marks, variation selectors): what you can't see, you
+/// can't find, and they must not split a word you can.
+fn is_ignorable(c: char) -> bool {
+    matches!(c, '\u{ad}' | '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}' | '\u{fe00}'..='\u{fe0f}')
 }
 
 impl Find {
@@ -139,7 +152,7 @@ fn search_line(line: &Line, needle: &[char], out: &mut Vec<Match>) {
 
 /// Every occurrence of `query` (ignoring case) in the page's text, in reading order.
 pub fn find_all(layout: &Layout, fonts: &Fonts, query: &str) -> Vec<Match> {
-    let needle: Vec<char> = query.chars().map(fold).collect();
+    let needle: Vec<char> = query.chars().filter(|c| !is_ignorable(*c)).map(fold).collect();
     let mut out = vec![];
     if needle.is_empty() {
         return out;
@@ -150,9 +163,13 @@ pub fn find_all(layout: &Layout, fonts: &Fonts, query: &str) -> Vec<Match> {
         *line = Line::default();
     };
     for item in &layout.items {
+        // the start of a block or table cell: whatever came before is a different line
+        if matches!(item, Item::Nop) {
+            flush(&mut line, &mut out);
+            continue;
+        }
         let Item::Text { x, baseline, text, size, face, .. } = item else { continue };
-        let chars: Vec<char> = text.chars().collect();
-        if chars.is_empty() {
+        if text.is_empty() {
             continue;
         }
         // is this word the continuation of the line so far?
@@ -171,12 +188,16 @@ pub fn find_all(layout: &Layout, fonts: &Fonts, query: &str) -> Vec<Match> {
             line.left.push(from);
             line.right.push(*x);
         }
-        for k in 0..chars.len() {
-            let before: String = chars[..k].iter().collect();
-            let upto: String = chars[..=k].iter().collect();
-            line.chars.push(chars[k]);
-            line.left.push(x + fonts.measure(*face, *size, &before));
-            line.right.push(x + fonts.measure(*face, *size, &upto));
+        // one running pen position: every glyph's advance is added once (no kerning in this
+        // engine), so a long word costs time in proportion to its length
+        let mut pen = *x;
+        let mut buf = [0u8; 4];
+        for c in text.chars().filter(|c| !is_ignorable(*c)) {
+            let advance = fonts.measure(*face, *size, c.encode_utf8(&mut buf));
+            line.chars.push(c);
+            line.left.push(pen);
+            pen += advance;
+            line.right.push(pen);
         }
         if out.len() >= MAX_MATCHES {
             break;
@@ -269,6 +290,48 @@ mod tests {
         assert_eq!(find_all(&layout, &fonts, "alpha").len(), 1);
         assert_eq!(find_all(&layout, &fonts, "beta").len(), 1);
         assert!(find_all(&layout, &fonts, "alpha beta").is_empty(), "a wide gap ends the line");
+        // cells that nearly touch used to be stitched together (they are a few pixels apart)
+        let (layout, fonts) = laid_out("<table><tr><td>alpha</td><td>beta</td></tr></table>", 600.0);
+        assert!(find_all(&layout, &fonts, "alpha beta").is_empty());
+        assert!(find_all(&layout, &fonts, "alphabeta").is_empty());
+        assert_eq!(find_all(&layout, &fonts, "beta").len(), 1);
+        let (layout, fonts) = laid_out("<table cellpadding=0 cellspacing=0><tr><td>alpha</td><td>beta</td></tr></table>", 600.0);
+        assert!(find_all(&layout, &fonts, "alphabeta").is_empty());
+        // while text inside one cell, across inline elements, is still one phrase
+        let (layout, fonts) = laid_out("<table><tr><td>alpha <b>beta</b></td></tr></table>", 600.0);
+        assert_eq!(find_all(&layout, &fonts, "alpha beta").len(), 1);
+    }
+
+    #[test]
+    fn invisible_characters_neither_block_nor_create_matches() {
+        // a zero-width space inside a word is not drawn, so "ab" is what you see
+        let (layout, fonts) = laid_out("<p>a&#8203;b and c&#xFEFF;d</p>", 600.0);
+        assert_eq!(find_all(&layout, &fonts, "ab").len(), 1);
+        assert_eq!(find_all(&layout, &fonts, "cd").len(), 1);
+        // and typing one into the query doesn't change what matches
+        assert_eq!(find_all(&layout, &fonts, "a\u{200b}b").len(), 1);
+        assert!(find_all(&layout, &fonts, "\u{200b}").is_empty(), "a query of nothing visible finds nothing");
+    }
+
+    #[test]
+    fn a_no_break_space_matches_a_normal_space() {
+        let (layout, fonts) = laid_out("<p>price&nbsp;list and price list</p>", 600.0);
+        assert_eq!(find_all(&layout, &fonts, "price list").len(), 2);
+        assert_eq!(find_all(&layout, &fonts, "price\u{a0}list").len(), 2);
+    }
+
+    #[test]
+    fn one_enormous_word_is_searched_in_linear_time() {
+        // every character used to be measured from the start of the word: quadratic
+        let (layout, fonts) = laid_out(&format!("<p style='width:100000px'>{}</p>", "x".repeat(20_000)), 600.0);
+        let t = std::time::Instant::now();
+        assert!(find_all(&layout, &fonts, "xy").is_empty());
+        assert_eq!(find_all(&layout, &fonts, "xxxxxxxxxx").len(), 2000, "capped");
+        assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+        // highlight positions still add up: the match of the whole word spans its width
+        let (layout, fonts) = laid_out("<style>body{margin:0}</style><p style='margin:0'>wide</p>", 600.0);
+        let m = find_all(&layout, &fonts, "wide");
+        assert!((m[0].w - fonts.measure(crate::fonts::Face { family: crate::fonts::Family::Sans, bold: false, italic: false }, m[0].size, "wide")).abs() < 0.5);
     }
 
     #[test]

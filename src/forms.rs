@@ -453,6 +453,10 @@ impl FormState {
 
     /// Is this `<details>` showing its content?
     pub fn details_open(&self, dom: &Dom, details: NodeId) -> bool {
+        // with no <summary> there is no heading to click, so it is never collapsed
+        if !dom.nodes[details].children.iter().any(|&c| dom.tag(c) == Some("summary")) {
+            return true;
+        }
         self.details.get(&details).copied().unwrap_or_else(|| dom.attr(details, "open").is_some())
     }
 
@@ -660,6 +664,18 @@ mod tests {
 
     fn find(dom: &Dom, tag: &str, nth: usize) -> NodeId {
         (0..dom.nodes.len()).filter(|&i| dom.tag(i) == Some(tag)).nth(nth).unwrap_or_else(|| panic!("no {tag} #{nth}"))
+    }
+
+    #[test]
+    fn a_details_without_a_summary_is_always_open_for_focus_and_reveal() {
+        let dom = html::parse("<details><p id=t>t</p><input name=a></details><input name=b>");
+        let a = by_name(&dom, "a");
+        let t = (0..dom.nodes.len()).find(|&n| dom.attr(n, "id") == Some("t")).unwrap();
+        let mut st = FormState::default();
+        st.focus_next(&dom, true);
+        assert_eq!(st.focus, Some(a), "the visible field can be tabbed to");
+        assert!(!st.in_closed_details(&dom, a));
+        assert!(!st.reveal(&dom, t), "nothing was hidden, so nothing was revealed");
     }
 
     #[test]

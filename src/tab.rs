@@ -503,16 +503,17 @@ impl Tab {
     /// Scroll to the target of `fragment` in the current layout. Returns whether
     /// anything matched (otherwise the page stays where it is).
     pub fn scroll_to_fragment(&mut self, fragment: &str) -> bool {
+        // A target (the first element with that id, as in browsers) inside a closed <details>
+        // opens it first, then we lay out again and scroll once that has happened. (Checked
+        // before looking for a laid-out target, so a visible duplicate id can't win.)
+        if self.page.reveal_fragment(fragment) {
+            self.pending_fragment = Some(fragment.to_string());
+            self.laid_out_width = -1.0;
+            return true;
+        }
         match self.page.fragment_y(fragment) {
             Some(y) => {
                 self.scroll = y.max(0.0); // clamped to the page on the next redraw
-                true
-            }
-            None if self.page.reveal_fragment(fragment) => {
-                // the target was inside a closed <details>: it is open now, so lay out again and
-                // scroll once that has happened
-                self.pending_fragment = Some(fragment.to_string());
-                self.laid_out_width = -1.0;
                 true
             }
             None => false,
@@ -1578,6 +1579,20 @@ mod tests {
         assert_eq!(tab.page.url.fragment(), Some("deep"));
         // a target that doesn't exist still does nothing
         assert!(!tab.page.reveal_fragment("nope"));
+        // with a visible duplicate id further down, the first one (in the closed details) still wins
+        tab.page = Page::from_source(
+            &Url::parse("file:///tmp/dup.html").unwrap(),
+            "<style>body{margin:0}p{margin:0;height:600px}</style><details><summary>More</summary><h2 id=x style='margin:0'>first</h2></details><p>pad</p><h2 id=x style='margin:0'>second</h2>",
+        );
+        tab.page.relayout(&fonts, 400.0);
+        tab.laid_out_width = 400.0;
+        tab.scroll = 0.0;
+        tab.scroll_to_fragment("x");
+        assert_eq!(tab.laid_out_width, -1.0, "the closed details is opened first");
+        tab.page.relayout(&fonts, 400.0);
+        tab.laid_out_width = 400.0;
+        tab.settle_fragment();
+        assert!(tab.scroll < 100.0, "scrolled to the first #x, not the second: {}", tab.scroll);
     }
 
     #[test]

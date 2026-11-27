@@ -504,7 +504,13 @@ impl Tab {
     /// is a message for the address bar.
     pub fn submit_form(&mut self, control: NodeId, submitter: Option<NodeId>) -> Result<(), String> {
         let Some(form_el) = forms::form_of(&self.page.dom, control) else { return Ok(()) };
-        let Some(sub) = self.page.form.submit(&self.page.dom, form_el, submitter, &self.page.url) else { return Ok(()) };
+        // An action written in the page resolves against the page's `<base href>`; a form with
+        // no action at all submits to the document's own address.
+        let dom = &self.page.dom;
+        let written = |el: NodeId, attr: &str| dom.attr(el, attr).is_some_and(|v| !v.trim().is_empty());
+        let action_in_markup = written(form_el, "action") || submitter.is_some_and(|s| written(s, "formaction"));
+        let resolve_against = if action_in_markup { self.page.base.clone() } else { self.page.url.clone() };
+        let Some(sub) = self.page.form.submit(&self.page.dom, form_el, submitter, &resolve_against) else { return Ok(()) };
         let post = matches!(sub.method, forms::Method::Post);
         // pressing Enter twice must not send a POST twice (a duplicate order, say)
         if post && self.nav.is_loading() && self.inflight_post.is_some() {
@@ -605,6 +611,35 @@ mod tests {
         plain.page = Page::from_source(&u("file:///tmp/dir/p.html"), "<a href=x.html>x</a>");
         assert_eq!(plain.link_target("x.html"), Some(u("file:///tmp/dir/x.html")));
         assert_eq!(plain.link_target("#top"), None, "a fragment of the page itself is not a navigation");
+    }
+
+    #[test]
+    fn a_form_action_resolves_against_the_base_href() {
+        let fonts = crate::fonts::Fonts::load();
+        let (notify, _rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        tab.page = Page::from_source(&u("file:///tmp/dir/p.html"), "<base href='file:///elsewhere/'><form action=go><input name=q value=1></form>");
+        tab.page.relayout(&fonts, 400.0);
+        let input = tab.page.layout.controls[0].node;
+        assert_eq!(tab.submit_form(input, None), Ok(()));
+        assert_eq!(tab.nav.pending().unwrap().url, u("file:///elsewhere/go?q=1"));
+        // a button's own formaction does too
+        let mut tab = Tab::blank(2, queue().0);
+        tab.page = Page::from_source(
+            &u("file:///tmp/dir/p.html"),
+            "<base href='file:///elsewhere/'><form><input name=q value=1><button formaction=other>go</button></form>",
+        );
+        tab.page.relayout(&fonts, 400.0);
+        let (input, button) = (tab.page.layout.controls[0].node, tab.page.layout.controls[1].node);
+        assert_eq!(tab.submit_form(input, Some(button)), Ok(()));
+        assert_eq!(tab.nav.pending().unwrap().url, u("file:///elsewhere/other?q=1"));
+        // but a form with no action submits to the page itself, whatever the base says
+        let mut tab = Tab::blank(3, queue().0);
+        tab.page = Page::from_source(&u("file:///tmp/dir/p.html"), "<base href='file:///elsewhere/'><form><input name=q value=1></form>");
+        tab.page.relayout(&fonts, 400.0);
+        let input = tab.page.layout.controls[0].node;
+        assert_eq!(tab.submit_form(input, None), Ok(()));
+        assert_eq!(tab.nav.pending().unwrap().url, u("file:///tmp/dir/p.html?q=1"));
     }
 
     #[test]

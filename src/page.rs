@@ -245,14 +245,16 @@ impl Page {
         let src = src.replace("\r\n", "\n").replace('\r', "\n");
         let dom = html::parse(&src);
 
-        // <base href> changes how every relative URL in the document resolves.
+        // <base href> changes how every relative URL in the document resolves. The first
+        // <base> that has a usable href is the one that counts (`<base target=_blank>` alone
+        // doesn't change anything).
         let mut base = url.clone();
         for id in 0..dom.nodes.len() {
             if dom.tag(id) == Some("base") {
                 if let Some(b) = dom.attr(id, "href").and_then(|h| url.join(h.trim()).ok()) {
                     base = b;
+                    break;
                 }
-                break;
             }
         }
         // An http(s) page must never be able to read local files.
@@ -535,6 +537,20 @@ mod tests {
         // an unparseable base is ignored
         let p = Page::from_source(&Url::parse("https://example.org/a/b.html").unwrap(), "<base href='http://[bad'><p>x</p>");
         assert_eq!(p.base, p.url);
+    }
+
+    #[test]
+    fn the_first_base_with_a_usable_href_is_the_one_that_counts() {
+        let doc = Url::parse("https://example.org/a/b.html").unwrap();
+        // `<base target=_blank>` has no href: it must not hide the real one after it
+        let p = Page::from_source(&doc, "<base target=_blank><base href='/real/'><p>x</p>");
+        assert_eq!(p.base.as_str(), "https://example.org/real/");
+        // and when two have an href the first one wins
+        let p = Page::from_source(&doc, "<base href='/one/'><base href='/two/'>");
+        assert_eq!(p.base.as_str(), "https://example.org/one/");
+        // an unusable first one is skipped
+        let p = Page::from_source(&doc, "<base href='http://[bad'><base href='/two/'>");
+        assert_eq!(p.base.as_str(), "https://example.org/two/");
     }
 
     // ---------- images ----------

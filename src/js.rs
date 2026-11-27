@@ -22,6 +22,8 @@ use dom_bindings::{Listener, Timer};
 /// Steps one event, and one timer callback, may take (a page has many of them).
 const EVENT_STEPS: u64 = 5_000_000;
 const TIMER_STEPS: u64 = 2_000_000;
+/// Steps one drain of the promise callback queue may take.
+const JOB_STEPS: u64 = 5_000_000;
 /// Steps all the timer callbacks run after one event or load may take together.
 const ALL_TIMER_STEPS: u64 = 8_000_000;
 
@@ -426,8 +428,10 @@ impl ScriptHost {
                 if interp.retained >= MAX_SCRIPT_MEMORY {
                     // the page has used all it may keep: its handlers no longer run
                     interp.log_line("script used too much memory and was stopped".into());
+                    interp.jobs.clear();
                     return false;
                 }
+                interp.promises = 0; // (a page may make many promises over its life: the limit is for one run)
                 interp.mem_limit = start + (MAX_SCRIPT_MEMORY - interp.retained);
                 let prevented = match interp.dispatch(node, &event) {
                     Ok(p) => p,
@@ -3481,6 +3485,40 @@ mod tests {
         assert!(run("class A { get x() { return 1 } }").starts_with("ERR"), "accessors");
         assert!(run("class A { x = 1 }").contains("not supported"));
         assert_eq!(run("class A { 'quoted name'() { return 1 } } console.log(new A()['quoted name']())"), "1");
+    }
+
+    #[test]
+    fn job_budgets_and_leftovers_from_review() {
+        // a script that used nearly all its own steps still gets its promise callbacks run
+        let (log, _) = page(
+            "<body></body>",
+            &["Promise.resolve().then(function () { console.log('job ran') }); var i = 0; while (i < 3000000) i++;"],
+        );
+        assert_eq!(log, "job ran");
+        // a timer that is stopped takes its queued callbacks with it: they don't run in some later event
+        let dom = crate::html::parse("<body></body>");
+        let src = vec![(
+            "document.addEventListener('click', function () { console.log('click handler') });
+             setTimeout(function () { Promise.resolve().then(function () { console.log('STALE') }); while (true) {} }, 0)"
+                .to_string(),
+            "s".to_string(),
+        )];
+        let mut done = run_page_scripts(dom, "http://t.example/", src).expect("ran");
+        let mut dom = done.dom;
+        done.host.take_console();
+        done.host.dispatch(&mut dom, dom_bindings::DOCUMENT, "click");
+        let lines = done.host.take_console();
+        assert_eq!(lines, ["click handler"], "{lines:?}");
+        // the promise limit is for one run: many clicks that each make many promises all work
+        let dom = crate::html::parse("<body></body>");
+        let src = vec![("document.addEventListener('click', function () { for (var i = 0; i < 70000; i++) Promise.resolve(i); console.log('ok') })".to_string(), "s".to_string())];
+        let mut done = run_page_scripts(dom, "http://t.example/", src).expect("ran");
+        let mut dom = done.dom;
+        for _ in 0..5 {
+            done.host.dispatch(&mut dom, dom_bindings::DOCUMENT, "click");
+        }
+        let lines = done.host.take_console();
+        assert_eq!(lines, ["ok"; 5], "{lines:?}");
     }
 
     #[test]

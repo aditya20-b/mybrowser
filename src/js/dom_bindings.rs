@@ -1169,9 +1169,15 @@ impl Interp {
                 }
                 Err(_) => {}
             }
-            self.run_jobs(); // (promise callbacks go before the next timer)
+            // (promise callbacks go before the next timer; what they use counts towards the total)
+            all_timers_spent += self.run_jobs();
+            if all_timers_spent > ALL_TIMER_STEPS {
+                self.log_line("timers ran for too long and were stopped".into());
+                break;
+            }
         }
         self.timers.clear();
+        self.jobs.clear(); // (nothing left over may run later, in the middle of some other event)
     }
 
     // ---- the globals
@@ -1373,7 +1379,17 @@ const MAX_JOBS_PER_DRAIN: usize = 200_000;
 impl Interp {
     /// Run the queued promise callbacks (microtasks), including those they queue, until none are
     /// left. They run after the code that queued them and before the next timer or event.
-    pub(super) fn run_jobs(&mut self) {
+    /// Returns the steps they used. Each drain has a budget of its own, not what the code before it left.
+    pub(super) fn run_jobs(&mut self) -> u64 {
+        if self.jobs.is_empty() {
+            return 0;
+        }
+        self.steps = MAX_STEPS - JOB_STEPS;
+        self.run_jobs_inner();
+        self.steps.saturating_sub(MAX_STEPS - JOB_STEPS)
+    }
+
+    fn run_jobs_inner(&mut self) {
         let mut ran = 0;
         while let Some((func, args)) = self.jobs.pop_front() {
             ran += 1;

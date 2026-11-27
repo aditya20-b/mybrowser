@@ -121,6 +121,23 @@ pub fn controls_in(dom: &Dom, form: NodeId) -> Vec<NodeId> {
     (0..dom.nodes.len()).filter(|&n| kind_of(dom, n).is_some() && form_of(dom, n) == Some(form)).collect()
 }
 
+/// The control a `<label>` is for: the element its `for` names (if that is a visible
+/// control), otherwise the first visible control inside the label.
+pub fn label_target(dom: &Dom, label: NodeId) -> Option<NodeId> {
+    let usable = |n: NodeId| matches!(kind_of(dom, n), Some(k) if k != ControlKind::Hidden);
+    if let Some(target) = dom.attr(label, "for") {
+        return (0..dom.nodes.len()).find(|&n| dom.attr(n, "id") == Some(target)).filter(|&n| usable(n));
+    }
+    let mut stack: Vec<NodeId> = dom.nodes[label].children.iter().rev().copied().collect();
+    while let Some(n) = stack.pop() {
+        if usable(n) {
+            return Some(n);
+        }
+        stack.extend(dom.nodes[n].children.iter().rev().copied());
+    }
+    None
+}
+
 /// The `(value, label)` of each `<option>` in a `<select>`.
 pub fn options(dom: &Dom, select: NodeId) -> Vec<(String, String)> {
     let mut out = vec![];
@@ -417,6 +434,18 @@ mod tests {
 
     fn find(dom: &Dom, tag: &str, nth: usize) -> NodeId {
         (0..dom.nodes.len()).filter(|&i| dom.tag(i) == Some(tag)).nth(nth).unwrap_or_else(|| panic!("no {tag} #{nth}"))
+    }
+
+    #[test]
+    fn a_label_points_at_its_for_target_or_its_first_visible_control() {
+        let dom = html::parse("<label id=l1 for=a>A</label><input id=a name=a><label id=l2>B <input type=hidden name=h><input name=b></label><label id=l3 for=missing>C</label><label id=l4 for=hid>D</label><input id=hid type=hidden><label id=l5>none</label><label id=l6 for=a><input name=inner></label>");
+        let l = |id: &str| (0..dom.nodes.len()).find(|&n| dom.attr(n, "id") == Some(id)).unwrap();
+        assert_eq!(label_target(&dom, l("l1")), Some(l("a")));
+        assert_eq!(label_target(&dom, l("l2")), Some(by_name(&dom, "b")), "skips the hidden input");
+        assert_eq!(label_target(&dom, l("l3")), None);
+        assert_eq!(label_target(&dom, l("l4")), None, "a hidden control can't be focused");
+        assert_eq!(label_target(&dom, l("l5")), None);
+        assert_eq!(label_target(&dom, l("l6")), Some(l("a")), "`for` wins over a nested control");
     }
 
     fn by_name(dom: &Dom, name: &str) -> NodeId {

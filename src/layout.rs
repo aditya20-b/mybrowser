@@ -108,7 +108,7 @@ pub fn layout_document(
     }
     let mut cx = Ctx {
         dom, styles, fonts, images, form, has_block, items: vec![], links: vec![], controls: vec![], blocks: vec![],
-        forced_outer: None,
+        forced_outer: None, label_cache: HashMap::new(),
     };
     let (bottom, mb) = cx.layout_block(0, 0.0, 0.0, 0.0, width, None, false);
 
@@ -183,6 +183,8 @@ struct Ctx<'a> {
     /// The margin-box width the next `layout_block` call must use (set by a flex line that has
     /// decided how wide an item is; consumed at the start of that call).
     forced_outer: Option<f32>,
+    /// For each `<label>` met so far, the control it is for (looked up once).
+    label_cache: HashMap<NodeId, Option<NodeId>>,
 }
 
 fn resolve(l: Length, base: f32) -> Option<f32> {
@@ -226,6 +228,8 @@ struct Placed {
     image_h: Option<f32>,
     /// Some((ascent, descent)) if this is a form control.
     control: Option<(f32, f32)>,
+    /// The control this word's `<label>` is for: clicking the word activates it.
+    label: Option<NodeId>,
 }
 
 struct Line {
@@ -1018,6 +1022,19 @@ impl<'a> Ctx<'a> {
         (w.clamp(0.0, 20_000.0), h.clamp(0.0, 20_000.0))
     }
 
+    /// The control that the `<label>` around `node` (if any) is for.
+    fn label_of(&mut self, node: NodeId) -> Option<NodeId> {
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            if self.dom.tag(n) == Some("label") {
+                let dom = self.dom;
+                return *self.label_cache.entry(n).or_insert_with(|| forms::label_target(dom, n));
+            }
+            cur = self.dom.nodes[n].parent;
+        }
+        None
+    }
+
     fn href_of(&self, mut id: NodeId) -> Option<String> {
         loop {
             if self.dom.tag(id) == Some("a") {
@@ -1279,11 +1296,12 @@ impl<'a> Ctx<'a> {
                 sp = 0.0;
             }
             let href = self.href_of(node);
+            let label = if href.is_none() && control.is_none() && image_h.is_none() { self.label_of(node) } else { None };
             let line = lines.last_mut().unwrap();
             line.asc = line.asc.max(a);
             line.desc = line.desc.max(d);
             line.content = true;
-            line.words.push(Placed { text, node, x: cx + sp, w, href, image_h, control });
+            line.words.push(Placed { text, node, x: cx + sp, w, href, image_h, control, label });
             cx += sp + w;
             pending_space = None;
         }
@@ -1359,6 +1377,11 @@ impl<'a> Ctx<'a> {
                 }
                 if let Some(href) = &w.href {
                     self.links.push(LinkRegion { x: ax, y: cy, w: span, h: line_h, href: href.clone() });
+                }
+                // text in a <label> activates its control: a click region that hit-tests like one
+                if let Some(target) = w.label {
+                    let lspan = next.filter(|n| n.label == w.label).map_or(w.w, |n| n.x - w.x);
+                    self.controls.push(ControlRegion { x: ax, y: cy, w: lspan, h: line_h, node: target });
                 }
             }
             cy += line_h;
@@ -2805,6 +2828,31 @@ mod tests {
         let p = render("<form><input name=a><input type=checkbox><button>b</button><select><option>x</select><textarea></textarea></form>");
         assert_eq!(p.layout.controls.len(), 5);
         assert!(p.layout.controls.iter().all(|c| c.w > 0.0 && c.h > 0.0 && c.y + c.h <= p.layout.height + 1.0));
+    }
+
+    #[test]
+    fn clicking_label_text_reaches_its_control() {
+        let p = render("<p style='margin:0'><label for=c>Remember me</label> <input type=checkbox id=c></p><p style='margin:0'><label>Nested <input name=q></label></p><label>nothing here</label><label for=c><a href=x>link</a></label>");
+        let cb = p.dom.nodes.iter().position(|n| matches!(&n.kind, Kind::Element { attrs, .. } if attrs.get("id").map(String::as_str) == Some("c"))).unwrap();
+        let q = (0..p.dom.nodes.len()).find(|&i| p.dom.attr(i, "name") == Some("q")).unwrap();
+        let hit = |word: &str| {
+            let (x, b) = at(&p, word);
+            p.control_at(x + 2.0, b - 4.0)
+        };
+        assert_eq!(hit("Remember"), Some(cb));
+        assert_eq!(hit("me"), Some(cb));
+        assert_eq!(hit("Nested"), Some(q));
+        assert_eq!(hit("nothing"), None, "a label with no control does nothing");
+        assert_eq!(hit("link"), None, "a link inside a label stays a link");
+        // the gap between the two words is part of the label too
+        let (x, b) = at(&p, "me");
+        assert_eq!(p.control_at(x - 2.0, b - 4.0), Some(cb));
+        // a label's text shifted by a vertically centred table cell still hits where it is drawn
+        let t = render("<table style='border-spacing:0'><tr><td><label for=z>Lbl</label></td><td>1<br>2<br>3<br>4</td></tr></table><input id=z>");
+        let z = (0..t.dom.nodes.len()).find(|&i| t.dom.attr(i, "id") == Some("z")).unwrap();
+        let (x, b) = at(&t, "Lbl");
+        assert!(b > 20.0);
+        assert_eq!(t.control_at(x + 2.0, b - 4.0), Some(z));
     }
 
     #[test]

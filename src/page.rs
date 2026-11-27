@@ -2,7 +2,7 @@
 //! sub-resources -> style -> (layout, done per viewport width).
 use crate::css::{self, Rule};
 use crate::dom::{Dom, Kind, NodeId};
-use crate::download;
+use crate::download::{self, PendingDownload};
 use crate::fonts::Fonts;
 use crate::forms::{self, FormState};
 use crate::html;
@@ -46,6 +46,9 @@ pub struct Page {
     /// What the user has typed into, checked or chosen in the page's form controls.
     pub form: FormState,
     pub layout: Layout,
+    /// Set when the response was a file we can't display: this page is just a note about it,
+    /// and the tab decides (it knows who asked for the load) whether to save the file.
+    pub download: Option<PendingDownload>,
 }
 
 fn esc(s: &str) -> String {
@@ -225,28 +228,22 @@ impl Page {
         }
     }
 
-    /// Save a fetched file that can't be displayed, and build the page that says where it went.
-    fn downloaded(f: &Fetched, name: &str) -> Page {
-        let Some(dir) = download::downloads_dir() else {
-            return Page::error(&f.url, "Cannot display this file, and there is no downloads folder to save it in");
-        };
-        match download::save(&dir, name, &f.body) {
-            Ok(path) => {
-                let saved = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                Page::from_source(
-                    &f.url,
-                    &format!(
-                        "<title>Downloaded {}</title><h1>Downloaded</h1><p>{} ({} bytes, {}) was saved to <code>{}</code>. It has not been opened.</p>",
-                        esc(&truncate_chars(&saved, 120)),
-                        esc(&truncate_chars(&saved, 120)),
-                        f.body.len(),
-                        esc(&f.content_type),
-                        esc(&truncate_chars(&path.to_string_lossy(), 300)),
-                    ),
-                )
-            }
-            Err(e) => Page::error(&f.url, &format!("Cannot display this file, and saving it failed: {e}")),
-        }
+    /// The page for a file we can't display. Nothing is written here (this runs on a loader
+    /// thread, for loads that may be cancelled, superseded or not asked for by the user).
+    fn download_notice(f: &Fetched) -> Page {
+        let name = download::safe_file_name(&download::name_from_url(&f.url));
+        let mut page = Page::from_source(
+            &f.url,
+            &format!(
+                "<title>Download {}</title><h1>Download</h1><p>{} ({} bytes, {}) can't be shown in the browser.</p>",
+                esc(&truncate_chars(&name, 120)),
+                esc(&truncate_chars(&name, 120)),
+                f.body.len(),
+                esc(&f.content_type),
+            ),
+        );
+        page.download = Some(PendingDownload { name, content_type: f.content_type.clone(), body: f.body.clone() });
+        page
     }
 
     pub fn error(url: &Url, message: &str) -> Page {
@@ -266,8 +263,9 @@ impl Page {
             "text/html" | "application/xhtml+xml" => {
                 Page::from_source(&f.url, &net::decode_text(&f.body, f.charset.as_deref(), true))
             }
-            "text/plain" | "text/css" | "text/javascript" | "application/javascript" | "application/json"
-            | "text/xml" | "application/xml" | "text/markdown" => {
+            // any other text type (csv, python, ...) and structured +xml / +json types read as text
+            c if c.starts_with("text/") || c.ends_with("+xml") || c.ends_with("+json")
+                || matches!(c, "application/javascript" | "application/json" | "application/xml") => {
                 let text = net::decode_text(&f.body, f.charset.as_deref(), false);
                 Page::from_source(&f.url, &format!("<title>{}</title><pre>{}</pre>", esc(&name), esc(&text)))
             }
@@ -288,9 +286,12 @@ impl Page {
                     &format!("Cannot decode this {} image (it may be damaged, or a format we can't show yet: PNG, JPEG, GIF and WebP work)", f.content_type),
                 ),
             },
-            // something we can't show: a web server's file is saved to the downloads folder
-            // (never opened); a local file or data: URL of an unknown type just says so
-            _ if matches!(f.url.scheme(), "http" | "https") => Page::downloaded(&f, &name),
+            // something we can't show: a successful, non-empty response from a web server is a
+            // download (saved later, by the tab, only if the user asked for it); anything else
+            // (an error status, an empty body, a local file) just says it can't be shown
+            _ if matches!(f.url.scheme(), "http" | "https") && (200..300).contains(&f.status) && f.status != 204 && !f.body.is_empty() => {
+                Page::download_notice(&f)
+            }
             other => Page::error(&f.url, &format!("Cannot display content of type '{other}'")),
         };
         page.status = Some(f.status);
@@ -408,7 +409,7 @@ impl Page {
         }
 
         let layout = Layout { items: vec![], links: vec![], controls: vec![], anchors: vec![], height: 0.0, canvas_bg: None };
-        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout }
+        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None }
     }
 
     /// Re-run layout for a new viewport width (logical pixels), or after the
@@ -602,30 +603,44 @@ mod tests {
 
     #[test]
     fn a_file_the_browser_cannot_show_is_saved_not_displayed() {
-        let dir = std::env::temp_dir().join(format!("mybrowser-dlpage-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Loading only builds a page carrying the file: nothing is written by the loader.
         let payload = vec![0u8, 159, 146, 150, 1, 2, 3];
-        let (port, server) = serve_routes(vec![("/files/archive.zip", "application/zip", payload.clone()), ("/a%2Fb%2F..%2Fevil.bin", "application/octet-stream", payload.clone())], 2);
-        // (the variable is only read by loads that need a download; the other tests never do)
-        unsafe { std::env::set_var("MYBROWSER_DOWNLOADS", &dir) };
-        let p = Page::load(&Url::parse(&format!("http://127.0.0.1:{port}/files/archive.zip")).unwrap());
+        let (port, server) = serve_routes(
+            vec![
+                ("/files/archive.zip", "application/zip", payload.clone()),
+                ("/a%2Fb%2F..%2Fevil.bin", "application/octet-stream", payload.clone()),
+                ("/data.csv", "text/csv", b"a,b\n1,2".to_vec()),
+                ("/feed", "application/rss+xml", b"<rss/>".to_vec()),
+                ("/empty.bin", "application/octet-stream", vec![]),
+            ],
+            5,
+        );
+        let load = |path: &str| Page::load(&Url::parse(&format!("http://127.0.0.1:{port}{path}")).unwrap());
+        let p = load("/files/archive.zip");
         assert_eq!(p.status, Some(200));
-        assert!(p.title.starts_with("Downloaded archive.zip"), "{}", p.title);
-        assert_eq!(std::fs::read(dir.join("archive.zip")).unwrap(), payload);
-        assert!(p.dom.text_content(0).contains("has not been opened"));
-        // a hostile name stays inside the folder
-        let q = Page::load(&Url::parse(&format!("http://127.0.0.1:{port}/a%2Fb%2F..%2Fevil.bin")).unwrap());
+        let d = p.download.as_ref().expect("a download");
+        assert_eq!((d.name.as_str(), d.body.as_slice()), ("archive.zip", payload.as_slice()));
+        assert!(p.title.starts_with("Download archive.zip"), "{}", p.title);
+        // a hostile name is cleaned before it ever reaches the tab
+        let q = load("/a%2Fb%2F..%2Fevil.bin");
+        assert_eq!(q.download.as_ref().unwrap().name, "a_b_.._evil.bin");
+        // unknown text and structured types are shown, not downloaded
+        let csv = load("/data.csv");
+        assert!(csv.download.is_none() && csv.dom.text_content(0).contains("a,b"));
+        assert!(load("/feed").download.is_none());
+        // an empty body is not a file
+        let empty = load("/empty.bin");
         server.join().unwrap();
-        assert_eq!(q.status, Some(200));
-        let saved: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
-        assert_eq!(saved.len(), 2, "{saved:?}");
-        unsafe { std::env::remove_var("MYBROWSER_DOWNLOADS") };
-        // a local file of an unknown type is never "downloaded"
+        assert!(empty.download.is_none() && empty.title == "Error");
+        // errors and unknown files: 404s with an odd type, and local files of unknown type
+        let (port, server) = serve_routes(vec![], 1);
+        let missing = Page::load(&Url::parse(&format!("http://127.0.0.1:{port}/gone.zip")).unwrap());
+        server.join().unwrap();
+        assert!(missing.download.is_none() && missing.status == Some(404));
         let local = std::env::temp_dir().join(format!("mybrowser-unknown-{}.bin", std::process::id()));
         std::fs::write(&local, [0u8, 159, 146, 150]).unwrap();
         let l = Page::load(&Url::from_file_path(&local).unwrap());
-        assert_eq!(l.title, "Error");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(l.download.is_none() && l.title == "Error");
         let _ = std::fs::remove_file(&local);
     }
 

@@ -2,6 +2,7 @@
 //! flight. Everything here is independent of the window system (loaders report
 //! back through a plain callback), so it is unit-tested without opening one.
 use crate::dom::NodeId;
+use crate::download::{self, PendingDownload};
 use crate::forms::{self, ControlKind, FormState};
 use crate::net;
 use crate::page::Page;
@@ -253,6 +254,8 @@ pub struct Tab {
     /// Where each page left behind in this tab was scrolled to (by full URL, fragment included).
     scroll_memory: HashMap<(Url, usize), f32>,
     /// How many meta-refresh redirects led to the page on screen, and to the load in flight.
+    /// What happened to the last file the tab was asked to download (shown once).
+    notice: Option<String>,
     refresh_hops: u8,
     inflight_hops: u8,
     /// Set just before `begin_load` by a meta refresh; taken by it.
@@ -293,6 +296,7 @@ impl Tab {
             next_initiator: None,
             inflight_initiator: None,
             scroll_memory: HashMap::new(),
+            notice: None,
             refresh_hops: 0,
             inflight_hops: 0,
             next_hops: 0,
@@ -353,10 +357,13 @@ impl Tab {
 
     /// A loader thread delivered a page. Returns whether it was applied (a
     /// superseded or cancelled load is ignored).
-    pub fn finish_load(&mut self, ticket: u64, page: Page) -> bool {
+    pub fn finish_load(&mut self, ticket: u64, mut page: Page) -> bool {
         let Some(pending) = self.nav.finish(ticket) else { return false };
         self.inflight_post = None;
         self.inflight_initiator = None;
+        if let Some(download) = page.download.take() {
+            return self.land_download(pending, page, download);
+        }
         // `page.html#section`: jump there once the page has been laid out. A redirect that
         // names no fragment of its own keeps the one that was asked for, as in other browsers.
         // A reload that remembers where you were stays put instead.
@@ -387,6 +394,42 @@ impl Tab {
         self.refresh_hops = std::mem::take(&mut self.inflight_hops);
         self.follow_meta_refresh();
         true
+    }
+
+    /// A load landed on a file we can't display. The page you were on stays (a download is not
+    /// a navigation, so history and scroll are untouched) and the file is saved only if the
+    /// user asked for it: a link, address or form they opened, never a reload, Back, Forward or
+    /// a meta refresh (that would be a drive-by download, or one copy more each time). A load
+    /// that was cancelled or superseded never gets here, so it writes nothing either.
+    /// The outcome goes to `notice`, for the window to show. A tab that has shown nothing yet
+    /// (opened straight onto the file) shows the note page instead.
+    fn land_download(&mut self, pending: Pending, page: Page, download: PendingDownload) -> bool {
+        let hops = std::mem::take(&mut self.inflight_hops);
+        // (a tab opened straight onto an address has shown nothing yet: that load is the user's too)
+        let asked = (pending.hist == Hist::Push || self.placeholder) && pending.keep_scroll.is_none() && hops == 0;
+        self.notice = Some(if !asked {
+            format!("Not saved: {} (a download only starts from a link or address you open)", download.name)
+        } else {
+            match download::downloads_dir() {
+                None => format!("Cannot save {}: there is no downloads folder", download.name),
+                Some(dir) => match download::save(&dir, &download.name, &download.body) {
+                    Ok(path) => format!("Saved {} ({}) to {}", download.name, download.content_type, path.display()),
+                    Err(e) => format!("Cannot save {}: {e}", download.name),
+                },
+            }
+        });
+        if self.placeholder {
+            self.page = page;
+            self.placeholder = false;
+            self.laid_out_width = -1.0;
+            self.scroll = 0.0;
+        }
+        true
+    }
+
+    /// The message about the last download, once (the window shows it in the address bar).
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.notice.take()
     }
 
     /// A page that says `<meta http-equiv=refresh content="0; url=...">` sends the tab on to
@@ -1200,6 +1243,124 @@ mod tests {
         assert_eq!(tab.scroll, 300.0);
         tab.go_forward();
         assert_eq!(tab.scroll, 650.0);
+    }
+
+    /// A throwaway HTTP server: (path, content type, status, body). Answers any number of requests.
+    fn serve_forever(routes: Vec<(&'static str, &'static str, u16, Vec<u8>)>) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let routes = std::sync::Arc::new(routes);
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(mut sock) = sock else { continue };
+                let routes = routes.clone();
+                std::thread::spawn(move || {
+                    let (mut seen, mut buf) = (vec![], [0u8; 2048]);
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf) {
+                            Ok(k) if k > 0 => seen.extend_from_slice(&buf[..k]),
+                            _ => return,
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&seen).lines().next().unwrap_or("").to_string();
+                    let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let (ctype, status, body) = match routes.iter().find(|r| r.0 == path) {
+                        Some(r) => (r.1, r.2, r.3.clone()),
+                        None => ("text/plain", 404, b"nope".to_vec()),
+                    };
+                    let head = format!("HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = sock.write_all(head.as_bytes());
+                    let _ = sock.write_all(&body);
+                });
+            }
+        });
+        port
+    }
+
+    fn files_in(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir).map(|d| d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn downloads_are_saved_only_when_the_user_asked_and_never_twice() {
+        let dir = std::env::temp_dir().join(format!("mybrowser-tabdl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // (the only test that sets this; nothing else in the suite saves files)
+        unsafe { std::env::set_var("MYBROWSER_DOWNLOADS", &dir) };
+        let payload = vec![0u8, 159, 146, 150, 7];
+        let port = serve_forever(vec![
+            ("/home.html", "text/html", 200, b"<title>Home</title><p>home</p>".to_vec()),
+            ("/f.zip", "application/zip", 200, payload.clone()),
+            ("/lure.html", "text/html", 200, b"<meta http-equiv=refresh content='0;url=/payload.bin'><p>lure</p>".to_vec()),
+            ("/payload.bin", "application/octet-stream", 200, payload.clone()),
+            ("/missing.zip", "application/zip", 404, payload.clone()),
+            ("/ping", "application/octet-stream", 204, vec![]),
+            ("/slow.zip", "application/zip", 200, payload.clone()),
+        ]);
+        let url = |p: &str| Url::parse(&format!("http://127.0.0.1:{port}{p}")).unwrap();
+        let (notify, rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        tab.open(url("/home.html"));
+        assert!(deliver(&mut tab, &rx));
+        let back_before = tab.history.back.clone();
+
+        // a link or typed address starts a download: the file is saved and the page stays put
+        tab.open(url("/f.zip"));
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(files_in(&dir), ["f.zip"]);
+        assert_eq!(std::fs::read(dir.join("f.zip")).unwrap(), payload);
+        assert!(tab.take_notice().unwrap().starts_with("Saved f.zip"));
+        assert_eq!(tab.take_notice(), None, "the note is given once");
+        assert_eq!(tab.page.url, url("/home.html"), "you stay on the page you were on");
+        assert_eq!(tab.history.back, back_before, "a download is not a history entry");
+
+        // reload, Back and Forward act on that page and can't fetch the file again
+        tab.reload();
+        assert!(deliver(&mut tab, &rx));
+        tab.go_back();
+        if tab.is_loading() {
+            assert!(deliver(&mut tab, &rx));
+        }
+        assert_eq!(files_in(&dir), ["f.zip"]);
+
+        // a cancelled load, and one that was superseded, write nothing
+        tab.open(url("/slow.zip"));
+        tab.cancel_load();
+        assert!(!deliver(&mut tab, &rx), "a cancelled load is dropped");
+        tab.open(url("/slow.zip"));
+        tab.open(url("/home.html"));
+        let landed = [deliver(&mut tab, &rx), deliver(&mut tab, &rx)]; // (either may report first)
+        assert_eq!(landed.iter().filter(|l| **l).count(), 1, "only the newest load lands: {landed:?}");
+        assert_eq!(tab.page.url, url("/home.html"));
+        assert_eq!(files_in(&dir), ["f.zip"]);
+
+        // a page that sends you to a file without being asked (meta refresh) saves nothing
+        tab.open(url("/lure.html"));
+        assert!(deliver(&mut tab, &rx));
+        assert!(tab.is_loading(), "the refresh started");
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(files_in(&dir), ["f.zip"], "no drive-by download");
+        assert!(tab.take_notice().unwrap().starts_with("Not saved"));
+
+        // an error response and an empty one are not downloads
+        for path in ["/missing.zip", "/ping"] {
+            tab.open(url(path));
+            assert!(deliver(&mut tab, &rx));
+            assert_eq!(files_in(&dir), ["f.zip"], "{path}");
+            assert!(tab.take_notice().is_none(), "{path}");
+        }
+
+        // a tab that was opened straight onto a file shows the note page (and saves it)
+        let (notify2, rx2) = queue();
+        let mut fresh = Tab::new(2, url("/payload.bin"), None, notify2);
+        assert!(deliver(&mut fresh, &rx2));
+        assert_eq!(files_in(&dir), ["f.zip", "payload.bin"]);
+        assert!(fresh.page.title.starts_with("Download payload.bin"), "{}", fresh.page.title);
+        unsafe { std::env::remove_var("MYBROWSER_DOWNLOADS") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

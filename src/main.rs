@@ -538,6 +538,10 @@ impl App {
             self.find = None; // it was searching the old page
             self.sync_chrome();
             self.update_hover();
+            // a download's outcome replaces the address text until the next navigation
+            if let Some(note) = self.tabs[index].take_notice() {
+                self.bar.error = Some(note);
+            }
         } else {
             self.request_redraw(); // its label changed
         }

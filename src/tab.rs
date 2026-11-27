@@ -5,6 +5,7 @@ use crate::dom::NodeId;
 use crate::forms::{self, ControlKind};
 use crate::net;
 use crate::page::Page;
+use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
@@ -249,8 +250,13 @@ pub struct Tab {
     /// submitted form); `None` for typed addresses and history. Decides `SameSite` cookies.
     next_initiator: Option<Url>,
     inflight_initiator: Option<Url>,
+    /// Where each page left behind in this tab was scrolled to (by full URL, fragment included).
+    scroll_memory: HashMap<Url, f32>,
     notify: Notify,
 }
+
+/// A tab remembers the scroll position of at most this many pages.
+const MAX_REMEMBERED_SCROLLS: usize = 200;
 
 impl Tab {
     /// A new tab that starts loading `start` (started from `initiator`, if a page opened it).
@@ -278,6 +284,7 @@ impl Tab {
             inflight_post: None,
             next_initiator: None,
             inflight_initiator: None,
+            scroll_memory: HashMap::new(),
             notify,
         }
     }
@@ -345,12 +352,31 @@ impl Tab {
             None => page.url.fragment().or(pending.url.fragment()).map(String::from),
             Some(_) => None,
         };
+        // remember where the page being left was scrolled to, so Back / Forward can return there
+        if !self.placeholder {
+            self.remember_scroll(pending.from.clone());
+        }
+        let restored = match (pending.hist, pending.keep_scroll) {
+            (Hist::Back | Hist::Forward, None) => self.scroll_memory.get(&pending.url).or(self.scroll_memory.get(&page.url)).copied(),
+            _ => None,
+        };
+        if restored.is_some() {
+            self.pending_fragment = None;
+        }
         self.history.apply(pending.hist, pending.from, &page.url);
         self.page = page;
         self.placeholder = false;
         self.laid_out_width = -1.0; // force relayout on the next redraw
-        self.scroll = pending.keep_scroll.unwrap_or(0.0); // clamped on the next redraw
+        self.scroll = restored.or(pending.keep_scroll).unwrap_or(0.0); // clamped on the next redraw
         true
+    }
+
+    /// Note the current scroll position as the one for `url` (a page being left).
+    fn remember_scroll(&mut self, url: Url) {
+        if self.scroll_memory.len() >= MAX_REMEMBERED_SCROLLS {
+            self.scroll_memory.clear();
+        }
+        self.scroll_memory.insert(url, self.scroll);
     }
 
     /// Scroll to the target of `fragment` in the current layout. Returns whether
@@ -436,6 +462,7 @@ impl Tab {
             return false;
         }
         let here = std::mem::replace(&mut self.page.url, target.clone());
+        self.remember_scroll(here.clone());
         if back {
             self.history.back.pop();
             self.history.forward.push(here);
@@ -443,11 +470,12 @@ impl Tab {
             self.history.forward.pop();
             self.history.back.push(here);
         }
-        match target.fragment() {
-            Some(f) => {
+        match (self.scroll_memory.get(target).copied(), target.fragment()) {
+            (Some(y), _) => self.scroll = y,
+            (None, Some(f)) => {
                 self.scroll_to_fragment(f);
             }
-            None => self.scroll = 0.0,
+            (None, None) => self.scroll = 0.0,
         }
         true
     }
@@ -471,6 +499,7 @@ impl Tab {
                     url.set_fragment(Some(&f));
                     if url != self.page.url {
                         let here = std::mem::replace(&mut self.page.url, url);
+                        self.remember_scroll(here.clone());
                         self.history.back.push(here);
                         self.history.forward.clear();
                     }
@@ -1078,6 +1107,42 @@ mod tests {
         tab.scroll = 123.0;
         tab.reload();
         assert_eq!(tab.scroll, 123.0, "reload keeps scroll (applied on landing)");
+    }
+
+    #[test]
+    fn back_and_forward_return_to_where_each_page_was_scrolled() {
+        let (dir, a, b) = site("scrollmem");
+        std::fs::write(dir.join("long.html"), "<style>body{margin:0}p{margin:0;height:900px}</style><p>one</p><p>two</p>").unwrap();
+        let long = Url::from_file_path(dir.join("long.html")).unwrap();
+        let (notify, rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        tab.open(long.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.scroll = 700.0;
+        tab.open(b.clone());
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.scroll, 0.0, "a new page starts at the top");
+        tab.scroll = 40.0;
+        tab.go_back();
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!((tab.page.url.clone(), tab.scroll), (long.clone(), 700.0), "Back restores the position");
+        tab.go_forward();
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!((tab.page.url.clone(), tab.scroll), (b.clone(), 40.0), "and so does Forward");
+        // a page never visited before has nothing to restore
+        tab.open(a.clone());
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.scroll, 0.0);
+        // fragment moves on one page remember their own positions too
+        tab.open(long.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.scroll = 300.0;
+        tab.follow("#nowhere");
+        tab.scroll = 650.0;
+        tab.go_back();
+        assert_eq!(tab.scroll, 300.0);
+        tab.go_forward();
+        assert_eq!(tab.scroll, 650.0);
     }
 
     #[test]

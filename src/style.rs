@@ -308,7 +308,12 @@ fn parse_flex(v: &str, fs: f32) -> Option<(f32, f32, Basis)> {
         "auto" => return Some((1.0, 1.0, (None, None))),
         _ => {}
     }
-    let tokens: Vec<&str> = lv.split_whitespace().collect();
+    let mut tokens: Vec<&str> = lv.split_whitespace().collect();
+    // the basis may come first (`flex: 100px 1 1`): move it to the end, where the forms below expect it
+    if tokens.len() >= 2 && tokens[0].parse::<f32>().is_err() {
+        let basis = tokens.remove(0);
+        tokens.push(basis);
+    }
     match tokens.len() {
         // `flex: 1` means `1 1 0%`; a lone length (`flex: 200px`) is a basis with grow 0
         1 => match tokens[0].parse::<f32>() {
@@ -792,6 +797,12 @@ mod tests {
         assert_eq!(item("flex: 200px"), (0.0, Some(200.0)), "a lone length is a basis");
         assert_eq!(item("flex: 1 2"), (1.0, Some(0.0)), "two numbers are grow and shrink");
         assert_eq!(item("flex: 1 50px"), (1.0, Some(50.0)), "grow and basis");
+        // the basis may be written first
+        assert_eq!(item("flex: 100px 2"), (2.0, Some(100.0)));
+        assert_eq!(item("flex: 100px 3 1"), (3.0, Some(100.0)));
+        assert_eq!(item("flex: auto 1 1"), (1.0, None));
+        assert_eq!(item("flex: 100px 100px"), (0.0, None), "two bases make no sense");
+        assert_eq!(item("flex: banana 1"), (0.0, None));
         let shrink = |decl: &str| style_of(&format!("<p style='{decl}'>x</p>"), "p").flex_shrink;
         assert_eq!((shrink(""), shrink("flex: 1"), shrink("flex: none"), shrink("flex: auto")), (1.0, 1.0, 0.0, 1.0));
         assert_eq!((shrink("flex: 1 0 auto"), shrink("flex: 2 3"), shrink("flex-shrink: 0")), (0.0, 3.0, 0.0));

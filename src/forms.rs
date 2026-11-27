@@ -121,7 +121,11 @@ pub fn is_focusable(dom: &Dom, id: NodeId) -> bool {
 /// The `<form>` that owns control `id`: the one named by its `form="id"`
 /// attribute if there is one, else the enclosing `<form>`.
 pub fn form_of(dom: &Dom, id: NodeId) -> Option<NodeId> {
-    if let Some(wanted) = dom.attr(id, "form").map(str::trim).filter(|w| !w.is_empty()) {
+    if let Some(wanted) = dom.attr(id, "form").map(str::trim) {
+        // a `form` attribute names the owner outright: an empty or unknown id means no form at all
+        if wanted.is_empty() {
+            return None;
+        }
         return (0..dom.nodes.len()).find(|&n| dom.tag(n) == Some("form") && dom.attr(n, "id") == Some(wanted));
     }
     let mut cur = dom.nodes[id].parent;
@@ -266,20 +270,20 @@ impl FormState {
         if let Some(&i) = self.selected.get(&id) {
             return i;
         }
-        // an <option selected> in the markup, else the first
+        // the last <option selected> in the markup (a single select shows the last one), else the first
         let mut stack: Vec<NodeId> = dom.nodes[id].children.iter().rev().copied().collect();
-        let mut index = 0;
+        let (mut index, mut chosen) = (0, 0);
         while let Some(n) = stack.pop() {
             if dom.tag(n) == Some("option") {
                 if dom.attr(n, "selected").is_some() {
-                    return index;
+                    chosen = index;
                 }
                 index += 1;
             } else {
                 stack.extend(dom.nodes[n].children.iter().rev());
             }
         }
-        0
+        chosen
     }
 
     pub fn is_checked(&self, dom: &Dom, id: NodeId) -> bool {
@@ -570,6 +574,16 @@ mod tests {
 
     fn find(dom: &Dom, tag: &str, nth: usize) -> NodeId {
         (0..dom.nodes.len()).filter(|&i| dom.tag(i) == Some(tag)).nth(nth).unwrap_or_else(|| panic!("no {tag} #{nth}"))
+    }
+
+    #[test]
+    fn empty_form_attributes_and_several_selected_options() {
+        let dom = html::parse("<form><input name=a form='' value=1><input name=b form='nope' value=2><input name=c value=3></form><select name=s><option value=x selected>X<option value=y selected>Y<option value=z>Z</select>");
+        let (a, b, c, s) = (by_name(&dom, "a"), by_name(&dom, "b"), by_name(&dom, "c"), by_name(&dom, "s"));
+        assert_eq!(form_of(&dom, a), None, "an empty form attribute means no owner");
+        assert_eq!(form_of(&dom, b), None);
+        assert!(form_of(&dom, c).is_some());
+        assert_eq!(FormState::default().value(&dom, s), "y", "the last selected option wins");
     }
 
     #[test]

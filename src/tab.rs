@@ -401,6 +401,9 @@ impl Tab {
         if let Link::Navigate(url) = self.classify(&href) {
             if url != self.page.url {
                 self.next_hops = self.refresh_hops + 1;
+                // the page asked for this, so it is the initiator: SameSite cookies must treat
+                // a cross-site refresh like a cross-site link, not like a typed address
+                self.next_initiator = Some(self.page.url.clone());
                 self.begin_load(url, Hist::Replace, None);
             }
         }
@@ -1216,6 +1219,7 @@ mod tests {
         tab.open(file("hop.html"));
         assert!(deliver(&mut tab, &rx));
         assert!(tab.is_loading(), "the refresh started a load");
+        assert_eq!(tab.inflight_initiator, Some(file("hop.html")), "the refreshing page is the initiator (SameSite)");
         assert!(deliver(&mut tab, &rx));
         assert_eq!(tab.page.url, b);
         assert_eq!(tab.history.back.last(), Some(&a), "Back goes to where the refresh started from");

@@ -168,6 +168,10 @@ pub fn parse_refresh(content: &str) -> Option<(f32, Option<String>)> {
     let content = content.trim();
     let end = content.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(content.len());
     let delay: f32 = content[..end].parse().ok().filter(|d: &f32| d.is_finite())?;
+    // the number must be followed by nothing, a separator or whitespace (`0e9` is not "0" then "e9")
+    if !content[end..].is_empty() && !content[end..].starts_with(|c: char| c.is_whitespace() || c == ';' || c == ',') {
+        return None;
+    }
     let rest = content[end..].trim_start_matches(|c: char| c.is_whitespace() || c == ';' || c == ',');
     if rest.is_empty() {
         return Some((delay, None));
@@ -185,8 +189,17 @@ impl Page {
     /// A `<meta http-equiv=refresh content="N; url=...">` in the document: (delay, target href).
     /// The first one that names a target counts.
     pub fn meta_refresh(&self) -> Option<(f32, String)> {
+        let inert = |mut n: NodeId| {
+            while let Some(p) = self.dom.nodes[n].parent {
+                if self.dom.tag(p) == Some("template") {
+                    return true;
+                }
+                n = p;
+            }
+            false
+        };
         (0..self.dom.nodes.len())
-            .filter(|&n| self.dom.tag(n) == Some("meta"))
+            .filter(|&n| self.dom.tag(n) == Some("meta") && !inert(n))
             .filter(|&n| self.dom.attr(n, "http-equiv").is_some_and(|h| h.trim().eq_ignore_ascii_case("refresh")))
             .find_map(|n| match parse_refresh(self.dom.attr(n, "content")?)? {
                 (delay, Some(href)) => Some((delay, href)),
@@ -571,6 +584,12 @@ mod tests {
         assert_eq!(parse_refresh("soon"), None);
         assert_eq!(parse_refresh(""), None);
         assert_eq!(parse_refresh("0;urlish.html"), Some((0.0, s("urlish.html"))));
+        assert_eq!(parse_refresh("0e9"), None);
+        assert_eq!(parse_refresh("1x2"), None);
+        // inert contexts don't count
+        let doc = Url::parse("http://h.test/").unwrap();
+        assert_eq!(Page::from_source(&doc, "<template><meta http-equiv=refresh content='0;url=/t'></template>").meta_refresh(), None);
+        assert!(Page::from_source(&doc, "<noscript><meta http-equiv=refresh content='0;url=/t'></noscript>").meta_refresh().is_some());
         let p = Page::from_source(&Url::parse("http://h.test/a/").unwrap(), "<meta http-equiv=refresh content='5'><meta http-equiv=Refresh content='1; url=z'><meta name=x content='0;url=no'>");
         assert_eq!(p.meta_refresh(), Some((1.0, "z".to_string())));
         assert_eq!(Page::from_source(&Url::parse("http://h.test/").unwrap(), "<p>hi</p>").meta_refresh(), None);

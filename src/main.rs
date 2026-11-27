@@ -580,6 +580,15 @@ impl App {
         if !kind.is_some_and(forms::is_text_like) {
             return false;
         }
+        // Cmd+Left / Cmd+Right jump to the start / end of the text (they'd otherwise mean Back / Forward)
+        if let Key::Named(named @ (NamedKey::ArrowLeft | NamedKey::ArrowRight)) = key {
+            let how = if *named == NamedKey::ArrowLeft { forms::CaretMove::Home } else { forms::CaretMove::End };
+            let tab = self.tab_mut();
+            let Page { dom, form, .. } = &mut tab.page;
+            form.move_caret(dom, id, how);
+            tab.form_changed();
+            return true;
+        }
         let Key::Character(c) = key else { return false };
         match c.as_str().to_ascii_lowercase().as_str() {
             "v" => {

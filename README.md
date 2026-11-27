@@ -34,7 +34,7 @@ The window has a tab strip, a toolbar with back, forward and reload buttons, and
 | `Cmd+F` | Find in page: type to search, `Enter` / `Shift+Enter` (or `Cmd+G` / `Cmd+Shift+G`) for the next / previous match, `Esc` to close |
 | `Cmd+L` (or `Ctrl+L`) | Focus the address bar and select it |
 | `Enter` / `Esc` | Go to the typed address / cancel editing, or cancel a load in progress |
-| `Cmd+V`, `Cmd+C`, `Cmd+A` | Paste, copy and select all in the address bar (macOS); `Cmd+V` and `Cmd+C` also paste into and copy from a focused text field on a page (never from a password field) |
+| `Cmd+V`, `Cmd+C`, `Cmd+A` | Paste, copy and select all in the address bar (macOS); `Cmd+V` and `Cmd+C` also paste into and copy from a focused text field on a page (never from a password field), and `Cmd+←` / `Cmd+→` jump to the start or end of the text there |
 | `Cmd+[`, `Cmd+]`, `Alt+←`, `Alt+→`, `Backspace` | Back and forward |
 | `Cmd+R`, `F5`, `R` | Reload |
 | Wheel, arrow keys, `Space`, `PgUp`, `PgDn`, `Home`, `End` | Scroll |

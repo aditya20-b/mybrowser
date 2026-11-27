@@ -3416,6 +3416,26 @@ mod tests {
     }
 
     #[test]
+    fn destructuring_defaults_and_nested_patterns() {
+        assert_eq!(
+            run("var {a, b: renamed, c = 5, d = 6} = {a: 1, b: 2, d: undefined};
+                 console.log(a, renamed, c, d);
+                 const [x, , z, ...others] = [10, 20, 30, 40, 50]; console.log(x, z, others.join());
+                 let {p: {q, r: [r0, r1]}, s = 'dflt'} = {p: {q: 'Q', r: ['R0', 'R1']}};
+                 console.log(q, r0, r1, s);
+                 function area({w, h = 2}, [scale] = [1]) { return w * h * scale }
+                 console.log(area({w: 3}), area({w: 3, h: 4}, [2]));
+                 var f = ({name}, ...more) => name + more.length; console.log(f({name: 'n'}, 1, 2));
+                 function def(x, y = x + 1, z = 'z') { return x + ',' + y + ',' + z } console.log(def(1), def(1, 5), def(1, undefined, 'w'));
+                 var out = []; for (const [k, v] of [['a', 1], ['b', 2]]) out.push(k + v); console.log(out.join());
+                 for (let {id, tag = 'none'} of [{id: 1}, {id: 2, tag: 't'}]) out.push(id + tag); console.log(out.join());
+                 var m = Object.entries({u: 1, w: 2}).map(([key, val]) => key + val); console.log(m.join());
+                 try { var {boom} = null } catch (e) { console.log('null source throws') }"),
+            "1 2 5 6\n10 30 40,50\nQ R0 R1 dflt\n6 24\nn2\n1,2,z 1,5,z 1,2,w\na1,b2\na1,b2,1none,2t\nu1,w2\nnull source throws"
+        );
+    }
+
+    #[test]
     fn spread_and_rest() {
         assert_eq!(
             run("function sum() { var t = 0; for (var i = 0; i < arguments.length; i++) t += arguments[i]; return t }

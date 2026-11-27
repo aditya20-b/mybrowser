@@ -445,13 +445,13 @@ pub enum DeclKind {
     Const,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum PropKey {
     Name(String),
     Computed(Expr),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Expr {
     Num(f64),
     Str(String),
@@ -480,6 +480,19 @@ pub enum Expr {
     Seq(Vec<Expr>),
     /// `...list` inside a call's arguments or an array literal.
     Spread(Box<Expr>),
+}
+
+/// A destructuring pattern (see `Parser::pattern`); only used while parsing.
+struct Pat {
+    target: PatTarget,
+    default: Option<Expr>,
+}
+
+enum PatTarget {
+    Name(String),
+    Obj(Vec<(String, Pat)>),
+    /// Items (a `None` is a skipped slot) and the `...rest` name.
+    Arr(Vec<Option<Pat>>, Option<String>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -520,6 +533,8 @@ struct Parser {
     chain: usize,
     /// `arguments` was mentioned in the function being parsed.
     arguments_seen: bool,
+    /// Hidden variables made for destructuring so far (their names must not repeat).
+    temps: usize,
 }
 
 type PResult<T> = Result<T, String>;
@@ -637,9 +652,143 @@ impl Parser {
         Ok(out)
     }
 
+    // ---- destructuring
+    //
+    // `{a, b: c = 1, ...}` and `[x, , y, ...rest]` on the left of a declaration, in a parameter
+    // list, or in `for (const [k, v] of ...)` are written out as plain declarations: the value
+    // goes into a hidden variable, and each name is read from it (`a = tmp.a`, `x = tmp[0]`).
+
+    fn pattern_ahead(&self) -> bool {
+        self.is_punct("{") || self.is_punct("[")
+    }
+
+    /// One target of a pattern, with its optional `= default`.
+    fn pattern(&mut self) -> PResult<Pat> {
+        self.enter()?;
+        let r = self.pattern_inner();
+        self.leave();
+        r
+    }
+
+    fn pattern_inner(&mut self) -> PResult<Pat> {
+        let target = if self.eat_punct("{") {
+            let mut props = vec![];
+            while !self.is_punct("}") {
+                let key = match self.advance() {
+                    Tok::Ident(n) => n,
+                    Tok::Str(s) => s,
+                    Tok::Num(n) => n.to_string(),
+                    other => {
+                        self.back(&other);
+                        return self.err("expected a property name in the pattern");
+                    }
+                };
+                let value = if self.eat_punct(":") {
+                    self.element()?
+                } else {
+                    // `{a}` and `{a = 1}`
+                    let default = if self.eat_punct("=") { Some(self.assignment()?) } else { None };
+                    Pat { target: PatTarget::Name(key.clone()), default }
+                };
+                props.push((key, value));
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+            self.expect_punct("}")?;
+            PatTarget::Obj(props)
+        } else if self.eat_punct("[") {
+            let mut items = vec![];
+            let mut rest = None;
+            while !self.is_punct("]") {
+                if self.eat_punct(",") {
+                    items.push(None);
+                    continue;
+                }
+                if self.eat_punct("...") {
+                    rest = Some(self.ident()?);
+                    break;
+                }
+                items.push(Some(self.element()?));
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+            self.expect_punct("]")?;
+            PatTarget::Arr(items, rest)
+        } else {
+            PatTarget::Name(self.ident()?)
+        };
+        Ok(Pat { target, default: None })
+    }
+
+    /// A pattern that may be followed by `= default` (inside another pattern, or as a parameter).
+    fn element(&mut self) -> PResult<Pat> {
+        let mut pat = self.pattern()?;
+        if self.eat_punct("=") {
+            pat.default = Some(self.assignment()?);
+        }
+        Ok(pat)
+    }
+
+    /// The declarations that bind `pat` to the value of `source`, in order.
+    fn flatten_pattern(&mut self, pat: Pat, source: Expr, out: &mut Vec<(String, Option<Expr>)>) {
+        let value = match pat.default {
+            Some(d) => Expr::Cond(
+                Box::new(Expr::Binary("===", Box::new(source.clone()), Box::new(Expr::Ident("undefined".into())))),
+                Box::new(d),
+                Box::new(source),
+            ),
+            None => source,
+        };
+        match pat.target {
+            PatTarget::Name(n) => out.push((n, Some(value))),
+            PatTarget::Obj(props) => {
+                let tmp = self.temp_name();
+                out.push((tmp.clone(), Some(value)));
+                for (key, p) in props {
+                    let src = Expr::Index(Box::new(Expr::Ident(tmp.clone())), Box::new(Expr::Str(key)));
+                    self.flatten_pattern(p, src, out);
+                }
+            }
+            PatTarget::Arr(items, rest) => {
+                let tmp = self.temp_name();
+                out.push((tmp.clone(), Some(value)));
+                let count = items.len();
+                for (i, p) in items.into_iter().enumerate() {
+                    if let Some(p) = p {
+                        let src = Expr::Index(Box::new(Expr::Ident(tmp.clone())), Box::new(Expr::Num(i as f64)));
+                        self.flatten_pattern(p, src, out);
+                    }
+                }
+                if let Some(r) = rest {
+                    let slice = Expr::Call(Box::new(Expr::Dot(Box::new(Expr::Ident(tmp)), "slice".into())), vec![Expr::Num(count as f64)]);
+                    out.push((r, Some(slice)));
+                }
+            }
+        }
+    }
+
+    fn temp_name(&mut self) -> String {
+        self.temps += 1;
+        format!("__d{}_{}", self.toks.get(self.pos).map_or(0, |t| t.line), self.temps)
+    }
+
     fn declarators(&mut self, kind: DeclKind) -> PResult<Vec<(String, Option<Expr>)>> {
         let mut list = vec![];
         loop {
+            if self.pattern_ahead() {
+                let pat = self.pattern()?;
+                if !self.eat_punct("=") {
+                    return self.err("a pattern needs a value");
+                }
+                let value = self.assignment()?;
+                self.flatten_pattern(pat, value, &mut list);
+                if !self.eat_punct(",") {
+                    return Ok(list);
+                }
+                continue;
+            }
             let name = self.ident()?;
             let init = if self.eat_punct("=") { Some(self.assignment()?) } else { None };
             if kind == DeclKind::Const && init.is_none() {
@@ -655,7 +804,7 @@ impl Parser {
     fn decl_kind(&self) -> Option<DeclKind> {
         match self.peek() {
             Tok::Ident(w) if w == "var" => Some(DeclKind::Var),
-            Tok::Ident(w) if w == "let" && matches!(self.peek_at(1), Tok::Ident(_)) => Some(DeclKind::Let),
+            Tok::Ident(w) if w == "let" && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Punct("{") | Tok::Punct("[")) => Some(DeclKind::Let),
             Tok::Ident(w) if w == "const" => Some(DeclKind::Const),
             _ => None,
         }
@@ -779,6 +928,26 @@ impl Parser {
         if kind.is_some() {
             self.advance();
         }
+        // `for (const [k, v] of pairs)`: the pattern is bound from a hidden variable at the top of each pass
+        if let (Some(k), true) = (kind, self.pattern_ahead()) {
+            let pat = self.pattern()?;
+            let of = match self.advance() {
+                Tok::Ident(w) if w == "of" => true,
+                Tok::Ident(w) if w == "in" => false,
+                other => {
+                    self.back(&other);
+                    return self.err("expected 'of' after the pattern");
+                }
+            };
+            let obj = if of { self.assignment()? } else { self.expression()? };
+            self.expect_punct(")")?;
+            let tmp = self.temp_name();
+            let mut decls = vec![];
+            self.flatten_pattern(pat, Expr::Ident(tmp.clone()), &mut decls);
+            let inner = self.statement()?;
+            let body = Box::new(Stmt::Block(vec![Stmt::Decl(DeclKind::Let, decls), inner]));
+            return Ok(Stmt::ForIn { of, kind: Some(k), var: tmp, obj, body });
+        }
         if let Tok::Ident(name) = self.peek().clone() {
             if !RESERVED.contains(&name.as_str()) && matches!(self.peek_at(1), Tok::Ident(w) if w == "in" || w == "of") {
                 self.advance();
@@ -862,29 +1031,57 @@ impl Parser {
     /// The parameters and body of a function, after its name.
     fn function_rest(&mut self, name: Option<String>) -> PResult<Func> {
         self.expect_punct("(")?;
-        let (params, rest) = self.parameter_list()?;
+        let (params, rest, prologue) = self.parameter_list()?;
         // (`arguments` seen in the body belongs to this function, not the one around it)
         let outer = std::mem::take(&mut self.arguments_seen);
         let body = self.block();
         let uses_arguments = std::mem::replace(&mut self.arguments_seen, outer);
-        Ok(Func { name, params, body: body?, arrow: false, uses_arguments, rest })
+        Ok(Func { name, params, body: Parser::with_prologue(prologue, body?), arrow: false, uses_arguments, rest })
     }
 
     /// Parameter names up to and including `)`, the last of which may be `...rest`.
-    fn parameter_list(&mut self) -> PResult<(Vec<String>, bool)> {
+    /// The third part is declarations to put first in the body: what a destructured parameter
+    /// (`function f({a, b}, [c])`) or a default (`function f(x = 1)`) needs.
+    fn parameter_list(&mut self) -> PResult<(Vec<String>, bool, Vec<(String, Option<Expr>)>)> {
         let mut params = vec![];
         let mut rest = false;
+        let mut prologue = vec![];
         while !self.is_punct(")") {
             if self.eat_punct("...") {
                 rest = true;
             }
-            params.push(self.ident()?);
+            if self.pattern_ahead() {
+                let pat = self.element()?;
+                let tmp = self.temp_name();
+                self.flatten_pattern(pat, Expr::Ident(tmp.clone()), &mut prologue);
+                params.push(tmp);
+            } else {
+                let name = self.ident()?;
+                if !rest && self.eat_punct("=") {
+                    // `x = 1`: the default is used when the argument is undefined
+                    let default = self.assignment()?;
+                    let pat = Pat { target: PatTarget::Name(name.clone()), default: Some(default) };
+                    let tmp = self.temp_name();
+                    self.flatten_pattern(pat, Expr::Ident(tmp.clone()), &mut prologue);
+                    params.push(tmp);
+                } else {
+                    params.push(name);
+                }
+            }
             if rest || !self.eat_punct(",") {
                 break;
             }
         }
         self.expect_punct(")")?;
-        Ok((params, rest))
+        Ok((params, rest, prologue))
+    }
+
+    /// Put a parameter list's declarations at the start of a function body.
+    fn with_prologue(prologue: Vec<(String, Option<Expr>)>, mut body: Vec<Stmt>) -> Vec<Stmt> {
+        if !prologue.is_empty() {
+            body.insert(0, Stmt::Decl(DeclKind::Let, prologue));
+        }
+        body
     }
 
     // ---- expressions
@@ -929,7 +1126,7 @@ impl Parser {
     }
 
     fn arrow(&mut self) -> PResult<Expr> {
-        let (params, rest) = if self.eat_punct("(") { self.parameter_list()? } else { (vec![self.ident()?], false) };
+        let (params, rest, prologue) = if self.eat_punct("(") { self.parameter_list()? } else { (vec![self.ident()?], false, vec![]) };
         self.expect_punct("=>")?;
         // an arrow function has no `arguments` of its own: a mention is the enclosing function's
         // (it stays flagged on the parser, so the enclosing function sees it)
@@ -938,7 +1135,7 @@ impl Parser {
         } else {
             vec![Stmt::Return(Some(self.assignment()?))]
         };
-        Ok(Expr::Function(Rc::new(Func { name: None, params, body, arrow: true, uses_arguments: false, rest })))
+        Ok(Expr::Function(Rc::new(Func { name: None, params, body: Parser::with_prologue(prologue, body), arrow: true, uses_arguments: false, rest })))
     }
 
     pub fn assignment(&mut self) -> PResult<Expr> {
@@ -1015,7 +1212,7 @@ impl Parser {
     fn template_exprs(&mut self, sources: Vec<(String, u32)>) -> PResult<Vec<Expr>> {
         let mut exprs = vec![];
         for (src, line) in sources {
-            let mut inner = Parser { toks: tokenize_at(&src, line)?, pos: 0, depth: self.depth, chain: self.chain, arguments_seen: false };
+            let mut inner = Parser { toks: tokenize_at(&src, line)?, pos: 0, depth: self.depth, chain: self.chain, arguments_seen: false, temps: 1000 + self.temps };
             let e = inner.expression()?;
             if *inner.peek() != Tok::Eof {
                 return inner.err("bad expression in template");
@@ -1425,7 +1622,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
 }
 
 fn parse_here(src: &str) -> Result<Vec<Stmt>, String> {
-    let mut p = Parser { toks: tokenize(src)?, pos: 0, depth: 0, chain: 0, arguments_seen: false };
+    let mut p = Parser { toks: tokenize(src)?, pos: 0, depth: 0, chain: 0, arguments_seen: false, temps: 0 };
     p.program()
 }
 
@@ -1434,7 +1631,7 @@ mod tests {
     use super::*;
 
     fn expr(src: &str) -> Expr {
-        let mut p = Parser { toks: tokenize(src).unwrap(), pos: 0, depth: 0, chain: 0, arguments_seen: false };
+        let mut p = Parser { toks: tokenize(src).unwrap(), pos: 0, depth: 0, chain: 0, arguments_seen: false, temps: 0 };
         let e = p.expression().unwrap_or_else(|e| panic!("{src}: {e}"));
         assert_eq!(*p.peek(), Tok::Eof, "{src}: leftover tokens");
         e

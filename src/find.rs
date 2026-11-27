@@ -45,12 +45,19 @@ fn fold(c: char) -> char {
 }
 
 /// Characters that are never drawn and have no width (zero-width spaces and joiners,
-/// soft hyphens, byte-order marks, variation selectors, bidi controls, invisible math
-/// operators): what you can't see, you can't find, and they must not split a word you can.
+/// soft hyphens, byte-order marks, variation selectors, bidi embeddings and isolates,
+/// invisible math operators): what you can't see, you can't find, and they must not
+/// split a word you can.
 fn is_ignorable(c: char) -> bool {
     matches!(
         c,
-        '\u{ad}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{feff}' | '\u{fe00}'..='\u{fe0f}'
+        '\u{ad}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+            | '\u{fe00}'..='\u{fe0f}'
     )
 }
 
@@ -338,6 +345,9 @@ mod tests {
         for q in ["ab", "cd", "ef"] {
             assert_eq!(find_all(&layout, &fonts, q).len(), 1, "{q}");
         }
+        // bidi isolates too: they wrap a run of text, with a space before and after it
+        let (layout, fonts) = laid_out("<p>a &#x2066;b&#x2069; c</p>", 600.0);
+        assert_eq!(find_all(&layout, &fonts, "a b c").len(), 1);
         // a lone zero-width space between words is not a second space
         let (layout, fonts) = laid_out("<p>a &#x200B; b</p>", 600.0);
         assert_eq!(find_all(&layout, &fonts, "a b").len(), 1);

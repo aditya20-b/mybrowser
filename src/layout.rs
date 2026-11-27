@@ -548,6 +548,13 @@ impl<'a> Ctx<'a> {
         px(s.padding[1]).max(0.0) + px(s.padding[3]).max(0.0) + bw[1] + bw[3] + px(s.margin[1]) + px(s.margin[3])
     }
 
+    /// The fixed left and right margins of a box.
+    fn margins_x(&self, id: NodeId) -> f32 {
+        let s = &self.styles[id];
+        let px = |l: Length| resolve(l, 0.0).unwrap_or(0.0);
+        px(s.margin[1]) + px(s.margin[3])
+    }
+
     /// The (min-content, max-content) outer width of one flex item, or None if it draws nothing.
     fn flex_item_widths(&self, c: NodeId) -> Option<(f32, f32, Option<Vec<Inl>>)> {
         if self.styles[c].display == Display::Inline {
@@ -606,9 +613,21 @@ impl<'a> Ctx<'a> {
             let Some((min, max, inline)) = self.flex_item_widths(c) else { continue };
             let st = &styles[c];
             let extras = if inline.is_some() { 0.0 } else { self.box_extras(c) };
-            let basis = match st.flex_basis {
-                Some(b) => b.max(0.0) + extras,
-                None => max,
+            // a percentage (of the container) from `flex-basis`, else from `width`, when no px basis is given
+            let pct = match (st.flex_basis, st.flex_basis_pct, st.width) {
+                (None, Some(p), _) => Some(p),
+                (None, None, Length::Pct(p)) if inline.is_none() => Some(p),
+                _ => None,
+            };
+            let basis = match (st.flex_basis, pct) {
+                (Some(b), _) => b.max(0.0) + extras,
+                (None, Some(p)) => {
+                    let px = (width * p / 100.0).clamp(0.0, 1.0e6);
+                    // a content-box size sits inside the item's padding and border; a border-box one includes them
+                    let pad_border = if st.border_box { 0.0 } else { extras - self.margins_x(c) };
+                    px + pad_border + self.margins_x(c)
+                }
+                (None, None) => max,
             };
             items.push(FlexItem { id: c, inline, min, basis, grow: st.flex_grow, shrink: st.flex_shrink });
         }
@@ -2359,6 +2378,30 @@ mod tests {
         // no room: the margin is just zero
         let n = flex("", "<div style='width:400px'>a</div><div style='margin-left:auto'>b</div>");
         assert!(at(&n, "b").0 >= 400.0 - 0.5);
+    }
+
+    #[test]
+    fn flex_items_can_be_sized_in_percentages_of_the_container() {
+        let halves = flex("", "<div style='width:50%'>a</div><div style='width:50%'>b</div>");
+        assert!((at(&halves, "b").0 - 150.0).abs() < 0.5, "{:?}", at(&halves, "b"));
+        let basis = flex("", "<div style='flex-basis:25%'>a</div><div>b</div>");
+        assert!((at(&basis, "b").0 - 75.0).abs() < 0.5, "{:?}", at(&basis, "b"));
+        let short = flex("", "<div style='flex:0 0 25%'>a</div><div style='flex:0 0 25%'>b</div>");
+        assert!((at(&short, "b").0 - 75.0).abs() < 0.5);
+        // the classic wrapping grid: thirds, three to a line
+        let grid = flex("flex-wrap:wrap", &"<div style='flex:0 0 33.333%'>q</div>".repeat(6));
+        let ys: Vec<i32> = texts(&grid).iter().map(|(_, b)| *b as i32).collect();
+        assert!(ys[0] == ys[2] && ys[3] == ys[5] && ys[3] > ys[0], "three per line: {ys:?}");
+        let xs: Vec<f32> = texts_full(&grid).iter().map(|(_, x, _)| *x).collect();
+        assert!((xs[1] - 100.0).abs() < 1.0 && (xs[2] - 200.0).abs() < 1.0, "{xs:?}");
+        // border-box widths include their padding; content-box ones sit inside it
+        let bb = flex("", "<div style='box-sizing:border-box;width:50%;padding:10px'>a</div><div>b</div>");
+        assert!((at(&bb, "b").0 - 150.0).abs() < 0.5, "{:?}", at(&bb, "b"));
+        let cb = flex("", "<div style='width:25%;padding:10px'>a</div><div>b</div>");
+        assert!((at(&cb, "b").0 - 95.0).abs() < 0.5, "{:?}", at(&cb, "b"));
+        // an absurd percentage stays finite
+        let huge = flex("", "<div style='width:99999999%'>a</div><div>b</div>");
+        assert!(huge.layout.height.is_finite());
     }
 
     #[test]

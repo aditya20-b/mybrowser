@@ -104,6 +104,8 @@ pub struct Style {
     pub flex_shrink: f32,
     /// `flex-basis` in px (None = auto: the item's own content width).
     pub flex_basis: Option<f32>,
+    /// A percentage `flex-basis` (of the container's width); used when `flex_basis` is None.
+    pub flex_basis_pct: Option<f32>,
 }
 
 impl Style {
@@ -142,6 +144,7 @@ impl Style {
             flex_grow: 0.0,
             flex_shrink: 1.0,
             flex_basis: None,
+            flex_basis_pct: None,
         }
     }
 
@@ -223,9 +226,12 @@ fn copy_prop(dst: &mut Style, src: &Style, name: &str) {
         "row-gap" => dst.gap_row = src.gap_row,
         "gap" => (dst.gap_col, dst.gap_row) = (src.gap_col, src.gap_row),
         "flex-grow" => dst.flex_grow = src.flex_grow,
-        "flex-basis" => dst.flex_basis = src.flex_basis,
+        "flex-basis" => (dst.flex_basis, dst.flex_basis_pct) = (src.flex_basis, src.flex_basis_pct),
         "flex-shrink" => dst.flex_shrink = src.flex_shrink,
-        "flex" => (dst.flex_grow, dst.flex_shrink, dst.flex_basis) = (src.flex_grow, src.flex_shrink, src.flex_basis),
+        "flex" => {
+            (dst.flex_grow, dst.flex_shrink) = (src.flex_grow, src.flex_shrink);
+            (dst.flex_basis, dst.flex_basis_pct) = (src.flex_basis, src.flex_basis_pct);
+        }
         _ => {
             if let Some(i) = name.strip_prefix("margin-").and_then(side) {
                 dst.margin[i] = src.margin[i];
@@ -271,14 +277,18 @@ fn family_from_names(list: &str) -> Option<Family> {
     None
 }
 
-/// A flex basis: a length in px, `0%` (which means "no basis"), or nothing for `auto`/`content`.
-fn parse_basis(v: &str, fs: f32) -> Option<Option<f32>> {
+/// A flex basis as (px, percent of the container): a length in px, a percentage (`0%` counts
+/// as 0px: "no basis"), or neither for `auto` / `content`.
+type Basis = (Option<f32>, Option<f32>);
+
+fn parse_basis(v: &str, fs: f32) -> Option<Basis> {
     match v.trim().to_ascii_lowercase().as_str() {
-        "auto" | "content" | "max-content" | "fit-content" => Some(None),
+        "auto" | "content" | "max-content" | "fit-content" => Some((None, None)),
         other => match css::parse_length(other, fs)? {
-            Length::Px(p) => Some(Some(p.max(0.0))),
-            Length::Pct(p) if p == 0.0 => Some(Some(0.0)),
-            _ => Some(None), // other percentages aren't resolved: treat as auto
+            Length::Px(p) => Some((Some(p.max(0.0)), None)),
+            Length::Pct(p) if p == 0.0 => Some((Some(0.0), None)),
+            Length::Pct(p) => Some((None, Some(p.clamp(0.0, 10_000.0)))),
+            Length::Auto => Some((None, None)),
         },
     }
 }
@@ -290,26 +300,26 @@ fn parse_factor(t: &str) -> Option<f32> {
 
 /// The `flex` shorthand: `none`, `auto`, `initial`, `<grow>`, `<grow> <shrink>`, and an optional basis.
 /// Returns (grow, shrink, basis); shrink is 1 unless the value says otherwise.
-fn parse_flex(v: &str, fs: f32) -> Option<(f32, f32, Option<f32>)> {
+fn parse_flex(v: &str, fs: f32) -> Option<(f32, f32, Basis)> {
     let lv = v.trim().to_ascii_lowercase();
     match lv.as_str() {
-        "none" => return Some((0.0, 0.0, None)),
-        "initial" => return Some((0.0, 1.0, None)),
-        "auto" => return Some((1.0, 1.0, None)),
+        "none" => return Some((0.0, 0.0, (None, None))),
+        "initial" => return Some((0.0, 1.0, (None, None))),
+        "auto" => return Some((1.0, 1.0, (None, None))),
         _ => {}
     }
     let tokens: Vec<&str> = lv.split_whitespace().collect();
     match tokens.len() {
         // `flex: 1` means `1 1 0%`; a lone length (`flex: 200px`) is a basis with grow 0
         1 => match tokens[0].parse::<f32>() {
-            Ok(_) => Some((parse_factor(tokens[0])?, 1.0, Some(0.0))),
+            Ok(_) => Some((parse_factor(tokens[0])?, 1.0, (Some(0.0), None))),
             Err(_) => Some((0.0, 1.0, parse_basis(tokens[0], fs)?)),
         },
         // `grow shrink` or `grow basis`
         2 => {
             let grow = parse_factor(tokens[0])?;
             match tokens[1].parse::<f32>() {
-                Ok(_) => Some((grow, parse_factor(tokens[1])?, Some(0.0))),
+                Ok(_) => Some((grow, parse_factor(tokens[1])?, (Some(0.0), None))),
                 Err(_) => Some((grow, 1.0, parse_basis(tokens[1], fs)?)),
             }
         }
@@ -437,10 +447,11 @@ fn apply(s: &mut Style, parent: &Style, d: &Declaration) {
         "row-gap" => { if let Some(Length::Px(p)) = css::parse_length(v, fs) { s.gap_row = p.clamp(0.0, 10_000.0); } }
         "flex-grow" => { if let Some(g) = parse_factor(&lv) { s.flex_grow = g.min(1000.0); } }
         "flex-shrink" => { if let Some(g) = parse_factor(&lv) { s.flex_shrink = g.min(1000.0); } }
-        "flex-basis" => { if let Some(b) = parse_basis(v, fs) { s.flex_basis = b; } }
+        "flex-basis" => { if let Some(b) = parse_basis(v, fs) { (s.flex_basis, s.flex_basis_pct) = b; } }
         "flex" => {
             if let Some((grow, shrink, basis)) = parse_flex(v, fs) {
-                (s.flex_grow, s.flex_shrink, s.flex_basis) = (grow.min(1000.0), shrink.min(1000.0), basis);
+                (s.flex_grow, s.flex_shrink) = (grow.min(1000.0), shrink.min(1000.0));
+                (s.flex_basis, s.flex_basis_pct) = basis;
             }
         }
         "color" => { if let Some(Some(c)) = css::color_value(v) { s.color = c; } }
@@ -784,6 +795,10 @@ mod tests {
         assert_eq!((shrink(""), shrink("flex: 1"), shrink("flex: none"), shrink("flex: auto")), (1.0, 1.0, 0.0, 1.0));
         assert_eq!((shrink("flex: 1 0 auto"), shrink("flex: 2 3"), shrink("flex-shrink: 0")), (0.0, 3.0, 0.0));
         assert_eq!((shrink("flex-shrink: -1"), shrink("flex: 1 -1")), (1.0, 1.0), "nonsense is ignored");
+        let pct = |decl: &str| style_of(&format!("<p style='{decl}'>x</p>"), "p").flex_basis_pct;
+        assert_eq!((pct("flex-basis: 33%"), pct("flex: 0 0 25%"), pct("flex: 1 50%")), (Some(33.0), Some(25.0), Some(50.0)));
+        assert_eq!((pct("flex-basis: 0%"), pct("flex: 1"), pct("flex-basis: 20px"), pct("flex-basis: auto")), (None, None, None, None));
+        assert_eq!(pct("flex-basis: 40%; flex-basis: 10px"), None, "a later px basis replaces the percentage");
         assert_eq!(item("flex-grow: 2.5"), (2.5, None));
         assert_eq!(item("flex-basis: 40px"), (0.0, Some(40.0)));
         assert_eq!(item("flex-grow: 2; flex-basis: auto"), (2.0, None));

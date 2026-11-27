@@ -108,7 +108,7 @@ pub fn layout_document(
     }
     let mut cx = Ctx {
         dom, styles, fonts, images, form, has_block, items: vec![], links: vec![], controls: vec![], blocks: vec![],
-        forced_outer: None, label_cache: HashMap::new(),
+        forced_outer: None, label_cache: HashMap::new(), id_map: None,
     };
     let (bottom, mb) = cx.layout_block(0, 0.0, 0.0, 0.0, width, None, false);
 
@@ -185,6 +185,8 @@ struct Ctx<'a> {
     forced_outer: Option<f32>,
     /// For each `<label>` met so far, the control it is for (looked up once).
     label_cache: HashMap<NodeId, Option<NodeId>>,
+    /// `id` -> element, built the first time a `<label>` needs it.
+    id_map: Option<HashMap<String, NodeId>>,
 }
 
 fn resolve(l: Length, base: f32) -> Option<f32> {
@@ -1051,8 +1053,25 @@ impl<'a> Ctx<'a> {
         let mut cur = Some(node);
         while let Some(n) = cur {
             if self.dom.tag(n) == Some("label") {
-                let dom = self.dom;
-                return *self.label_cache.entry(n).or_insert_with(|| forms::label_target(dom, n));
+                if let Some(t) = self.label_cache.get(&n) {
+                    return *t;
+                }
+                let (dom, styles) = (self.dom, self.styles);
+                let ids = self.id_map.get_or_insert_with(|| forms::id_map(dom));
+                // a control inside a `display: none` box isn't there to be clicked
+                let shown = |c: NodeId| {
+                    let mut cur = Some(c);
+                    while let Some(x) = cur {
+                        if styles[x].display == Display::None {
+                            return false;
+                        }
+                        cur = dom.nodes[x].parent;
+                    }
+                    true
+                };
+                let target = forms::label_target(dom, n, ids, &shown);
+                self.label_cache.insert(n, target);
+                return target;
             }
             cur = self.dom.nodes[n].parent;
         }
@@ -2918,6 +2937,29 @@ mod tests {
         let (x, b) = at(&t, "Lbl");
         assert!(b > 20.0);
         assert_eq!(t.control_at(x + 2.0, b - 4.0), Some(z));
+    }
+
+    #[test]
+    fn labels_ignore_undisplayed_targets_and_scale_to_many_labels() {
+        for markup in [
+            "<label for=a>Lbl</label><input id=a hidden>",
+            "<label for=a>Lbl</label><input id=a style='display:none'>",
+            "<label for=a>Lbl</label><div hidden><input id=a></div>",
+            "<label for=a>Lbl</label><div style='display:none'><input id=a type=checkbox></div>",
+            "<label for=''>Lbl</label><input id='' type=checkbox>",
+            "<label>Lbl<input style='display:none'></label>",
+        ] {
+            let p = render(markup);
+            let (x, b) = at(&p, "Lbl");
+            assert_eq!(p.control_at(x + 2.0, b - 4.0), None, "{markup}");
+        }
+        let mut many = String::new();
+        for i in 0..8000 {
+            many.push_str(&format!("<label for=zz{i}>t</label><span id=s{i}>.</span>"));
+        }
+        let t = std::time::Instant::now();
+        render(&many);
+        assert!(t.elapsed().as_secs() < 20, "{:?}", t.elapsed());
     }
 
     #[test]

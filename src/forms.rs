@@ -121,12 +121,26 @@ pub fn controls_in(dom: &Dom, form: NodeId) -> Vec<NodeId> {
     (0..dom.nodes.len()).filter(|&n| kind_of(dom, n).is_some() && form_of(dom, n) == Some(form)).collect()
 }
 
+/// Every element's `id` -> the first element that has it.
+pub fn id_map(dom: &Dom) -> HashMap<String, NodeId> {
+    let mut m = HashMap::new();
+    for n in 0..dom.nodes.len() {
+        if let Some(id) = dom.attr(n, "id") {
+            m.entry(id.to_string()).or_insert(n);
+        }
+    }
+    m
+}
+
 /// The control a `<label>` is for: the element its `for` names (if that is a visible
 /// control), otherwise the first visible control inside the label.
-pub fn label_target(dom: &Dom, label: NodeId) -> Option<NodeId> {
-    let usable = |n: NodeId| matches!(kind_of(dom, n), Some(k) if k != ControlKind::Hidden);
+/// `ids` maps each `id` to its first element (see `id_map`); `shown` says whether a control is
+/// actually displayed (the page's styles decide that, so the caller supplies it).
+pub fn label_target(dom: &Dom, label: NodeId, ids: &HashMap<String, NodeId>, shown: &dyn Fn(NodeId) -> bool) -> Option<NodeId> {
+    let usable = |n: NodeId| is_focusable(dom, n) && shown(n);
     if let Some(target) = dom.attr(label, "for") {
-        return (0..dom.nodes.len()).find(|&n| dom.attr(n, "id") == Some(target)).filter(|&n| usable(n));
+        // an empty `for` names nothing
+        return ids.get(target).copied().filter(|_| !target.is_empty()).filter(|&n| usable(n));
     }
     let mut stack: Vec<NodeId> = dom.nodes[label].children.iter().rev().copied().collect();
     while let Some(n) = stack.pop() {
@@ -439,13 +453,22 @@ mod tests {
     #[test]
     fn a_label_points_at_its_for_target_or_its_first_visible_control() {
         let dom = html::parse("<label id=l1 for=a>A</label><input id=a name=a><label id=l2>B <input type=hidden name=h><input name=b></label><label id=l3 for=missing>C</label><label id=l4 for=hid>D</label><input id=hid type=hidden><label id=l5>none</label><label id=l6 for=a><input name=inner></label>");
-        let l = |id: &str| (0..dom.nodes.len()).find(|&n| dom.attr(n, "id") == Some(id)).unwrap();
-        assert_eq!(label_target(&dom, l("l1")), Some(l("a")));
-        assert_eq!(label_target(&dom, l("l2")), Some(by_name(&dom, "b")), "skips the hidden input");
-        assert_eq!(label_target(&dom, l("l3")), None);
-        assert_eq!(label_target(&dom, l("l4")), None, "a hidden control can't be focused");
-        assert_eq!(label_target(&dom, l("l5")), None);
-        assert_eq!(label_target(&dom, l("l6")), Some(l("a")), "`for` wins over a nested control");
+        let ids = id_map(&dom);
+        let l = |id: &str| ids[id];
+        let target = |id: &str| label_target(&dom, l(id), &ids, &|_| true);
+        assert_eq!(target("l1"), Some(l("a")));
+        assert_eq!(target("l2"), Some(by_name(&dom, "b")), "skips the hidden input");
+        assert_eq!(target("l3"), None);
+        assert_eq!(target("l4"), None, "a hidden control can't be focused");
+        assert_eq!(target("l5"), None);
+        assert_eq!(target("l6"), Some(l("a")), "`for` wins over a nested control");
+        // controls the page doesn't display, the `hidden` attribute, and an empty `for`
+        assert_eq!(label_target(&dom, l("l1"), &ids, &|n| n != l("a")), None);
+        let dom = html::parse("<label id=x for=a>X</label><input id=a hidden><label id=y for=''>Y</label><input id='' type=checkbox><label id=z for=b>Z</label><div hidden><input id=b></div>");
+        let ids = id_map(&dom);
+        for label in ["x", "y", "z"] {
+            assert_eq!(label_target(&dom, ids[label], &ids, &|_| true), None, "{label}");
+        }
     }
 
     fn by_name(dom: &Dom, name: &str) -> NodeId {

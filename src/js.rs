@@ -285,6 +285,9 @@ pub struct Interp {
     bytes: u64,
     /// The heap size, process-wide, above which the script is stopped.
     mem_limit: isize,
+    /// Bytes the page's scripts have kept from earlier runs (load, events): what is left of the
+    /// allowance is for the next one.
+    retained: isize,
     /// Arrays being joined right now (a cycle joins as an empty string).
     joining: Vec<ObjRef>,
     /// What the script wrote with `console.log` and friends.
@@ -363,6 +366,7 @@ pub fn run_page_scripts(dom: Dom, url: &str, scripts: Vec<(String, String)>) -> 
         .spawn(move || {
             let job = job;
             let (dom, scripts) = job.0;
+            let start = crate::memcount::live_bytes();
             let mut interp = Interp::for_page(dom, &url);
             for (source, name) in scripts {
                 interp.steps = 0; // (each script has the whole budget: one that runs away doesn't starve the next)
@@ -377,6 +381,7 @@ pub fn run_page_scripts(dom: Dom, url: &str, scripts: Vec<(String, String)>) -> 
             interp.run_timers();
             let dom = interp.dom.take().unwrap_or_else(Dom::new);
             let console = std::mem::take(&mut interp.console);
+            interp.retained = (crate::memcount::live_bytes() - start).max(0);
             Unsend((dom, console, interp))
         })
         .ok()?
@@ -399,9 +404,25 @@ impl ScriptHost {
                 let job = job;
                 let interp = job.0;
                 interp.steps = MAX_STEPS - EVENT_STEPS;
-                interp.mem_limit = crate::memcount::live_bytes() + MAX_SCRIPT_MEMORY; // (counted per thread: this is a new one)
-                let prevented = interp.dispatch(node, &event).unwrap_or(false);
+                // (memory is counted per thread, and this is a new one: the page's whole allowance
+                // is what it hasn't already kept, so many events can't add up to more than one script)
+                let start = crate::memcount::live_bytes();
+                interp.mem_limit = start + (MAX_SCRIPT_MEMORY - interp.retained).max(16 * 1024 * 1024);
+                let prevented = match interp.dispatch(node, &event) {
+                    Ok(p) => p,
+                    Err(Ctrl::Abort(m)) => {
+                        // (a script that ran away or ate the memory: say so, it isn't an ordinary error)
+                        interp.log_line(m);
+                        false
+                    }
+                    Err(_) => false,
+                };
                 interp.run_timers();
+                // (the limit is only looked at every so often while running: look once more at the end)
+                if interp.spend_bytes(0).is_err() {
+                    interp.log_line("script used too much memory and was stopped".into());
+                }
+                interp.retained = (interp.retained + crate::memcount::live_bytes() - start).max(0);
                 prevented
             });
             handle.ok().and_then(|h| h.join().ok())
@@ -575,6 +596,7 @@ impl Interp {
             objects: 0,
             bytes: 0,
             mem_limit: crate::memcount::live_bytes() + MAX_SCRIPT_MEMORY,
+            retained: 0,
             joining: vec![],
             console: vec![],
             console_bytes: 0,
@@ -3236,6 +3258,21 @@ mod tests {
         // events from a detached element don't reach the document
         let (log, _) = page("<body></body>", &["document.addEventListener('click', function(){ console.log('document') }); document.createElement('div').click(); document.body.click()"]);
         assert_eq!(log, "document");
+    }
+
+    #[test]
+    fn deep_trees_are_refused_and_memory_is_a_budget_for_the_whole_page() {
+        let (log, _) = page("<body></body>", &["var d = document.body; try { for (var i = 0; i < 5000; i++) { var c = document.createElement('div'); d.appendChild(c); d = c } } catch (e) { console.log('stopped: ' + e.message) }"]);
+        assert!(log.starts_with("stopped: the page is nested too deeply"), "{log}");
+        // events share what the load left of the allowance
+        let dom = crate::html::parse("<body></body>");
+        let src = vec![("var keep=[]; document.addEventListener('click', function(){ var s='x'.repeat(4000000); for (var i=0;i<10;i++) keep.push(s+i); console.log('kept ' + keep.length) })".to_string(), "s".to_string())];
+        let mut done = run_page_scripts(dom, "http://t.example/", src).expect("ran");
+        done.host.interp().retained = MAX_SCRIPT_MEMORY - 20 * 1024 * 1024; // (as if earlier events had kept almost all of it)
+        let mut dom = done.dom;
+        done.host.dispatch(&mut dom, dom_bindings::DOCUMENT, "click");
+        let lines = done.host.take_console();
+        assert!(lines.iter().any(|l| l.contains("too much memory")), "{lines:?} (load: {:?})", done.console);
     }
 
     #[test]

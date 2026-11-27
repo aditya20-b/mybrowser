@@ -11,6 +11,8 @@ use crate::dom::{Dom, Kind as DKind, NodeId};
 
 /// The most nodes a script may grow the DOM to, and the biggest `innerHTML` it may set.
 const MAX_NODES: usize = 200_000;
+/// How deep a script may nest elements.
+const MAX_TREE_DEPTH: usize = 512;
 const MAX_INNER_HTML: usize = 1024 * 1024;
 /// Listeners a page may register, timers it may have pending, and how many timer callbacks run at load.
 const MAX_LISTENERS: usize = 10_000;
@@ -177,6 +179,22 @@ fn attach(i: &mut Interp, parent: NodeId, child: NodeId, before: Option<NodeId>)
     }
     if dom.nodes.len() > MAX_NODES {
         return Err(Ctrl::Abort("the page grew too big".into()));
+    }
+    // Trees stay shallow: walking up from a node costs its depth, and every lookup does it
+    let mut depth = 0;
+    let mut up = Some(parent);
+    while let Some(p) = up {
+        depth += 1;
+        up = dom.nodes[p].parent;
+    }
+    let mut height = 0;
+    let mut level = vec![child];
+    while !level.is_empty() && height <= MAX_TREE_DEPTH {
+        height += 1;
+        level = level.iter().flat_map(|&n| dom.nodes[n].children.iter().copied()).collect();
+    }
+    if depth + height > MAX_TREE_DEPTH {
+        return i.throw("Error", "the page is nested too deeply");
     }
     let mut node = child;
     if child < parent {

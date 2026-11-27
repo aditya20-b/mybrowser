@@ -2,7 +2,7 @@
 
 I wanted to understand what a browser actually does, so I'm writing one from scratch in Rust. The goal is a *functional* browser: type an address, fetch the page over HTTPS, parse the HTML and CSS, lay it out, and paint it. There's no WebKit or Blink underneath and no UI toolkit doing the text layout for me. Only the window, the TLS stack, the font rasterizer and the image decoders come from crates.
 
-It is early. It can load and read plain, document-style websites today, including older table-based ones like Hacker News, and it falls over on anything that depends on JavaScript or flexbox. The [roadmap](#whats-missing) below is honest about the distance to a real browser.
+It is early. It can load and read plain, document-style websites today, including older table-based ones like Hacker News, and it falls over on anything that depends on JavaScript, grid or floats. The [roadmap](#whats-missing) below is honest about the distance to a real browser.
 
 <p align="center">
   <img src="docs/demo.png" width="24%" alt="The demo page rendered by mybrowser">
@@ -62,7 +62,7 @@ One heads-up: fonts are loaded from the macOS system font folder (see `src/fonts
 
 **CSS.** `<style>` blocks, linked stylesheets and inline styles. Selectors: tag, class, ID, `*`, attribute selectors (`[href]`, `[type=text]`, `^=`, `$=`, `*=`, `~=`, `|=`, and the `i`/`s` flags; values of HTML keyword attributes like `type` and `lang` ignore case, as in browsers), `:first-child`, `:last-child`, `:only-child`, `:nth-child()` and its `last`/`of-type` relatives, `:link`, `:root` and `:not()`, with descendant, `>`, `+` and `~` combinators. Selectors that need state the browser doesn't keep (`:hover`, `:focus`, `:visited`) or pseudo-elements (`::before`) are dropped rather than misapplied. Specificity, source order, `!important`, origin (author rules beat the built-in stylesheet), inheritance, and `inherit`/`initial`/`unset`. Most of the box model: width, max-width, height, padding, borders, auto margins, `box-sizing`, and margin collapsing including the awkward cases. Colors in hex, `rgb()`, `hsl()` and by name; the `font` and `border` shorthands. The `hidden` attribute hides an element.
 
-**Layout.** Block and inline flow, lists, `<pre>`, and **tables**: column widths from min and max content, percentage and fixed widths, `colspan` and `rowspan`, captions, row and cell backgrounds that stretch to the row, vertical alignment, nested tables, and the legacy attributes older pages rely on (`border`, `cellpadding`, `cellspacing`, `bgcolor`, `align`, `valign`, `<font>`).
+**Layout.** Block and inline flow, lists, `<pre>`, and **tables**: column widths from min and max content, percentage and fixed widths, `colspan` and `rowspan`, captions, row and cell backgrounds that stretch to the row, vertical alignment, nested tables, and the legacy attributes older pages rely on (`border`, `cellpadding`, `cellspacing`, `bgcolor`, `align`, `valign`, `<font>`). A **flexbox subset**: `display: flex` rows with `flex-wrap`, `gap`, `justify-content` (all six values), `align-items` (start, center, end), and items sized by `flex`, `flex-grow` and `flex-basis`, shrinking towards their min-content width when there isn't room. `flex-direction: column` stacks like a normal block.
 
 **Text and images.** Text wraps using real glyph widths with alignment, bold, italic, monospace, underlines, highlights and clickable links. Characters missing from the main fonts (arrows, CJK) fall back to a wide-coverage font. PNG, JPEG (including CMYK), GIF and WebP (lossy, lossless and with transparency) images flow inline with the text, scaled with bilinear filtering, with alt text as the fallback. The format is recognised from the bytes (a JPEG named `.png` still works), a GIF or an animated WebP shows its first frame, and every decoder checks the size a file claims before allocating, so a tiny file can't demand gigabytes. A decoder that crashes on a corrupt file costs that one picture, not the page.
 
@@ -125,7 +125,7 @@ There are about three hundred tests. They cover the parsers, selector matching, 
 The honest list, roughly by how much it matters for a real browser:
 
 - **JavaScript.** None. Pages that build their content with scripts will be blank or broken.
-- **Layout.** No flexbox, grid, floats or positioning, no inline padding or margins, and no `vh`/`vw`/`calc()`. A lot of the modern web depends on these.
+- **Layout.** Flexbox is only a subset: items keep their own height (no stretching of backgrounds to the tallest item), text written directly inside a flex container is ignored, `row-reverse`/`order`/`flex-shrink`/`align-self` aren't supported, and `inline-flex` acts as inline. No grid, floats or positioning, no inline padding or margins, and no `vh`/`vw`/`calc()`. A lot of the modern web depends on these.
 - **CSS.** No `@media`, pseudo-elements (`::before`), `:hover`/`:focus`/`:target` states, `:is()`/`:where()`, or `:checked`/`:disabled`.
 - **Forms.** No `multipart/form-data` (so no file uploads; a form asking for it is sent urlencoded), no `<select multiple>`, and `<label>` clicks don't focus their control. Reloading or going back to a page a `POST` produced fetches its URL with a `GET`. No caret movement or selection inside fields (typing appends, backspace deletes), no file, date or colour inputs, radio buttons draw as squares, and selects cycle on click instead of opening a menu. Controls hidden with CSS (`display:none`) can still be tabbed to. A page whose markup checks several radios of one group draws them all checked (only the last is submitted).
 - **Tabs.** No dragging to reorder. A reopened tab starts fresh (no back history, scroll position or typed form data). With many tabs open they shrink until only the close button shows (at most 20 can be open).
@@ -136,7 +136,7 @@ The honest list, roughly by how much it matters for a real browser:
 - **Text.** No shaping, so no kerning, ligatures or complex scripts, and no right-to-left text.
 - **Platform.** macOS fonts only, for now.
 
-The order I'm tackling things in: the remaining CSS gaps (inline boxes, viewport units), a flexbox subset, and eventually a JavaScript engine. Until then it's best at documents, blogs, articles and older table-based sites.
+The order I'm tackling things in: the remaining CSS gaps (inline boxes, viewport units, flex stretching), and eventually a JavaScript engine. Until then it's best at documents, blogs, articles and older table-based sites.
 
 ## Where to learn more
 

@@ -9,6 +9,8 @@ pub enum Display {
     None,
     Inline,
     Block,
+    /// A flex container (see `Style::flex_row` and friends for how it lays its children out).
+    Flex,
     ListItem,
     Table,
     TableRow,
@@ -30,6 +32,26 @@ pub enum VAlign {
     Top,
     Middle,
     Bottom,
+}
+
+/// `justify-content`: where a flex line's leftover space goes along the main axis.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Justify {
+    Start,
+    End,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
+/// `align-items`: where flex items sit across the line (stretching boxes isn't done: they
+/// keep their own height).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AlignItems {
+    Start,
+    Center,
+    End,
 }
 
 #[derive(Clone)]
@@ -67,6 +89,19 @@ pub struct Style {
     pub border_box: bool, // box-sizing: border-box (width/height include padding+border)
     /// `vertical-align` / `valign=`; None = unspecified (cells then use their row's, else middle).
     pub valign: Option<VAlign>,
+    // flexbox (container properties first, then the item's own)
+    /// `flex-direction: row` (the default); `column` makes the container stack like a block.
+    pub flex_row: bool,
+    pub flex_wrap: bool,
+    pub justify: Justify,
+    pub align_items: AlignItems,
+    /// `column-gap` and `row-gap` (`gap` sets both).
+    pub gap_col: f32,
+    pub gap_row: f32,
+    /// `flex-grow`: this item's share of a line's leftover space.
+    pub flex_grow: f32,
+    /// `flex-basis` in px (None = auto: the item's own content width).
+    pub flex_basis: Option<f32>,
 }
 
 impl Style {
@@ -96,6 +131,14 @@ impl Style {
             height: None,
             border_box: false,
             valign: None,
+            flex_row: true,
+            flex_wrap: false,
+            justify: Justify::Start,
+            align_items: AlignItems::Start,
+            gap_col: 0.0,
+            gap_row: 0.0,
+            flex_grow: 0.0,
+            flex_basis: None,
         }
     }
 
@@ -132,6 +175,11 @@ impl Style {
     pub fn face(&self) -> Face {
         Face { family: self.family, bold: self.bold, italic: self.italic }
     }
+
+    /// Does this box lay its children out side by side in a row?
+    pub fn is_flex_row(&self) -> bool {
+        self.display == Display::Flex && self.flex_row
+    }
 }
 
 fn side(name: &str) -> Option<usize> {
@@ -164,6 +212,16 @@ fn copy_prop(dst: &mut Style, src: &Style, name: &str) {
         "vertical-align" => dst.valign = src.valign,
         "border-spacing" => dst.spacing = src.spacing,
         "border-collapse" => dst.collapse = src.collapse,
+        "flex-direction" => dst.flex_row = src.flex_row,
+        "flex-wrap" => dst.flex_wrap = src.flex_wrap,
+        "justify-content" => dst.justify = src.justify,
+        "align-items" => dst.align_items = src.align_items,
+        "column-gap" => dst.gap_col = src.gap_col,
+        "row-gap" => dst.gap_row = src.gap_row,
+        "gap" => (dst.gap_col, dst.gap_row) = (src.gap_col, src.gap_row),
+        "flex-grow" => dst.flex_grow = src.flex_grow,
+        "flex-basis" => dst.flex_basis = src.flex_basis,
+        "flex" => (dst.flex_grow, dst.flex_basis) = (src.flex_grow, src.flex_basis),
         _ => {
             if let Some(i) = name.strip_prefix("margin-").and_then(side) {
                 dst.margin[i] = src.margin[i];
@@ -207,6 +265,58 @@ fn family_from_names(list: &str) -> Option<Family> {
         }
     }
     None
+}
+
+/// A flex basis: a length in px, `0%` (which means "no basis"), or nothing for `auto`/`content`.
+fn parse_basis(v: &str, fs: f32) -> Option<Option<f32>> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "auto" | "content" | "max-content" | "fit-content" => Some(None),
+        other => match css::parse_length(other, fs)? {
+            Length::Px(p) => Some(Some(p.max(0.0))),
+            Length::Pct(p) if p == 0.0 => Some(Some(0.0)),
+            _ => Some(None), // other percentages aren't resolved: treat as auto
+        },
+    }
+}
+
+/// A non-negative, finite number (a flex factor).
+fn parse_factor(t: &str) -> Option<f32> {
+    t.parse::<f32>().ok().filter(|g| g.is_finite() && *g >= 0.0)
+}
+
+/// The `flex` shorthand: `none`, `auto`, `initial`, `<grow>`, `<grow> <shrink>`, and an optional basis.
+fn parse_flex(v: &str, fs: f32) -> Option<(f32, Option<f32>)> {
+    let lv = v.trim().to_ascii_lowercase();
+    match lv.as_str() {
+        "none" | "initial" => return Some((0.0, None)),
+        "auto" => return Some((1.0, None)),
+        _ => {}
+    }
+    let tokens: Vec<&str> = lv.split_whitespace().collect();
+    match tokens.len() {
+        // `flex: 1` means `1 1 0%`; a lone length (`flex: 200px`) is a basis with grow 0
+        1 => match tokens[0].parse::<f32>() {
+            Ok(_) => Some((parse_factor(tokens[0])?, Some(0.0))),
+            Err(_) => Some((0.0, parse_basis(tokens[0], fs)?)),
+        },
+        // `grow shrink` (the shrink factor is ignored) or `grow basis`
+        2 => {
+            let grow = parse_factor(tokens[0])?;
+            match tokens[1].parse::<f32>() {
+                Ok(_) => {
+                    parse_factor(tokens[1])?;
+                    Some((grow, Some(0.0)))
+                }
+                Err(_) => Some((grow, parse_basis(tokens[1], fs)?)),
+            }
+        }
+        3 => {
+            let grow = parse_factor(tokens[0])?;
+            parse_factor(tokens[1])?;
+            Some((grow, parse_basis(tokens[2], fs)?))
+        }
+        _ => None,
+    }
 }
 
 fn apply(s: &mut Style, parent: &Style, d: &Declaration) {
@@ -273,9 +383,66 @@ fn apply(s: &mut Style, parent: &Style, d: &Declaration) {
             "table-row" => s.display = Display::TableRow,
             "table-row-group" | "table-header-group" | "table-footer-group" => s.display = Display::TableRowGroup,
             "table-cell" => s.display = Display::TableCell,
-            "block" | "flex" | "grid" | "table-caption" | "flow-root" => s.display = Display::Block,
+            "flex" => s.display = Display::Flex,
+            "block" | "grid" | "table-caption" | "flow-root" => s.display = Display::Block,
             _ => {} // unknown value: ignore the declaration
         },
+        "flex-direction" => match lv.as_str() {
+            "row" | "row-reverse" => s.flex_row = true,
+            "column" | "column-reverse" => s.flex_row = false,
+            _ => {}
+        },
+        "flex-wrap" => match lv.as_str() {
+            "wrap" | "wrap-reverse" => s.flex_wrap = true,
+            "nowrap" => s.flex_wrap = false,
+            _ => {}
+        },
+        "flex-flow" => {
+            for word in lv.split_whitespace() {
+                match word {
+                    "row" | "row-reverse" => s.flex_row = true,
+                    "column" | "column-reverse" => s.flex_row = false,
+                    "wrap" | "wrap-reverse" => s.flex_wrap = true,
+                    "nowrap" => s.flex_wrap = false,
+                    _ => {}
+                }
+            }
+        }
+        "justify-content" => match lv.as_str() {
+            "flex-start" | "start" | "normal" | "left" | "stretch" => s.justify = Justify::Start,
+            "flex-end" | "end" | "right" => s.justify = Justify::End,
+            "center" => s.justify = Justify::Center,
+            "space-between" => s.justify = Justify::SpaceBetween,
+            "space-around" => s.justify = Justify::SpaceAround,
+            "space-evenly" => s.justify = Justify::SpaceEvenly,
+            _ => {}
+        },
+        "align-items" => match lv.as_str() {
+            "flex-start" | "start" | "stretch" | "normal" | "baseline" => s.align_items = AlignItems::Start,
+            "center" => s.align_items = AlignItems::Center,
+            "flex-end" | "end" => s.align_items = AlignItems::End,
+            _ => {}
+        },
+        "gap" | "grid-gap" => {
+            // `gap: <row> <column>` (one value sets both)
+            let mut parts = lv.split_whitespace().map(|p| css::parse_length(p, fs));
+            if let Some(Some(Length::Px(row))) = parts.next() {
+                let col = match parts.next() {
+                    Some(Some(Length::Px(c))) => c,
+                    _ => row,
+                };
+                (s.gap_row, s.gap_col) = (row.clamp(0.0, 10_000.0), col.clamp(0.0, 10_000.0));
+            }
+        }
+        "column-gap" => { if let Some(Length::Px(p)) = css::parse_length(v, fs) { s.gap_col = p.clamp(0.0, 10_000.0); } }
+        "row-gap" => { if let Some(Length::Px(p)) = css::parse_length(v, fs) { s.gap_row = p.clamp(0.0, 10_000.0); } }
+        "flex-grow" => { if let Some(g) = parse_factor(&lv) { s.flex_grow = g.min(1000.0); } }
+        "flex-basis" => { if let Some(b) = parse_basis(v, fs) { s.flex_basis = b; } }
+        "flex" => {
+            if let Some((grow, basis)) = parse_flex(v, fs) {
+                (s.flex_grow, s.flex_basis) = (grow.min(1000.0), basis);
+            }
+        }
         "color" => { if let Some(Some(c)) = css::color_value(v) { s.color = c; } }
         "background-color" => { if let Some(c) = css::color_value(v) { s.background = c; } }
         "font-size" => {
@@ -568,6 +735,66 @@ mod tests {
         assert_eq!(s.width, Length::Auto);
     }
 
+    // ---------- flexbox ----------
+
+    #[test]
+    fn flex_container_properties_parse() {
+        let s = style_of("<div style='display:flex'>x</div>", "div");
+        assert_eq!(s.display, Display::Flex);
+        assert!(s.is_flex_row() && !s.flex_wrap);
+        assert_eq!((s.justify, s.align_items, s.gap_col, s.gap_row), (Justify::Start, AlignItems::Start, 0.0, 0.0));
+        let s = style_of(
+            "<div style='display:flex;flex-direction:column;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:10px 20px'>x</div>",
+            "div",
+        );
+        assert_eq!(s.display, Display::Flex);
+        assert!(!s.flex_row && !s.is_flex_row() && s.flex_wrap);
+        assert_eq!((s.justify, s.align_items), (Justify::SpaceBetween, AlignItems::Center));
+        assert_eq!((s.gap_row, s.gap_col), (10.0, 20.0));
+        let s = style_of("<div style='display:flex;flex-flow:column wrap;column-gap:7px;row-gap:3px;justify-content:flex-end'>x</div>", "div");
+        assert!(!s.flex_row && s.flex_wrap);
+        assert_eq!((s.gap_col, s.gap_row, s.justify), (7.0, 3.0, Justify::End));
+        let one = style_of("<div style='gap:12px'>x</div>", "div");
+        assert_eq!((one.gap_col, one.gap_row), (12.0, 12.0), "a single value sets both");
+        for (value, want) in [
+            ("center", Justify::Center), ("space-around", Justify::SpaceAround), ("space-evenly", Justify::SpaceEvenly),
+            ("flex-start", Justify::Start), ("end", Justify::End),
+        ] {
+            assert_eq!(style_of(&format!("<div style='justify-content:{value}'>x</div>"), "div").justify, want, "{value}");
+        }
+    }
+
+    #[test]
+    fn flex_item_shorthands() {
+        let item = |decl: &str| {
+            let s = style_of(&format!("<p style='{decl}'>x</p>"), "p");
+            (s.flex_grow, s.flex_basis)
+        };
+        assert_eq!(item("flex: 1"), (1.0, Some(0.0)), "`flex: 1` is `1 1 0%`");
+        assert_eq!(item("flex: 3"), (3.0, Some(0.0)));
+        assert_eq!(item("flex: 2 1 0%"), (2.0, Some(0.0)));
+        assert_eq!(item("flex: 1 1 100px"), (1.0, Some(100.0)));
+        assert_eq!(item("flex: 0 0 auto"), (0.0, None));
+        assert_eq!(item("flex: auto"), (1.0, None));
+        assert_eq!(item("flex: none"), (0.0, None));
+        assert_eq!(item("flex: 200px"), (0.0, Some(200.0)), "a lone length is a basis");
+        assert_eq!(item("flex: 1 2"), (1.0, Some(0.0)), "two numbers are grow and shrink");
+        assert_eq!(item("flex: 1 50px"), (1.0, Some(50.0)), "grow and basis");
+        assert_eq!(item("flex-grow: 2.5"), (2.5, None));
+        assert_eq!(item("flex-basis: 40px"), (0.0, Some(40.0)));
+        assert_eq!(item("flex-grow: 2; flex-basis: auto"), (2.0, None));
+        // nonsense is ignored, hostile numbers are clamped
+        assert_eq!(item("flex: banana"), (0.0, None));
+        assert_eq!(item("flex: -3"), (0.0, None));
+        assert_eq!(item("flex: 1 -2"), (0.0, None));
+        assert_eq!(item("flex: 1 2 3 4"), (0.0, None));
+        assert_eq!(item("flex: 99999999").0, 1000.0);
+        assert_eq!(item("flex-grow: -1"), (0.0, None));
+        // flex props are not inherited
+        let s = style_of("<div style='display:flex;gap:9px;flex:2'><p>x</p></div>", "p");
+        assert_eq!((s.gap_col, s.flex_grow, s.display), (0.0, 0.0, Display::Block));
+    }
+
     // ---------- regressions from the adversarial review ----------
 
     #[test]
@@ -661,7 +888,8 @@ mod tests {
         assert_eq!(d("inline-grid"), Display::Inline);
         assert_eq!(d("inline-flex"), Display::Inline);
         assert_eq!(d("contents"), Display::Inline);
-        assert_eq!(d("flex"), Display::Block);
+        assert_eq!(d("flex"), Display::Flex);
+        assert_eq!(d("grid"), Display::Block);
         assert_eq!(d("bogus"), Display::Block); // ignored: keeps the UA default for <p>
         assert_eq!(style_of("<div style='display:inline'><p style='display:inherit'>x</p></div>", "p").display, Display::Inline);
     }

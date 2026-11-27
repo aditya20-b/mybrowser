@@ -5,20 +5,26 @@
 //! margins collapse. Inline layout: text is flattened into words and
 //! greedily wrapped into lines, then aligned. Tables use the classic
 //! auto-layout idea: measure each column's min/max content width, fit the
-//! table to the available space, then lay the cells out row by row. Form
-//! controls are inline boxes drawn from rects and text.
+//! table to the available space, then lay the cells out row by row. Flex rows
+//! (`display: flex`) size their items from their content, share out the leftover
+//! space by `flex-grow`, wrap into lines if asked to, and place them with
+//! `justify-content` and `align-items`. Form controls are inline boxes drawn
+//! from rects and text.
 use crate::css::{Color, Length};
 use crate::dom::{Dom, Kind, NodeId};
 use crate::fonts::{Face, Family, Fonts};
 use crate::forms::{self, ControlKind, FormState};
 use crate::images::Image;
-use crate::style::{Align, Display, Style, VAlign};
+use crate::style::{Align, AlignItems, Display, Justify, Style, VAlign};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// A table never has more columns than this (cells beyond it are dropped), so
 /// `colspan=999999999` can't allocate gigabytes.
 const MAX_COLS: usize = 1000;
+
+/// A flex container lays out at most this many items (the rest are dropped).
+const MAX_FLEX_ITEMS: usize = 2000;
 
 /// Form controls use a fixed 13.333px sans-serif, like a browser's default.
 const CTL_FONT: f32 = 13.333;
@@ -100,7 +106,10 @@ pub fn layout_document(
             _ => true,
         });
     }
-    let mut cx = Ctx { dom, styles, fonts, images, form, has_block, items: vec![], links: vec![], controls: vec![], blocks: vec![] };
+    let mut cx = Ctx {
+        dom, styles, fonts, images, form, has_block, items: vec![], links: vec![], controls: vec![], blocks: vec![],
+        forced_outer: None,
+    };
     let (bottom, mb) = cx.layout_block(0, 0.0, 0.0, 0.0, width, None, false);
 
     // The canvas takes the background of <html>, or else of <body>.
@@ -171,6 +180,9 @@ struct Ctx<'a> {
     /// y of the line or block they start in, in layout order. Table cells shift theirs
     /// along with their content.
     blocks: Vec<(NodeId, f32)>,
+    /// The margin-box width the next `layout_block` call must use (set by a flex line that has
+    /// decided how wide an item is; consumed at the start of that call).
+    forced_outer: Option<f32>,
 }
 
 fn resolve(l: Length, base: f32) -> Option<f32> {
@@ -276,6 +288,65 @@ struct Spanning {
     valign: VAlign,
 }
 
+/// One item of a flex container.
+struct FlexItem {
+    id: NodeId,
+    /// Set for an inline-level item (a `<span>`, an `<img>`, a link): it is laid out as a
+    /// line of text rather than as a box.
+    inline: Option<Vec<Inl>>,
+    /// Narrowest it can get (min-content), outer width.
+    min: f32,
+    /// Starting size before growing or shrinking, outer width.
+    basis: f32,
+    grow: f32,
+}
+
+/// Where each item of a flex line goes: the main-axis widths, then the offset of the first
+/// item and the extra space between neighbours that `justify-content` asks for.
+struct FlexLine {
+    widths: Vec<f32>,
+    offset: f32,
+    extra_gap: f32,
+}
+
+/// Size one flex line: items start at their basis; if there is room to spare it goes to the
+/// items that grow (by weight), and failing that to `justify-content`; if there isn't enough
+/// room, items shrink towards their min-content width (the most flexible ones first, in
+/// proportion to how far they can shrink).
+fn flex_line_sizes(items: &[&FlexItem], width: f32, gap: f32, justify: Justify) -> FlexLine {
+    let n = items.len();
+    let gaps = gap * n.saturating_sub(1) as f32;
+    let basis_sum: f32 = items.iter().map(|i| i.basis).sum();
+    let free = width - basis_sum - gaps;
+    let mut widths: Vec<f32> = items.iter().map(|i| i.basis).collect();
+    let grow_sum: f32 = items.iter().map(|i| i.grow).sum();
+    if free > 0.0 && grow_sum > 0.0 {
+        for (w, it) in widths.iter_mut().zip(items) {
+            *w += free * it.grow / grow_sum;
+        }
+    } else if free < 0.0 {
+        let room: Vec<f32> = items.iter().map(|i| (i.basis - i.min).max(0.0)).collect();
+        let total_room: f32 = room.iter().sum();
+        if total_room > 0.0 {
+            let cut = (-free).min(total_room);
+            for (w, r) in widths.iter_mut().zip(&room) {
+                *w -= cut * r / total_room;
+            }
+        }
+    }
+    let leftover = (width - widths.iter().sum::<f32>() - gaps).max(0.0);
+    let (offset, extra_gap) = match justify {
+        Justify::Start => (0.0, 0.0),
+        Justify::End => (leftover, 0.0),
+        Justify::Center => (leftover / 2.0, 0.0),
+        Justify::SpaceBetween if n > 1 => (0.0, leftover / (n - 1) as f32),
+        Justify::SpaceBetween => (0.0, 0.0),
+        Justify::SpaceAround => (leftover / n.max(1) as f32 / 2.0, leftover / n.max(1) as f32),
+        Justify::SpaceEvenly => (leftover / (n + 1) as f32, leftover / (n + 1) as f32),
+    };
+    FlexLine { widths, offset, extra_gap }
+}
+
 /// Divide `avail` between columns: percentage columns get their share, the rest
 /// share what's left between their min and max content widths.
 fn distribute(min: &[f32], max: &[f32], pct: &[Option<f32>], avail: f32) -> Vec<f32> {
@@ -339,6 +410,7 @@ impl<'a> Ctx<'a> {
     ) -> (f32, f32) {
         let styles = self.styles;
         let s = &styles[id];
+        let forced = self.forced_outer.take();
 
         let pad = s.padding.map(|l| resolve(l, avail).unwrap_or(0.0).max(0.0));
         let bw = s.borders();
@@ -365,7 +437,11 @@ impl<'a> Ctx<'a> {
         let to_content = |w: f32| if s.border_box { (w - extras).max(0.0) } else { w.max(0.0) };
 
         // ---- horizontal: resolve content width and left/right margins
-        let mut width_spec = resolve(s.width, avail).map(to_content);
+        let mut width_spec = match forced {
+            // a flex line decided this item's whole (margin-box) width
+            Some(w) => Some((w - ml_opt.unwrap_or(0.0) - mr_opt.unwrap_or(0.0) - extras).max(0.0)),
+            None => resolve(s.width, avail).map(to_content),
+        };
         let inner = (avail - ml_opt.unwrap_or(0.0) - mr_opt.unwrap_or(0.0) - extras).max(0.0);
         let mut content_w = width_spec.unwrap_or(inner);
         if let Some(maxw) = s.max_width.map(to_content) {
@@ -414,7 +490,11 @@ impl<'a> Ctx<'a> {
             self.items.len() - 1
         });
 
-        let (end_y, last_mb) = self.layout_children(id, content_x, content_top, content_w, top_open);
+        let (end_y, last_mb) = if s.is_flex_row() {
+            self.layout_flex(id, content_x, content_top, content_w)
+        } else {
+            self.layout_children(id, content_x, content_top, content_w, top_open)
+        };
 
         // A list marker sits on the baseline of the item's first line, whatever
         // font that line uses (a heading inside an <li> has a taller baseline).
@@ -444,6 +524,137 @@ impl<'a> Ctx<'a> {
         let bottom = content_bottom + pad[2] + bw[2];
         self.emit_decor(s, bg_slot, bx, top, border_w, bottom, bw, None);
         (bottom, eff_mb)
+    }
+
+    // ---------------------------------------------------------------- flexbox
+
+    /// The horizontal margin, padding and border of a box (what sits around its content width).
+    fn box_extras(&self, id: NodeId) -> f32 {
+        let s = &self.styles[id];
+        let px = |l: Length| resolve(l, 0.0).unwrap_or(0.0);
+        let bw = s.borders();
+        px(s.padding[1]).max(0.0) + px(s.padding[3]).max(0.0) + bw[1] + bw[3] + px(s.margin[1]) + px(s.margin[3])
+    }
+
+    /// The (min-content, max-content) outer width of one flex item, or None if it draws nothing.
+    fn flex_item_widths(&self, c: NodeId) -> Option<(f32, f32, Option<Vec<Inl>>)> {
+        if self.styles[c].display == Display::Inline {
+            let mut v = vec![];
+            self.flatten(c, &mut v);
+            if v.iter().all(|i| matches!(i, Inl::Space(_))) {
+                return None;
+            }
+            let (min, max) = self.inline_widths(&v);
+            return Some((min, max, Some(v)));
+        }
+        let (min, max) = self.outer_widths(c);
+        Some((min, max, None))
+    }
+
+    /// The element children of a flex container (text directly inside one isn't laid out).
+    fn flex_children(&self, id: NodeId) -> Vec<NodeId> {
+        self.flow_children(id)
+            .into_iter()
+            .filter(|&c| self.styles[c].display != Display::None && matches!(self.dom.nodes[c].kind, Kind::Element { .. }))
+            .take(MAX_FLEX_ITEMS)
+            .collect()
+    }
+
+    /// (min, max) content width of a flex row: the items side by side. With wrapping it can be
+    /// as narrow as its widest item; without, items only shrink towards their min-content.
+    fn flex_content_widths(&self, id: NodeId) -> (f32, f32) {
+        let s = &self.styles[id];
+        let (mut min_sum, mut min_max, mut max_sum, mut n) = (0.0f32, 0.0f32, 0.0f32, 0usize);
+        for c in self.flex_children(id) {
+            let Some((min, max, _)) = self.flex_item_widths(c) else { continue };
+            let basis = match s_basis(&self.styles[c]) {
+                Some(b) => b + if self.styles[c].display == Display::Inline { 0.0 } else { self.box_extras(c) },
+                None => max,
+            };
+            min_sum += min;
+            min_max = min_max.max(min);
+            max_sum += basis;
+            n += 1;
+        }
+        let gaps = s.gap_col * n.saturating_sub(1) as f32;
+        let min = if s.flex_wrap { min_max } else { min_sum + gaps };
+        (min, max_sum + gaps)
+    }
+
+    /// Lay out a flex row's items inside the content box at (`x`, `y`), `width` wide. Returns
+    /// (y after the last line, 0): items' margins never collapse with their container's.
+    fn layout_flex(&mut self, id: NodeId, x: f32, y: f32, width: f32) -> (f32, f32) {
+        let styles = self.styles;
+        let s = &styles[id];
+        let (gap_c, gap_r) = (s.gap_col, s.gap_row);
+        let mut items: Vec<FlexItem> = vec![];
+        for c in self.flex_children(id) {
+            let Some((min, max, inline)) = self.flex_item_widths(c) else { continue };
+            let st = &styles[c];
+            let extras = if inline.is_some() { 0.0 } else { self.box_extras(c) };
+            let basis = match st.flex_basis {
+                Some(b) => b.max(0.0) + extras,
+                None => max,
+            };
+            items.push(FlexItem { id: c, inline, min, basis, grow: st.flex_grow });
+        }
+        if items.is_empty() {
+            return (y, 0.0);
+        }
+
+        // split into lines (one line unless wrapping)
+        let mut lines: Vec<Vec<usize>> = vec![vec![]];
+        let mut used = 0.0f32;
+        for (i, it) in items.iter().enumerate() {
+            let cur = lines.last_mut().unwrap();
+            if s.flex_wrap && !cur.is_empty() && used + gap_c + it.basis > width + 0.01 {
+                lines.push(vec![i]);
+                used = it.basis;
+            } else {
+                used += if cur.is_empty() { it.basis } else { gap_c + it.basis };
+                cur.push(i);
+            }
+        }
+
+        let mut cy = y;
+        let mut end = y;
+        for (li, line) in lines.iter().enumerate() {
+            let members: Vec<&FlexItem> = line.iter().map(|&i| &items[i]).collect();
+            let sizes = flex_line_sizes(&members, width, gap_c, s.justify);
+            let mut cx = x + sizes.offset;
+            let mut placed: Vec<([(usize, usize); 4], f32)> = vec![];
+            let mut line_h = 0.0f32;
+            for (it, &w) in members.iter().zip(&sizes.widths) {
+                let before = (self.items.len(), self.links.len(), self.controls.len(), self.blocks.len());
+                let h = if let Some(v) = &it.inline {
+                    self.layout_inline(v, cx, cy, w, Align::Left, id)
+                } else if styles[it.id].display == Display::Table {
+                    self.layout_table(it.id, cx, cy, 0.0, w, false, id).0 - cy
+                } else {
+                    self.forced_outer = Some(w);
+                    let (bottom, mb) = self.layout_block(it.id, cx, cy, 0.0, w, None, false);
+                    bottom + mb - cy
+                };
+                let after = (self.items.len(), self.links.len(), self.controls.len(), self.blocks.len());
+                placed.push(([(before.0, after.0), (before.1, after.1), (before.2, after.2), (before.3, after.3)], h));
+                line_h = line_h.max(h);
+                cx += w + gap_c + sizes.extra_gap;
+            }
+            // across the line: items that are shorter than it sit at the top, middle or bottom
+            for (ranges, h) in &placed {
+                let dy = match s.align_items {
+                    AlignItems::Start => 0.0,
+                    AlignItems::Center => (line_h - h) / 2.0,
+                    AlignItems::End => line_h - h,
+                };
+                if dy > 0.0 {
+                    self.shift(ranges[0], ranges[1], ranges[2], ranges[3], dy);
+                }
+            }
+            end = cy + line_h;
+            cy = end + if li + 1 < lines.len() { gap_r } else { 0.0 };
+        }
+        (end, 0.0)
     }
 
     /// Fill the background placeholder at `bg_slot` and push the border rects.
@@ -630,8 +841,9 @@ impl<'a> Ctx<'a> {
     fn collapsed_top(&self, id: NodeId, avail: f32) -> f32 {
         let s = &self.styles[id];
         let mt = resolve(s.margin[0], avail).unwrap_or(0.0);
-        // a table's own margin is all there is: its rows don't collapse into it
-        if s.display == Display::Table {
+        // a table's own margin is all there is: its rows don't collapse into it; a flex
+        // container's items never collapse their margins with it either
+        if matches!(s.display, Display::Table | Display::Flex) {
             return mt;
         }
         let pad_top = resolve(s.padding[0], avail).unwrap_or(0.0);
@@ -1233,7 +1445,7 @@ impl<'a> Ctx<'a> {
         if s.display == Display::Table {
             return self.table_widths(id);
         }
-        let (mut min, mut max) = self.content_widths(id);
+        let (mut min, mut max) = if s.is_flex_row() { self.flex_content_widths(id) } else { self.content_widths(id) };
         if let Length::Px(w) = s.width {
             min = w.max(0.0);
             max = min;
@@ -1641,6 +1853,11 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// A flex item's `flex-basis`, if it has one.
+fn s_basis(s: &Style) -> Option<f32> {
+    s.flex_basis.map(|b| b.max(0.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1794,6 +2011,278 @@ mod tests {
         let body = format!("{}text{}", "<span><div>".repeat(n), "</div></span>".repeat(n));
         let p = render(&body);
         assert!(texts(&p).iter().any(|(s, _)| s == "text"));
+    }
+
+    // ---------------------------------------------------------------- flexbox
+
+    /// A 300px-wide flex row of the given items (margin-free body).
+    fn flex(container_style: &str, items: &str) -> Page {
+        render_w(&format!("<div style='display:flex;{container_style}'>{items}</div>"), 300.0)
+    }
+
+    #[test]
+    fn flex_items_sit_side_by_side_at_their_content_width() {
+        let p = flex("", "<div>aa</div><div>bb</div><div>cc</div>");
+        let (a, b, c) = (at(&p, "aa"), at(&p, "bb"), at(&p, "cc"));
+        assert_eq!((a.1, b.1), (b.1, c.1), "one row: they share a baseline");
+        assert_eq!(a.0, 0.0);
+        let w = |s: &str| Fonts::load().measure(ctl_face(), 16.0, s);
+        assert!((b.0 - (a.0 + w("aa"))).abs() < 1.5, "bb starts where aa ends: {} vs {}", b.0, a.0 + w("aa"));
+        assert!(c.0 > b.0 && c.0 < 100.0, "and cc after it, nowhere near the right edge: {}", c.0);
+        // without the flex display the same divs stack
+        let stacked = render_w("<div><div>aa</div><div>bb</div></div>", 300.0);
+        assert!(at(&stacked, "bb").1 > at(&stacked, "aa").1 + 5.0);
+    }
+
+    #[test]
+    fn flex_grow_shares_the_leftover_space() {
+        // `flex: 1` is grow 1 from a basis of 0: three equal thirds
+        let p = flex("", "<div style='flex:1'>a</div><div style='flex:1'>b</div><div style='flex:1'>c</div>");
+        let (a, b, c) = (at(&p, "a"), at(&p, "b"), at(&p, "c"));
+        assert!(a.0.abs() < 0.5 && (b.0 - 100.0).abs() < 0.5 && (c.0 - 200.0).abs() < 0.5, "{a:?} {b:?} {c:?}");
+        // weights: 1 : 2 -> a third and two thirds
+        let p = flex("", "<div style='flex:1'>a</div><div style='flex:2'>b</div>");
+        assert!((at(&p, "b").0 - 100.0).abs() < 0.5, "{:?}", at(&p, "b"));
+        // a fixed item next to a growing one: the grower takes what is left
+        let p = flex("", "<div style='flex:1'>a</div><div style='width:100px'>b</div>");
+        assert!((at(&p, "b").0 - 200.0).abs() < 0.5, "{:?}", at(&p, "b"));
+        // growing from an auto basis: each keeps its content and gets half the extra
+        let p = flex("", "<div style='flex-grow:1'>a</div><div style='flex-grow:1'>b</div>");
+        let wa = Fonts::load().measure(ctl_face(), 16.0, "a");
+        let wb = Fonts::load().measure(ctl_face(), 16.0, "b");
+        let extra = (300.0 - wa - wb) / 2.0;
+        assert!((at(&p, "b").0 - (wa + extra)).abs() < 1.0, "{:?}", at(&p, "b"));
+    }
+
+    #[test]
+    fn flex_items_shrink_when_there_is_not_enough_room() {
+        // two 200px items in 300px: each gives up 50px (they can shrink towards their content)
+        let p = flex("", "<div style='width:200px'>a</div><div style='width:200px'>b</div>");
+        // explicit widths are also the min-content, so they overflow rather than shrink
+        assert!((at(&p, "b").0 - 200.0).abs() < 0.5, "{:?}", at(&p, "b"));
+        // auto-width items with a lot of text wrap instead of overflowing
+        let words = "word ".repeat(40);
+        let p = flex("", &format!("<div>{words}</div><div>{words}</div>"));
+        let right_edge = texts_full(&p).iter().map(|(t, x, _)| x + Fonts::load().measure(ctl_face(), 16.0, t)).fold(0.0f32, f32::max);
+        assert!(right_edge <= 300.5, "nothing sticks out of the container: {right_edge}");
+        let baselines: std::collections::BTreeSet<i32> = texts(&p).iter().map(|(_, b)| *b as i32).collect();
+        assert!(baselines.len() > 3, "the text wrapped over several lines");
+    }
+
+    #[test]
+    fn gaps_separate_items_and_lines() {
+        let plain = flex("", "<div>aa</div><div>bb</div>");
+        let gapped = flex("gap:20px", "<div>aa</div><div>bb</div>");
+        assert!((at(&gapped, "bb").0 - at(&plain, "bb").0 - 20.0).abs() < 0.5);
+        // row-gap between wrapped lines, column-gap within one
+        let p = flex("flex-wrap:wrap;column-gap:10px;row-gap:30px", &"<div style='width:140px'>q</div>".repeat(4));
+        let ys: Vec<f32> = texts(&p).iter().map(|(_, b)| *b).collect();
+        assert_eq!(ys.len(), 4);
+        assert_eq!(ys[0], ys[1]);
+        assert!(ys[2] - ys[0] > 30.0 + 10.0, "the second row is a line plus a 30px gap lower: {ys:?}");
+        let xs: Vec<f32> = texts_full(&p).iter().map(|(_, x, _)| *x).collect();
+        assert!((xs[1] - xs[0] - 150.0).abs() < 0.5, "140px item + 10px gap: {xs:?}");
+    }
+
+    #[test]
+    fn justify_content_places_the_leftover_space() {
+        let w = Fonts::load().measure(ctl_face(), 16.0, "x");
+        let x_of = |style: &str| at(&flex(style, "<div>x</div>"), "x").0;
+        assert!(x_of("justify-content:flex-start").abs() < 0.5);
+        assert!((x_of("justify-content:center") - (300.0 - w) / 2.0).abs() < 1.0);
+        assert!((x_of("justify-content:flex-end") - (300.0 - w)).abs() < 1.0);
+        // several items: between, around and evenly
+        let three = |style: &str| {
+            let p = flex(style, "<div>a</div><div>b</div><div>c</div>");
+            [at(&p, "a").0, at(&p, "b").0, at(&p, "c").0]
+        };
+        let between = three("justify-content:space-between");
+        assert!(between[0].abs() < 0.5, "the first touches the start: {between:?}");
+        let wc = Fonts::load().measure(ctl_face(), 16.0, "c");
+        assert!((between[2] + wc - 300.0).abs() < 1.0, "the last touches the end: {between:?}");
+        assert!((between[1] - (between[0] + between[2]) / 2.0).abs() < 4.0, "the middle one is about centred: {between:?}");
+        let around = three("justify-content:space-around");
+        assert!(around[0] > 10.0 && around[1] - around[0] > 20.0, "{around:?}");
+        let evenly = three("justify-content:space-evenly");
+        assert!(evenly[0] > 10.0, "{evenly:?}");
+        let step1 = evenly[1] - evenly[0];
+        let step2 = evenly[2] - evenly[1];
+        assert!((step1 - step2).abs() < 3.0, "evenly spaced: {evenly:?}");
+        // growing items use the space, so justify-content has nothing to place
+        let grown = flex("justify-content:center", "<div style='flex:1'>a</div>");
+        assert!(at(&grown, "a").0.abs() < 0.5);
+        // a lone item with space-between sits at the start
+        assert!(x_of("justify-content:space-between").abs() < 0.5);
+    }
+
+    #[test]
+    fn flex_wrap_breaks_items_onto_new_lines() {
+        let item = "<div style='width:120px'>q</div>";
+        let wrapped = flex("flex-wrap:wrap", &item.repeat(4));
+        let ys: Vec<f32> = texts(&wrapped).iter().map(|(_, b)| *b).collect();
+        assert_eq!(ys[0], ys[1], "two fit on the first line");
+        assert!(ys[2] > ys[0] + 5.0 && ys[2] == ys[3], "the other two wrap: {ys:?}");
+        let xs: Vec<f32> = texts_full(&wrapped).iter().map(|(_, x, _)| *x).collect();
+        assert_eq!(xs[0], xs[2], "a new line starts at the left again: {xs:?}");
+        // without wrap they stay on one line (and overflow)
+        let nowrap = flex("", &item.repeat(4));
+        let ys: Vec<f32> = texts(&nowrap).iter().map(|(_, b)| *b).collect();
+        assert!(ys.iter().all(|y| *y == ys[0]));
+        // a wrapping container's height covers all its lines
+        assert!(wrapped.layout.height > nowrap.layout.height + 5.0);
+        // grow works per line: the lone last item on its line takes the whole width
+        let grown = flex("flex-wrap:wrap", &format!("{}<div style='flex:1 1 50px'>last</div>", "<div style='width:140px'>q</div>".repeat(2)));
+        assert!(at(&grown, "last").1 > at(&grown, "q").1 + 5.0, "it wrapped (140+140+content > 300)");
+    }
+
+    #[test]
+    fn align_items_places_shorter_items_across_the_line() {
+        let tall = "<div>t<br>t<br>t</div>";
+        let first_baseline = |style: &str| at(&flex(style, &format!("{tall}<div>short</div>")), "short").1;
+        let top = first_baseline("");
+        let mid = first_baseline("align-items:center");
+        let bottom = first_baseline("align-items:flex-end");
+        assert!(mid > top + 5.0 && bottom > mid + 5.0, "{top} {mid} {bottom}");
+        // the tall item does not move
+        let tall_y = |style: &str| at(&flex(style, &format!("{tall}<div>short</div>")), "t").1;
+        assert_eq!(tall_y(""), tall_y("align-items:center"));
+        // and things inside a moved item move with it: links, controls and anchors
+        let p = flex("align-items:center", &format!("{tall}<div><a id=tgt href=x>link</a><input name=q></div>"));
+        let link = &p.layout.links[0];
+        assert!((link.y - (at(&p, "link").1 - 16.0)).abs() < 20.0, "the link region followed its text: {} vs {}", link.y, at(&p, "link").1);
+        assert!(p.layout.controls[0].y > 10.0, "the input moved down too: {}", p.layout.controls[0].y);
+        assert!(p.layout.anchor_y("tgt").unwrap() > 10.0, "and the anchor");
+    }
+
+    #[test]
+    fn a_column_flex_container_stacks_its_items() {
+        let p = flex("flex-direction:column", "<div>aa</div><div>bb</div>");
+        assert!(at(&p, "bb").1 > at(&p, "aa").1 + 5.0);
+        assert_eq!(at(&p, "aa").0, at(&p, "bb").0);
+        let p = flex("flex-flow:column wrap", "<div>aa</div><div>bb</div>");
+        assert!(at(&p, "bb").1 > at(&p, "aa").1 + 5.0);
+    }
+
+    #[test]
+    fn flex_item_boxes_keep_their_margins_padding_backgrounds_and_borders() {
+        let p = flex("", "<div style='background:red;padding:10px;margin:5px;width:100px'>a</div><div style='margin-left:20px'>b</div>");
+        let red = rects(&p).into_iter().find(|r| r.4 == RED).unwrap();
+        assert_eq!(red.0, 5.0, "the margin offsets the box");
+        assert_eq!(red.1, 5.0);
+        assert!((red.2 - 120.0).abs() < 0.5, "100px content + padding: {}", red.2);
+        assert!(red.3 > 20.0, "padding is part of the height: {}", red.3);
+        // the next item starts after the first one's right margin, plus its own left margin
+        assert!((at(&p, "b").0 - (5.0 + 120.0 + 5.0 + 20.0)).abs() < 1.0, "{:?}", at(&p, "b"));
+        // no margin collapsing between an item and its container
+        let q = render_w("<div style='display:flex;margin-top:10px'><div style='margin-top:30px;height:5px;background:red'></div></div>", 300.0);
+        assert_eq!(rects(&q).into_iter().find(|r| r.4 == RED).unwrap().1, 40.0, "10 + 30, not max(10, 30)");
+        // the container's own background and padding surround the items
+        let c = render_w("<div style='display:flex;background:red;padding:7px'><div>a</div></div>", 300.0);
+        let bg = rects(&c).into_iter().find(|r| r.4 == RED).unwrap();
+        assert_eq!((bg.0, bg.2), (0.0, 300.0));
+        assert!(at(&c, "a").0 >= 7.0);
+    }
+
+    #[test]
+    fn inline_and_replaced_elements_can_be_flex_items() {
+        let p = flex("gap:10px", "<span>one</span><a href=u>two</a><button>Go</button><input name=q size=5>");
+        let (one, two) = (at(&p, "one"), at(&p, "two"));
+        assert!(two.0 > one.0 + 20.0 && two.1 == one.1, "{one:?} {two:?}");
+        assert_eq!(p.layout.links.len(), 1);
+        assert_eq!(p.layout.controls.len(), 2);
+        assert!(p.layout.controls[0].x > two.0, "the button follows the link");
+        // text directly inside the container, and whitespace between items, don't make items
+        let q = flex("", "stray text <div>a</div> <div>b</div>");
+        assert!(at(&q, "b").0 > at(&q, "a").0);
+        // an image item shows up
+        let dir = std::env::temp_dir().join(format!("mybrowser-flex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut png = vec![];
+        let mut enc = png::Encoder::new(&mut png, 20, 10);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&[255u8; 20 * 10 * 4]).unwrap();
+        std::fs::write(dir.join("a.png"), &png).unwrap();
+        let fonts = Fonts::load();
+        let mut page = Page::from_source(&Url::from_file_path(dir.join("t.html")).unwrap(), "<div style='display:flex'><img src=a.png><div>after</div></div>");
+        page.relayout(&fonts, 300.0);
+        let img = page.layout.items.iter().find_map(|i| match i { Item::Image { x, w, .. } => Some((*x, *w)), _ => None }).expect("the image is drawn");
+        assert_eq!(img.1, 20.0);
+        assert!(at(&page, "after").0 >= img.0 + 20.0 - 0.5);
+    }
+
+    #[test]
+    fn flex_containers_nest_and_size_inside_other_boxes() {
+        // a flex row inside a flex item
+        let p = flex("", "<div style='flex:1'><div style='display:flex'><div>x</div><div>y</div></div></div><div style='flex:1'>z</div>");
+        assert!(at(&p, "y").0 > at(&p, "x").0 && at(&p, "x").1 == at(&p, "y").1);
+        assert!((at(&p, "z").0 - 150.0).abs() < 0.5);
+        // a flex container as a table cell's content, and inside a list item
+        let t = render("<table><tr><td><div style='display:flex'><div>l</div><div>r</div></div></td></tr></table>");
+        assert!(at(&t, "r").0 > at(&t, "l").0 && at(&t, "r").1 == at(&t, "l").1);
+        let l = render("<ul><li><div style='display:flex'><div>l</div><div>r</div></div></li></ul>");
+        assert!(at(&l, "r").0 > at(&l, "l").0);
+        // a shrink-wrapped float-less container: a flex row inside a width-limited block
+        let n = render_w("<div style='width:100px'><div style='display:flex'><div style='flex:1'>a</div><div style='flex:1'>b</div></div></div>", 300.0);
+        assert!((at(&n, "b").0 - 50.0).abs() < 0.5, "{:?}", at(&n, "b"));
+    }
+
+    #[test]
+    fn hostile_flex_input_does_not_panic_or_explode() {
+        for style in [
+            "gap:99999px", "gap:-5px", "flex-wrap:wrap;gap:100000px", "justify-content:space-between;width:0", "width:1px",
+            "padding:1000px", "flex-direction:row;height:-10px", "align-items:center;justify-content:space-around",
+        ] {
+            let p = flex(style, "<div style='flex:99999999'>a</div><div style='flex:-3;width:-50px'>b</div><div style='flex-basis:1e9px'>c</div>");
+            assert!(p.layout.height.is_finite(), "{style}");
+            assert!(texts_full(&p).iter().all(|(_, x, b)| x.is_finite() && b.is_finite()), "{style}");
+        }
+        // many items stay fast, and the item cap holds
+        let many = "<div>x</div>".repeat(MAX_FLEX_ITEMS + 500);
+        let t = std::time::Instant::now();
+        let p = flex("flex-wrap:wrap", &many);
+        assert!(t.elapsed().as_secs() < 60, "{:?}", t.elapsed());
+        assert_eq!(texts(&p).len(), MAX_FLEX_ITEMS);
+        // an empty container and a container of only hidden items take no height
+        assert_eq!(flex("", "").layout.height, 0.0);
+        assert_eq!(flex("", "<div style='display:none'>x</div> <div hidden>y</div>").layout.height, 0.0);
+        // deep nesting of flex containers
+        let deep = format!("{}core{}", "<div style='display:flex'><div>".repeat(60), "</div></div>".repeat(60));
+        assert!(texts(&render(&deep)).iter().any(|(t, _)| t == "core"));
+    }
+
+    #[test]
+    fn flex_lines_are_sized_by_grow_shrink_and_justify() {
+        let item = |basis: f32, min: f32, grow: f32| FlexItem { id: 0, inline: None, min, basis, grow };
+        // leftover goes to growers by weight
+        let (a, b) = (item(50.0, 0.0, 1.0), item(50.0, 0.0, 3.0));
+        let l = flex_line_sizes(&[&a, &b], 300.0, 0.0, Justify::Start);
+        assert_eq!(l.widths, [100.0, 200.0]);
+        // gaps come off the top first
+        let l = flex_line_sizes(&[&a, &b], 300.0, 20.0, Justify::Start);
+        assert_eq!(l.widths, [95.0, 185.0]);
+        // shrinking stops at min-content
+        let (c, d) = (item(200.0, 150.0, 0.0), item(200.0, 190.0, 0.0));
+        let l = flex_line_sizes(&[&c, &d], 300.0, 0.0, Justify::Start);
+        assert!(l.widths[0] >= 150.0 && l.widths[1] >= 190.0 && (l.widths.iter().sum::<f32>() - 340.0).abs() < 0.01, "can't go below the minimums: {:?}", l.widths);
+        let (e, f) = (item(200.0, 0.0, 0.0), item(100.0, 0.0, 0.0));
+        let l = flex_line_sizes(&[&e, &f], 150.0, 0.0, Justify::Start);
+        assert!((l.widths[0] - 100.0).abs() < 0.01 && (l.widths[1] - 50.0).abs() < 0.01, "shrinks in proportion to basis: {:?}", l.widths);
+        // justify with leftover
+        let g = item(50.0, 0.0, 0.0);
+        let l = flex_line_sizes(&[&g, &g], 300.0, 0.0, Justify::SpaceBetween);
+        assert_eq!((l.offset, l.extra_gap), (0.0, 200.0));
+        let l = flex_line_sizes(&[&g, &g], 300.0, 0.0, Justify::Center);
+        assert_eq!((l.offset, l.extra_gap), (100.0, 0.0));
+        let l = flex_line_sizes(&[&g, &g], 300.0, 0.0, Justify::SpaceEvenly);
+        assert!((l.offset - 200.0 / 3.0).abs() < 0.01 && (l.extra_gap - 200.0 / 3.0).abs() < 0.01);
+        let l = flex_line_sizes(&[&g], 300.0, 0.0, Justify::SpaceAround);
+        assert_eq!((l.offset, l.extra_gap), (125.0, 250.0));
+        // no leftover, nothing to place; no items, no panic
+        let l = flex_line_sizes(&[&g, &g], 100.0, 0.0, Justify::Center);
+        assert_eq!(l.offset, 0.0);
+        let l = flex_line_sizes(&[], 100.0, 5.0, Justify::SpaceAround);
+        assert!(l.widths.is_empty());
     }
 
     // ---------------------------------------------------------------- anchors
@@ -2098,6 +2587,17 @@ mod tests {
         let p = render("<table border=1 width=100%><caption>c</caption><tr bgcolor=red><td>a</td><td rowspan=2>b</td></tr><tr><td>c</td></tr></table>");
         let (w, h) = (400usize, 200usize);
         Painter::default().paint(&mut vec![0; w * h], w, h, &p.layout, &fonts, 0.0, 2.0);
+    }
+
+    #[test]
+    fn pages_with_flex_rows_paint_without_panicking() {
+        use crate::paint::Painter;
+        let fonts = Fonts::load();
+        let p = flex("gap:8px;justify-content:space-between;align-items:center;background:#eee", "<div style='background:red;padding:4px'>a</div><div>b<br>c</div><span>d</span>");
+        let (w, h) = (300usize, 120usize);
+        for scale in [1.0, 2.0] {
+            Painter::default().paint(&mut vec![0; w * h], w, h, &p.layout, &fonts, 0.0, scale);
+        }
     }
 
     // ---------- regressions from the table review ----------

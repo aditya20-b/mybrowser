@@ -656,6 +656,7 @@ thead, tbody, tfoot { display: table-row-group }
 tr { display: table-row }
 td, th { display: table-cell; padding: 1px }
 li { display: list-item }
+summary { padding-left: 16px }
 body { margin: 8px }
 h1 { font-size: 2em; font-weight: bold; margin: 0.67em 0 }
 h2 { font-size: 1.5em; font-weight: bold; margin: 0.83em 0 }

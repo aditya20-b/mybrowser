@@ -657,6 +657,14 @@ impl Tab {
         if forms::is_disabled(&self.page.dom, id) {
             return Ok(());
         }
+        // a click on a <details> heading opens or closes it
+        {
+            let Page { dom, form, .. } = &mut self.page;
+            if form.toggle_details(dom, id) {
+                self.form_changed();
+                return Ok(());
+            }
+        }
         let kind = forms::kind_of(&self.page.dom, id);
         let mut result = Ok(());
         {
@@ -1484,6 +1492,25 @@ mod tests {
         tab.open(file("hop.html"));
         assert!(deliver(&mut tab, &rx));
         assert!(tab.is_loading());
+    }
+
+    #[test]
+    fn clicking_a_details_heading_opens_and_closes_it() {
+        let (notify, _rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        tab.page = Page::from_source(&Url::parse("file:///tmp/d.html").unwrap(), "<details><summary>Head</summary><p>inside</p></details>");
+        let fonts = crate::fonts::Fonts::load();
+        tab.page.relayout(&fonts, 400.0);
+        let has_inside = |t: &Tab| t.page.layout.items.iter().any(|i| matches!(i, crate::layout::Item::Text { text, .. } if text == "inside"));
+        assert!(!has_inside(&tab));
+        let summary = tab.page.layout.controls[0].node;
+        tab.activate_control(summary).unwrap();
+        assert!(!tab.is_loading());
+        tab.page.relayout(&fonts, 400.0);
+        assert!(has_inside(&tab));
+        tab.activate_control(summary).unwrap();
+        tab.page.relayout(&fonts, 400.0);
+        assert!(!has_inside(&tab));
     }
 
     #[test]

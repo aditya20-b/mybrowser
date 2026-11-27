@@ -96,6 +96,19 @@ pub fn layout_document(
     form: &FormState,
     width: f32,
 ) -> Layout {
+    // The content of a closed <details> isn't shown: lay it out as `display: none`.
+    let closed = forms::hidden_by_details(dom, form);
+    let collapsed_styles: Vec<Style>;
+    let styles = if closed.is_empty() {
+        styles
+    } else {
+        let mut copy = styles.to_vec();
+        for id in closed {
+            copy[id].display = Display::None;
+        }
+        collapsed_styles = copy;
+        &collapsed_styles[..]
+    };
     // Which inline elements contain block-level descendants? Children come
     // after their parents in the arena, so one backwards pass is enough.
     let mut has_block = vec![false; dom.nodes.len()];
@@ -850,6 +863,10 @@ impl<'a> Ctx<'a> {
                         self.layout_table(c, x, cursor, prev_mb, width, collapsed, id)
                     } else {
                         let mut marker = None;
+                        // a <details> heading gets a disclosure triangle in its left padding
+                        if let Some(details) = forms::summary_owner(self.dom, c) {
+                            marker = Some(if self.form.details_open(self.dom, details) { "▼" } else { "▶" }.to_string());
+                        }
                         if d == Display::ListItem {
                             counter += 1;
                             if !self.styles[id].list_none && !self.styles[c].list_none {
@@ -1066,6 +1083,19 @@ impl<'a> Ctx<'a> {
         };
         // Keep sizes finite and sane so later arithmetic can't blow up.
         (w.clamp(0.0, 20_000.0), h.clamp(0.0, 20_000.0))
+    }
+
+    /// The `<summary>` heading of a `<details>` that `node` sits in, if any: clicking its text
+    /// toggles the details (it reuses the click regions that labels use).
+    fn summary_of(&self, node: NodeId) -> Option<NodeId> {
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            if self.dom.tag(n) == Some("summary") {
+                return forms::summary_owner(self.dom, n).map(|_| n);
+            }
+            cur = self.dom.nodes[n].parent;
+        }
+        None
     }
 
     /// The control that the `<label>` around `node` (if any) is for.
@@ -1375,7 +1405,11 @@ impl<'a> Ctx<'a> {
                 sp = 0.0;
             }
             let href = self.href_of(node);
-            let label = if href.is_none() && control.is_none() && image_h.is_none() { self.label_of(node) } else { None };
+            let label = if href.is_none() && control.is_none() && image_h.is_none() {
+                self.label_of(node).or_else(|| self.summary_of(node))
+            } else {
+                None
+            };
             let line = lines.last_mut().unwrap();
             line.asc = line.asc.max(a);
             line.desc = line.desc.max(d);
@@ -2378,6 +2412,44 @@ mod tests {
         // no room: the margin is just zero
         let n = flex("", "<div style='width:400px'>a</div><div style='margin-left:auto'>b</div>");
         assert!(at(&n, "b").0 >= 400.0 - 0.5);
+    }
+
+    #[test]
+    fn a_closed_details_hides_its_content_and_its_heading_toggles_it() {
+        let fonts = Fonts::load();
+        let has = |p: &Page, w: &str| texts(p).iter().any(|(t, _)| t == w);
+        let mut p = render("<details><summary>Heading</summary><p>secret text</p>tail</details><p>after</p>");
+        assert!(has(&p, "Heading") && has(&p, "after") && !has(&p, "secret") && !has(&p, "tail"), "{:?}", texts(&p));
+        assert!(has(&p, "▶"), "a closed details shows a right-pointing triangle");
+        // clicking the heading text opens it
+        let (x, b) = at(&p, "Heading");
+        let summary = p.control_at(x + 2.0, b - 4.0).expect("the heading is clickable");
+        assert!(p.form.toggle_details(&p.dom, summary));
+        p.relayout(&fonts, 400.0);
+        assert!(has(&p, "secret") && has(&p, "tail") && has(&p, "▼") && !has(&p, "▶"), "{:?}", texts(&p));
+        assert!(at(&p, "after").1 > at(&p, "secret").1, "the content pushes what follows down");
+        // and again closes it
+        p.form.toggle_details(&p.dom, summary);
+        p.relayout(&fonts, 400.0);
+        assert!(!has(&p, "secret"));
+        // the open attribute starts it open; only the first summary is the heading
+        let open = render("<details open><summary>One</summary><summary>Two</summary><p>body</p></details>");
+        assert!(has(&open, "body") && has(&open, "One") && has(&open, "▼"));
+        assert_eq!(texts(&open).iter().filter(|(t, _)| t == "▼").count(), 1);
+        let shut = render("<details><summary>One</summary><summary>Two</summary></details>");
+        assert!(has(&shut, "One") && !has(&shut, "Two"), "a second summary is just hidden content");
+        // a summary outside details is a plain block, and a link inside a heading stays a link
+        let lone = render("<summary>Solo</summary>");
+        assert!(has(&lone, "Solo") && !has(&lone, "▶") && lone.layout.controls.is_empty());
+        let linked = render("<details><summary><a href=x>go</a> text</summary>hidden</details>");
+        assert_eq!(linked.layout.links.len(), 1);
+        let (lx, lb) = at(&linked, "text");
+        assert!(linked.control_at(lx + 2.0, lb - 4.0).is_some(), "the rest of the heading toggles");
+        assert!(linked.control_at(at(&linked, "go").0 + 2.0, lb - 4.0).is_none(), "the link text does not");
+        // nested details toggle independently, and anchors inside a closed one aren't targets
+        let nested = render("<details open><summary>outer</summary><details><summary>inner</summary><p id=deep>deep</p></details></details>");
+        assert!(has(&nested, "inner") && !has(&nested, "deep"));
+        assert_eq!(nested.layout.anchor_y("deep"), None);
     }
 
     #[test]

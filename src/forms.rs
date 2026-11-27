@@ -25,6 +25,30 @@ pub enum ControlKind {
     Hidden,
 }
 
+/// The `<details>` that `summary` is the heading of: its parent, if `summary` is that
+/// element's first `<summary>` child.
+pub fn summary_owner(dom: &Dom, summary: NodeId) -> Option<NodeId> {
+    if dom.tag(summary) != Some("summary") {
+        return None;
+    }
+    let details = dom.nodes[summary].parent.filter(|&p| dom.tag(p) == Some("details"))?;
+    let first = dom.nodes[details].children.iter().copied().find(|&c| dom.tag(c) == Some("summary"))?;
+    (first == summary).then_some(details)
+}
+
+/// Every node that a collapsed `<details>` hides: all of its children except its heading summary.
+pub fn hidden_by_details(dom: &Dom, state: &FormState) -> Vec<NodeId> {
+    let mut out = vec![];
+    for d in 0..dom.nodes.len() {
+        if dom.tag(d) != Some("details") || state.details_open(dom, d) {
+            continue;
+        }
+        let heading = dom.nodes[d].children.iter().copied().find(|&c| dom.tag(c) == Some("summary"));
+        out.extend(dom.nodes[d].children.iter().copied().filter(|&c| Some(c) != heading));
+    }
+    out
+}
+
 /// A keyboard step through a select's options.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SelectStep {
@@ -239,6 +263,8 @@ pub struct FormState {
     selected: HashMap<NodeId, usize>,
     /// Caret positions (character indexes) of text controls that have had one set.
     carets: HashMap<NodeId, usize>,
+    /// `<details>` elements the user has opened or closed (the `open` attribute is the default).
+    details: HashMap<NodeId, bool>,
     /// The control with keyboard focus.
     pub focus: Option<NodeId>,
 }
@@ -409,6 +435,20 @@ impl FormState {
         }
         let next = (self.selected_index(dom, id) + 1) % n;
         self.selected.insert(id, next);
+    }
+
+    /// Is this `<details>` showing its content?
+    pub fn details_open(&self, dom: &Dom, details: NodeId) -> bool {
+        self.details.get(&details).copied().unwrap_or_else(|| dom.attr(details, "open").is_some())
+    }
+
+    /// A click on a `<summary>`: open or close the `<details>` it heads (only the first
+    /// summary child of a details element is its heading). Returns whether it was one.
+    pub fn toggle_details(&mut self, dom: &Dom, summary: NodeId) -> bool {
+        let Some(details) = summary_owner(dom, summary) else { return false };
+        let open = self.details_open(dom, details);
+        self.details.insert(details, !open);
+        true
     }
 
     /// A reset button was pressed: every control of the form goes back to what the markup says.

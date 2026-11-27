@@ -208,6 +208,7 @@ pub fn toggle(dir: &Path, url: &Url, title: &str) -> Result<bool, String> {
 }
 
 /// Is `url` bookmarked?
+#[cfg(test)]
 pub fn contains(dir: &Path, url: &Url) -> bool {
     let url = stored(url);
     load(dir).iter().any(|b| b.url == url)

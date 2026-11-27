@@ -272,6 +272,8 @@ pub struct Tab {
     /// How many meta-refresh redirects led to the page on screen, and to the load in flight.
     /// What happened to the last file the tab was asked to download (shown once).
     notice: Option<String>,
+    /// Page zoom (1.0 = 100%): the page is laid out `zoom` times narrower and drawn `zoom` times bigger.
+    pub zoom: f32,
     /// How many history entries behind / ahead of the page on screen are fragment positions of
     /// this same document (Back and Forward between them need no load).
     frag_back: usize,
@@ -289,6 +291,9 @@ pub struct Tab {
 
 /// A chain of zero-delay meta refreshes is cut off after this many.
 const MAX_REFRESH_HOPS: u8 = 5;
+
+/// The zoom levels `Cmd+Plus` / `Cmd+Minus` step through.
+pub const ZOOM_STEPS: [f32; 12] = [0.5, 0.67, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
 
 /// A tab keeps this many recently left pages in memory for Back and Forward...
 const MAX_CACHED_PAGES: usize = 6;
@@ -337,6 +342,7 @@ impl Tab {
             page_cache: std::collections::VecDeque::new(),
             notice: None,
             on_download_page: false,
+            zoom: 1.0,
             frag_back: 0,
             frag_forward: 0,
             restored: false,
@@ -501,6 +507,23 @@ impl Tab {
             self.scroll = 0.0;
         }
         true
+    }
+
+    /// Zoom one step in (`1`) or out (`-1`) along `ZOOM_STEPS`, or back to 100% (`0`). Returns the
+    /// new zoom. The page is laid out again at the new width.
+    pub fn zoom_step(&mut self, direction: i32) -> f32 {
+        let at = ZOOM_STEPS
+            .iter()
+            .enumerate()
+            .min_by(|a, b| (a.1 - self.zoom).abs().total_cmp(&(b.1 - self.zoom).abs()))
+            .map_or(0, |(i, _)| i);
+        self.zoom = match direction {
+            0 => 1.0,
+            d if d > 0 => ZOOM_STEPS[(at + 1).min(ZOOM_STEPS.len() - 1)],
+            _ => ZOOM_STEPS[at.saturating_sub(1)],
+        };
+        self.laid_out_width = -1.0;
+        self.zoom
     }
 
     /// Mark a tab that was brought back from the closed-tabs list: whatever it loads first is
@@ -1670,6 +1693,34 @@ mod tests {
         tab.go_back();
         assert!(!tab.is_loading());
         assert_eq!(tab.page.form.value(&tab.page.dom, input), "1typed");
+    }
+
+    #[test]
+    fn zoom_steps_between_fixed_levels_and_forces_a_relayout() {
+        let (notify, _rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        assert_eq!(tab.zoom, 1.0);
+        tab.laid_out_width = 800.0;
+        assert_eq!(tab.zoom_step(1), 1.1);
+        assert_eq!(tab.laid_out_width, -1.0, "the page is laid out again");
+        assert_eq!(tab.zoom_step(1), 1.25);
+        assert_eq!(tab.zoom_step(-1), 1.1);
+        assert_eq!(tab.zoom_step(-1), 1.0);
+        assert_eq!(tab.zoom_step(-1), 0.9);
+        for _ in 0..30 {
+            tab.zoom_step(-1);
+        }
+        assert_eq!(tab.zoom, 0.5, "stops at the smallest");
+        for _ in 0..30 {
+            tab.zoom_step(1);
+        }
+        assert_eq!(tab.zoom, 3.0, "and at the biggest");
+        assert_eq!(tab.zoom_step(0), 1.0, "Cmd+0 goes back to 100%");
+        // an odd value (say from a future setting) snaps to the nearest level first
+        tab.zoom = 1.3;
+        assert_eq!(tab.zoom_step(1), 1.5);
+        // every level is distinct and ascending
+        assert!(ZOOM_STEPS.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]

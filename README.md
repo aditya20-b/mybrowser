@@ -33,6 +33,7 @@ The window has a tab strip, a toolbar with back, forward and reload buttons, and
 | `Cmd+click` a link | Open it in a new tab |
 | `Cmd+F` | Find in page: type to search, `Enter` / `Shift+Enter` (or `Cmd+G` / `Cmd+Shift+G`) for the next / previous match, `Esc` to close |
 | `Cmd+L` (or `Ctrl+L`) | Focus the address bar and select it |
+| `Cmd++`, `Cmd+-`, `Cmd+0` | Zoom the page in or out (50% to 300%, per tab; the toolbar and tabs keep their size) and back to 100% |
 | `Cmd+D`, `Cmd+Shift+B` | Bookmark the page (again to remove its bookmark), open the bookmarks list (`about:bookmarks`) |
 | `Enter` / `Esc` | Go to the typed address / cancel editing, or cancel a load in progress |
 | `Cmd+V`, `Cmd+C`, `Cmd+A` | Paste, copy and select all in the address bar (macOS); `Cmd+V` and `Cmd+C` also paste into and copy from a focused text field on a page (never from a password field), and `Cmd+←` / `Cmd+→` jump to the start or end of the text there |

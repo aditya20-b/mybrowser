@@ -147,9 +147,13 @@ impl Painter {
     /// tinted yellow (the selected one orange), and a small search box at the top
     /// right showing the query and "n of m". `scroll` is the page's scroll offset.
     #[allow(clippy::too_many_arguments)]
-    pub fn paint_find(&mut self, buf: &mut [u32], w: usize, h: usize, fonts: &Fonts, scale: f32, scroll: f32, find: &Find) {
+    /// `zoom` is the page zoom: match highlights follow the page, the search box stays its size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_find(&mut self, buf: &mut [u32], w: usize, h: usize, fonts: &Fonts, scale: f32, zoom: f32, scroll: f32, find: &Find) {
         let scale = sane_scale(scale);
+        let zoom = sane_scale(zoom);
         let px = |v: f32| (v * scale).round() as i32;
+        let page_px = |v: f32| (v * scale * zoom).round() as i32;
         let line = scale.round().max(1.0) as i32;
         let face = Face { family: Family::Sans, bold: false, italic: false };
 
@@ -157,12 +161,12 @@ impl Painter {
         let current = find.current_index();
         for (i, m) in find.matches().iter().enumerate() {
             let (top, bottom) = (m.baseline - m.size * 0.85 - scroll, m.baseline + m.size * 0.25 - scroll);
-            if bottom < 0.0 || top * scale > h as f32 {
+            if bottom < 0.0 || top * scale * zoom > h as f32 {
                 continue;
             }
-            let (x0, x1) = (px(m.x), px(m.x + m.w));
+            let (x0, x1) = (page_px(m.x), page_px(m.x + m.w));
             let (color, alpha) = if current == Some(i) { (FIND_CURRENT, 150) } else { (FIND_MATCH, 110) };
-            tint_rect(buf, w, h, x0, px(top), x1.max(x0.saturating_add(1)), px(bottom), color, alpha);
+            tint_rect(buf, w, h, x0, page_px(top), x1.max(x0.saturating_add(1)), page_px(bottom), color, alpha);
         }
 
         // the search box
@@ -567,7 +571,7 @@ mod tests {
         let mut painter = Painter::default();
         painter.paint(&mut plain, w, h, &page.layout, &fonts, 0.0, 1.0);
         let mut marked = plain.clone();
-        painter.paint_find(&mut marked, w, h, &fonts, 1.0, 0.0, &find);
+        painter.paint_find(&mut marked, w, h, &fonts, 1.0, 1.0, 0.0, &find);
         let m = find.matches().to_vec();
         assert_eq!(m.len(), 2);
         // a background pixel inside each match changes colour: yellowish for one, orange for the selected one
@@ -579,7 +583,7 @@ mod tests {
         // selecting the other one swaps them
         find.next();
         let mut swapped = plain.clone();
-        painter.paint_find(&mut swapped, w, h, &fonts, 1.0, 0.0, &find);
+        painter.paint_find(&mut swapped, w, h, &fonts, 1.0, 1.0, 0.0, &find);
         assert_eq!((swapped[probe(&m[0])], swapped[probe(&m[1])]), (second, first));
         // text between the matches is untouched
         let gap = (m[0].baseline as usize - 3) * w + (m[0].x + m[0].w + 3.0) as usize;
@@ -606,7 +610,7 @@ mod tests {
                 for scale in [0.0, f32::NAN, 0.5, 1.0, 2.0] {
                     for scroll in [0.0, 100.0, 1e9, -50.0, f32::NAN] {
                         let mut buf = vec![0u32; w * h];
-                        Painter::default().paint_find(&mut buf, w, h, &fonts, scale, scroll, &find);
+                        Painter::default().paint_find(&mut buf, w, h, &fonts, scale, 1.0, scroll, &find);
                     }
                 }
             }

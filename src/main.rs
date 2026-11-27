@@ -265,8 +265,17 @@ impl App {
     }
 
     /// Height of the area the page is drawn in (the window minus the tab strip and toolbar).
+    /// (in page units: a zoomed-in page shows less of itself)
     fn view_height(&self) -> f32 {
-        (self.window_size().1 - TOP).max(0.0)
+        (self.window_size().1 - TOP).max(0.0) / self.tab().zoom
+    }
+
+    /// Cmd+Plus, Cmd+Minus, Cmd+0: zoom the page in this tab.
+    fn zoom_by(&mut self, direction: i32) {
+        let zoom = self.tab_mut().zoom_step(direction);
+        self.clamp_scroll();
+        self.bar.error = Some(format!("Zoom {}%", (zoom * 100.0).round()));
+        self.request_redraw();
     }
 
     fn request_redraw(&self) {
@@ -316,7 +325,8 @@ impl App {
             };
             (icon, None)
         } else {
-            let (px, py) = (cx, cy - TOP + self.tab().scroll);
+            let zoom = self.tab().zoom;
+            let (px, py) = (cx / zoom, (cy - TOP) / zoom + self.tab().scroll);
             let tab = self.tab();
             if let Some(id) = tab.page.control_at(px, py) {
                 // an I-beam over text fields, a hand over buttons, boxes and menus
@@ -825,7 +835,8 @@ impl App {
                 let url = if self.tab().is_loading() { self.bar.submit_text().to_string() } else { self.tab().address() };
                 self.bar.show(&url);
             }
-            let (px, py) = (cx, cy - TOP + self.tab().scroll);
+            let zoom = self.tab().zoom;
+            let (px, py) = (cx / zoom, (cy - TOP) / zoom + self.tab().scroll);
             if let Some(id) = self.tab().page.control_at(px, py) {
                 // clicking a page field takes the keyboard from the find box
                 self.close_find();
@@ -970,6 +981,9 @@ impl App {
             Key::Character(c) if cmd => match c.as_str().to_ascii_lowercase().as_str() {
                 "l" => self.focus_address_bar(),
                 "d" => self.toggle_bookmark(),
+                "=" | "+" => self.zoom_by(1),
+                "-" => self.zoom_by(-1),
+                "0" => self.zoom_by(0),
                 "b" if self.modifiers.shift_key() => self.open(Url::parse("about:bookmarks").expect("a constant, valid URL")),
                 "r" => self.reload(),
                 "[" => self.go_back(),
@@ -1008,7 +1022,9 @@ impl App {
         let size = window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
         let scale = self.scale();
-        let logical_w = size.width as f32 / scale;
+        let zoom = self.tabs[self.active].zoom;
+        // the page is laid out `zoom` times narrower and drawn `zoom` times bigger; the toolbar and tabs keep their size
+        let logical_w = size.width as f32 / scale / zoom;
         let relaid = {
             let tab = &mut self.tabs[self.active];
             let needed = (logical_w - tab.laid_out_width).abs() > 0.5;
@@ -1044,9 +1060,9 @@ impl App {
         let pixels: &mut [u32] = &mut buffer;
         // The page goes in the rows below the chrome (with the find overlay on top of it);
         // then the toolbar, then the tab strip.
-        self.painter.paint(&mut pixels[top * w_px..], w_px, h_px - top, &tab.page.layout, &self.fonts, tab.scroll, scale);
+        self.painter.paint(&mut pixels[top * w_px..], w_px, h_px - top, &tab.page.layout, &self.fonts, tab.scroll, scale * zoom);
         if let Some(find) = &self.find {
-            self.painter.paint_find(&mut pixels[top * w_px..], w_px, h_px - top, &self.fonts, scale, tab.scroll, find);
+            self.painter.paint_find(&mut pixels[top * w_px..], w_px, h_px - top, &self.fonts, scale, zoom, tab.scroll, find);
         }
         let view = ChromeView {
             bar: &self.bar,

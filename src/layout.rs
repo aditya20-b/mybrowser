@@ -326,7 +326,8 @@ fn flex_line_sizes(items: &[&FlexItem], width: f32, gap: f32, justify: Justify) 
     let grow_sum: f32 = items.iter().map(|i| i.grow).sum();
     if free > 0.0 && grow_sum > 0.0 {
         for (w, it) in widths.iter_mut().zip(items) {
-            *w += free * it.grow / grow_sum;
+            // growth factors adding up to less than 1 only claim that fraction of the space
+            *w += free * grow_sum.min(1.0) * it.grow / grow_sum;
         }
     } else if free < 0.0 {
         let room: Vec<f32> = items.iter().map(|i| (i.basis - i.min).max(0.0)).collect();
@@ -469,7 +470,8 @@ impl<'a> Ctx<'a> {
         let border_w = content_w + extras;
         // Vertical margin collapsing: with no top padding/border, our top margin
         // merges with that of our first block child (recursively).
-        let top_open = pad[0] + bw[0] == 0.0;
+        // (a flex container's items never merge their top margin into it)
+        let top_open = pad[0] + bw[0] == 0.0 && s.display != Display::Flex;
         let own_mt = if top_open { self.collapsed_top(id, avail) } else { mt_raw };
         let top = if top_collapsed { cursor } else { cursor + collapse(prev_mb, own_mt) };
         self.blocks.push((id, top));
@@ -572,7 +574,9 @@ impl<'a> Ctx<'a> {
         for c in self.flex_children(id) {
             let Some((min, max, _)) = self.flex_item_widths(c) else { continue };
             let basis = match s_basis(&self.styles[c]) {
-                Some(b) => b + if self.styles[c].display == Display::Inline { 0.0 } else { self.box_extras(c) },
+                // a small or zero basis (`flex: 1`) still needs its content's room when the
+                // container is being sized from its contents, e.g. in a table cell
+                Some(b) => (b + if self.styles[c].display == Display::Inline { 0.0 } else { self.box_extras(c) }).max(max),
                 None => max,
             };
             min_sum += min;
@@ -1469,12 +1473,14 @@ impl<'a> Ctx<'a> {
             return self.table_widths(id);
         }
         let (mut min, mut max) = if s.is_flex_row() { self.flex_content_widths(id) } else { self.content_widths(id) };
-        if let Length::Px(w) = s.width {
-            min = w.max(0.0);
-            max = min;
-        }
         let px = |l: Length| resolve(l, 0.0).unwrap_or(0.0);
         let bw = s.borders();
+        if let Length::Px(w) = s.width {
+            // with border-box sizing the width already includes the padding and border
+            let inside = if s.border_box { px(s.padding[1]).max(0.0) + px(s.padding[3]).max(0.0) + bw[1] + bw[3] } else { 0.0 };
+            min = (w - inside).max(0.0);
+            max = min;
+        }
         let extras = px(s.padding[1]).max(0.0) + px(s.padding[3]).max(0.0) + bw[1] + bw[3]
             + px(s.margin[1]) + px(s.margin[3]);
         ((min + extras).max(0.0), (max + extras).max(0.0))
@@ -2272,6 +2278,23 @@ mod tests {
         // deep nesting of flex containers
         let deep = format!("{}core{}", "<div style='display:flex'><div>".repeat(60), "</div></div>".repeat(60));
         assert!(texts(&render(&deep)).iter().any(|(t, _)| t == "core"));
+    }
+
+    #[test]
+    fn flex_review_regressions() {
+        // a column container keeps its first child's top margin
+        let q = render_w("<div style='display:flex;flex-direction:column'><div style='margin-top:30px;height:5px;background:red'></div></div>", 300.0);
+        assert_eq!(rects(&q).into_iter().find(|r| r.4 == RED).unwrap().1, 30.0);
+        // border-box items aren't widened by their padding a second time
+        let p = flex("", "<div style='box-sizing:border-box;width:100px;padding:20px'>a</div><div>b</div>");
+        assert!((at(&p, "b").0 - 100.0).abs() < 0.5, "{:?}", at(&p, "b"));
+        // fractional grow factors only claim that fraction of the leftover space
+        let p = flex("", "<div style='flex-grow:0.25'>a</div><div>b</div>");
+        let wa = Fonts::load().measure(ctl_face(), 16.0, "a");
+        assert!((at(&p, "b").0 - (wa + (300.0 - wa - Fonts::load().measure(ctl_face(), 16.0, "b")) * 0.25)).abs() < 1.0, "{:?}", at(&p, "b"));
+        // a flex container sized from its contents (a table cell) keeps room for `flex: 1` items
+        let t = render_w("<table><tr><td><div style='display:flex'><div style='flex:1'>alpha beta</div><div style='flex:1'>gamma delta</div></div></td></tr></table>", 600.0);
+        assert_eq!(at(&t, "alpha").1, at(&t, "beta").1, "no wrapping in a 600px page");
     }
 
     #[test]

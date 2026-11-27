@@ -19,8 +19,14 @@ const MAX_STEPS: u64 = 20_000_000;
 /// Nested JavaScript calls.
 const MAX_CALL_DEPTH: usize = 48;
 /// The longest string, and the most elements an array can be extended to.
-const MAX_STRING: usize = 8 * 1024 * 1024;
-const MAX_ARRAY: usize = 4_000_000;
+const MAX_STRING: usize = 4 * 1024 * 1024;
+const MAX_ARRAY: usize = 1_000_000;
+/// Nested evaluations (expressions inside expressions inside calls...) at once: the Rust stack
+/// use of the interpreter is proportional to this, not to what the parser allowed.
+const MAX_NEST: usize = 3000;
+/// Objects (including arrays and functions) a script may create, and the bytes it may ask for.
+const MAX_OBJECTS: usize = 250_000;
+const MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 pub type ObjRef = Rc<RefCell<Object>>;
 type ScopeRef = Rc<RefCell<Scope>>;
@@ -90,10 +96,23 @@ pub struct Interp {
     global: ScopeRef,
     object_proto: ObjRef,
     error_proto: ObjRef,
+    /// `Array.prototype`: an (empty) array, so the array methods are found through it too.
+    array_proto: ObjRef,
+    object_ctor: Value,
+    array_ctor: Value,
     steps: u64,
     depth: usize,
+    /// How deeply `eval` / `exec` / native conversions are nested (bounds the Rust stack).
+    nest: usize,
+    /// Objects made so far (bounds nesting depth, and so the recursion when they are dropped).
+    objects: usize,
+    /// A rough count of the bytes of memory the script has asked for (strings and arrays).
+    bytes: u64,
+    /// Arrays being joined right now (a cycle joins as an empty string).
+    joining: Vec<ObjRef>,
     /// What the script wrote with `console.log` and friends.
     pub console: Vec<String>,
+    console_bytes: usize,
     rng: u64,
 }
 
@@ -198,9 +217,56 @@ impl Interp {
     pub fn new() -> Interp {
         let object_proto = Rc::new(RefCell::new(Object { kind: Kind::Plain, props: HashMap::new(), order: vec![], proto: None }));
         let error_proto = Rc::new(RefCell::new(Object { kind: Kind::Plain, props: HashMap::new(), order: vec![], proto: Some(object_proto.clone()) }));
-        let mut interp = Interp { global: new_scope(None), object_proto, error_proto, steps: 0, depth: 0, console: vec![], rng: 0x2545F4914F6CDD1D };
+        let array_proto = Rc::new(RefCell::new(Object { kind: Kind::Array(vec![]), props: HashMap::new(), order: vec![], proto: Some(object_proto.clone()) }));
+        let mut interp = Interp {
+            global: new_scope(None),
+            object_proto,
+            error_proto,
+            array_proto,
+            object_ctor: Value::Undefined,
+            array_ctor: Value::Undefined,
+            steps: 0,
+            depth: 0,
+            nest: 0,
+            objects: 0,
+            bytes: 0,
+            joining: vec![],
+            console: vec![],
+            console_bytes: 0,
+            rng: 0x2545F4914F6CDD1D,
+        };
         interp.install_globals();
         interp
+    }
+
+    /// Count `n` bytes against the script's memory budget.
+    fn spend_bytes(&mut self, n: usize) -> Result<(), Ctrl> {
+        self.bytes += n as u64;
+        if self.bytes > MAX_BYTES {
+            Err(Ctrl::Abort("script used too much memory and was stopped".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Charge for work a native function does on a big value (cloning an array, scanning a string).
+    fn charge(&mut self, units: usize) -> Result<(), Ctrl> {
+        self.steps += (units / 16) as u64;
+        if self.steps > MAX_STEPS {
+            Err(Ctrl::Abort("script ran for too long and was stopped".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Enter a level of recursion that uses the Rust stack.
+    fn descend(&mut self) -> Result<(), Ctrl> {
+        self.nest += 1;
+        if self.nest > MAX_NEST {
+            self.nest -= 1;
+            return Err(Ctrl::Abort("script nested too deeply and was stopped".into()));
+        }
+        Ok(())
     }
 
     /// Run a whole script. An uncaught exception or a stopped script is an `Err` with a message.
@@ -236,27 +302,40 @@ impl Interp {
     fn tick(&mut self) -> Result<(), Ctrl> {
         self.steps += 1;
         if self.steps > MAX_STEPS {
-            Err(Ctrl::Abort("script ran for too long and was stopped".into()))
-        } else {
-            Ok(())
+            return Err(Ctrl::Abort("script ran for too long and was stopped".into()));
         }
+        if self.objects > MAX_OBJECTS {
+            return Err(Ctrl::Abort("script made too many objects and was stopped".into()));
+        }
+        if self.bytes > MAX_BYTES {
+            return Err(Ctrl::Abort("script used too much memory and was stopped".into()));
+        }
+        Ok(())
     }
 
     // ---- creating values
 
-    fn new_object(&self) -> ObjRef {
+    // (every object made is counted: the limits are checked at the next evaluation step)
+    fn new_object(&mut self) -> ObjRef {
+        self.objects += 1;
+        self.bytes += 96;
         Rc::new(RefCell::new(Object { kind: Kind::Plain, props: HashMap::new(), order: vec![], proto: Some(self.object_proto.clone()) }))
     }
 
-    fn new_array(&self, items: Vec<Value>) -> Value {
-        Value::Obj(Rc::new(RefCell::new(Object { kind: Kind::Array(items), props: HashMap::new(), order: vec![], proto: Some(self.object_proto.clone()) })))
+    fn new_array(&mut self, items: Vec<Value>) -> Value {
+        self.objects += 1;
+        self.bytes += 96 + 16 * items.len() as u64;
+        Value::Obj(Rc::new(RefCell::new(Object { kind: Kind::Array(items), props: HashMap::new(), order: vec![], proto: Some(self.array_proto.clone()) })))
     }
 
-    fn native(&self, f: NativeFn) -> Value {
+    fn native(&mut self, f: NativeFn) -> Value {
+        self.objects += 1;
+        self.bytes += 96;
         Value::Obj(Rc::new(RefCell::new(Object { kind: Kind::Native(f), props: HashMap::new(), order: vec![], proto: Some(self.object_proto.clone()) })))
     }
 
     fn make_error(&mut self, name: &str, message: &str) -> Value {
+        self.objects += 1;
         let mut props = HashMap::new();
         props.insert("message".to_string(), str_value(message));
         props.insert("name".to_string(), str_value(name));
@@ -383,6 +462,8 @@ impl Interp {
     }
 
     fn make_closure(&mut self, func: &std::sync::Arc<Func>, scope: &ScopeRef, this: Option<Value>) -> Value {
+        self.objects += 1;
+        self.bytes += 160;
         Value::Obj(Rc::new(RefCell::new(Object {
             kind: Kind::Closure(Rc::new(Closure { func: func.clone(), scope: scope.clone(), this })),
             props: HashMap::new(),
@@ -423,6 +504,13 @@ impl Interp {
     }
 
     fn exec(&mut self, stmt: &Stmt, scope: &ScopeRef, this: &Value) -> Result<Value, Ctrl> {
+        self.descend()?;
+        let r = self.exec_inner(stmt, scope, this);
+        self.nest -= 1;
+        r
+    }
+
+    fn exec_inner(&mut self, stmt: &Stmt, scope: &ScopeRef, this: &Value) -> Result<Value, Ctrl> {
         self.tick()?;
         match stmt {
             Stmt::Empty | Stmt::Function(_) => Ok(Value::Undefined),
@@ -576,6 +664,7 @@ impl Interp {
         } else {
             self.own_keys(&subject).into_iter().map(|k| str_value(&k)).collect()
         };
+        self.charge(items.len() * 8)?;
         for item in items {
             let inner = new_scope(Some(scope.clone()));
             match kind {
@@ -701,6 +790,7 @@ impl Interp {
                             return Err(Ctrl::Abort("array too big".into()));
                         }
                         if i >= a.len() {
+                            self.bytes += 16 * (i + 1 - a.len()) as u64;
                             a.resize(i + 1, Value::Undefined);
                         }
                         a[i] = value;
@@ -708,8 +798,18 @@ impl Interp {
                     }
                     if name == "length" {
                         if let Value::Num(n) = value {
-                            if n >= 0.0 && (n as usize) <= MAX_ARRAY {
+                            if n > MAX_ARRAY as f64 {
+                                drop(b);
+                                return Err(Ctrl::Abort("array too big".into()));
+                            }
+                            if n >= 0.0 && n.fract() == 0.0 {
+                                if (n as usize) > a.len() {
+                                    self.bytes += 16 * (n as usize - a.len()) as u64;
+                                }
                                 a.resize(n as usize, Value::Undefined);
+                            } else {
+                                drop(b);
+                                return self.throw("RangeError", "Invalid array length");
                             }
                         }
                         return Ok(());
@@ -725,24 +825,32 @@ impl Interp {
 
     // ---- conversions needing the interpreter
 
-    fn to_primitive(&mut self, v: &Value) -> Res {
-        match v {
-            Value::Obj(o) => {
-                if matches!(o.borrow().kind, Kind::Array(_)) {
-                    let joined = array_join(self, v, &[])?;
-                    return Ok(joined);
-                }
-                let to_string = self.get_member(v, "toString")?;
-                if to_string.is_callable() {
-                    let r = self.call(&to_string, v, &[])?;
-                    if !matches!(r, Value::Obj(_)) {
-                        return Ok(r);
-                    }
-                }
-                Ok(str_value("[object Object]"))
+    /// An object as a primitive: `toString` first when a string is wanted, `valueOf` first
+    /// otherwise (arithmetic, `+`, comparison).
+    fn to_primitive(&mut self, v: &Value, string_hint: bool) -> Res {
+        let Value::Obj(o) = v else { return Ok(v.clone()) };
+        self.descend()?;
+        let r = self.to_primitive_inner(v, o, string_hint);
+        self.nest -= 1;
+        r
+    }
+
+    fn to_primitive_inner(&mut self, v: &Value, o: &ObjRef, string_hint: bool) -> Res {
+        let order: [&str; 2] = if string_hint { ["toString", "valueOf"] } else { ["valueOf", "toString"] };
+        for method in order {
+            // (an array's own toString is `join`; a plain object has no valueOf unless the script gave it one)
+            if method == "toString" && matches!(o.borrow().kind, Kind::Array(_)) && !o.borrow().props.contains_key("toString") {
+                return array_join(self, v, &[]);
             }
-            other => Ok(other.clone()),
+            let f = self.get_member(v, method)?;
+            if f.is_callable() {
+                let r = self.call(&f, v, &[])?;
+                if !matches!(r, Value::Obj(_)) {
+                    return Ok(r);
+                }
+            }
         }
+        Ok(str_value("[object Object]"))
     }
 
     pub fn to_string(&mut self, v: &Value) -> Result<String, Ctrl> {
@@ -753,7 +861,7 @@ impl Interp {
             Value::Num(n) => number_to_string(*n),
             Value::Str(s) => s.to_string(),
             Value::Obj(_) => {
-                let p = self.to_primitive(v)?;
+                let p = self.to_primitive(v, true)?;
                 self.to_string(&p)?
             }
         })
@@ -771,7 +879,7 @@ impl Interp {
             Value::Num(n) => *n,
             Value::Str(s) => string_to_number(s),
             Value::Obj(_) => {
-                let p = self.to_primitive(v)?;
+                let p = self.to_primitive(v, false)?;
                 self.to_number(&p)?
             }
         })
@@ -783,11 +891,11 @@ impl Interp {
             (Value::Undefined | Value::Null, _) | (_, Value::Undefined | Value::Null) => false,
             (Value::Obj(_), Value::Obj(_)) => strict_equals(a, b),
             (Value::Obj(_), _) => {
-                let p = self.to_primitive(a)?;
+                let p = self.to_primitive(a, false)?;
                 return self.loose_equals(&p, b);
             }
             (_, Value::Obj(_)) => {
-                let p = self.to_primitive(b)?;
+                let p = self.to_primitive(b, false)?;
                 return self.loose_equals(a, &p);
             }
             (Value::Str(x), Value::Str(y)) => x == y,
@@ -813,7 +921,21 @@ impl Interp {
         }
         self.depth += 1;
         let result = match target {
-            Target::Native(f) => f(self, this, args),
+            Target::Native(f) => {
+                // a method on a big array or string does work in proportion to its size
+                let size = match this {
+                    Value::Obj(t) => match &t.borrow().kind {
+                        Kind::Array(a) => a.len(),
+                        _ => 0,
+                    },
+                    Value::Str(s) => s.len(),
+                    _ => 0,
+                };
+                match self.charge(size) {
+                    Ok(()) => f(self, this, args),
+                    Err(e) => Err(e),
+                }
+            }
             Target::Closure(c) => self.call_closure(&c, this, args),
         };
         self.depth -= 1;
@@ -861,6 +983,13 @@ impl Interp {
     // ---- expressions
 
     fn eval(&mut self, e: &Expr, scope: &ScopeRef, this: &Value) -> Res {
+        self.descend()?;
+        let r = self.eval_inner(e, scope, this);
+        self.nest -= 1;
+        r
+    }
+
+    fn eval_inner(&mut self, e: &Expr, scope: &ScopeRef, this: &Value) -> Res {
         self.tick()?;
         match e {
             Expr::Num(n) => Ok(Value::Num(*n)),
@@ -1039,6 +1168,7 @@ impl Interp {
         if let Value::Obj(o) = target {
             let mut b = o.borrow_mut();
             if b.props.remove(name).is_some() {
+                self.steps += (b.order.len() / 16) as u64; // (finding the key in the order list is a scan)
                 b.order.retain(|k| k != name);
             }
             if let (Kind::Array(a), Ok(i)) = (&mut b.kind, name.parse::<usize>()) {
@@ -1096,13 +1226,14 @@ impl Interp {
     fn binary(&mut self, op: &str, a: &Value, b: &Value) -> Res {
         Ok(match op {
             "+" => {
-                let (pa, pb) = (self.to_primitive(a)?, self.to_primitive(b)?);
+                let (pa, pb) = (self.to_primitive(a, false)?, self.to_primitive(b, false)?);
                 if matches!(pa, Value::Str(_)) || matches!(pb, Value::Str(_)) {
                     let mut s = self.to_string(&pa)?;
                     s.push_str(&self.to_string(&pb)?);
                     if s.len() > MAX_STRING {
                         return Err(Ctrl::Abort("string too long".into()));
                     }
+                    self.spend_bytes(s.len())?;
                     str_value(&s)
                 } else {
                     Value::Num(self.to_number(&pa)? + self.to_number(&pb)?)
@@ -1123,7 +1254,7 @@ impl Interp {
             "===" => Value::Bool(strict_equals(a, b)),
             "!==" => Value::Bool(!strict_equals(a, b)),
             "<" | ">" | "<=" | ">=" => {
-                let (pa, pb) = (self.to_primitive(a)?, self.to_primitive(b)?);
+                let (pa, pb) = (self.to_primitive(a, false)?, self.to_primitive(b, false)?);
                 if let (Value::Str(x), Value::Str(y)) = (&pa, &pb) {
                     return Ok(Value::Bool(match op {
                         "<" => x < y,
@@ -1296,12 +1427,21 @@ impl Interp {
 // ------------------------------------------------------------------ built-in functions
 
 fn console_log(i: &mut Interp, _: &Value, args: &[Value]) -> Res {
-    let mut parts = vec![];
-    for a in args {
-        parts.push(i.inspect(a, 0));
+    let mut line = String::new();
+    for (k, a) in args.iter().enumerate() {
+        if k > 0 {
+            line.push(' ');
+        }
+        let part = i.inspect(a, 0);
+        // (what a script logs is bounded: each line, the number of lines, and the total)
+        line.extend(part.chars().take(10_000));
+        if line.len() > 20_000 {
+            break;
+        }
     }
-    if i.console.len() < 10_000 {
-        i.console.push(parts.join(" "));
+    if i.console.len() < 10_000 && i.console_bytes < 4 * 1024 * 1024 {
+        i.console_bytes += line.len();
+        i.console.push(line);
     }
     Ok(Value::Undefined)
 }
@@ -1310,7 +1450,8 @@ impl Interp {
     /// How `console.log` shows a value.
     fn inspect(&mut self, v: &Value, depth: usize) -> String {
         match v {
-            Value::Str(s) if depth > 0 => format!("'{s}'"),
+            Value::Str(s) if depth > 0 => format!("'{}'", s.chars().take(200).collect::<String>()),
+            Value::Str(s) => s.chars().take(10_000).collect(),
             Value::Obj(o) if depth < 3 => {
                 let kind_array = matches!(o.borrow().kind, Kind::Array(_));
                 if matches!(o.borrow().kind, Kind::Closure(_) | Kind::Native(_)) {
@@ -1472,6 +1613,10 @@ fn json_stringify(i: &mut Interp, _: &Value, a: &[Value]) -> Res {
         if depth > 20 {
             return Err(Ctrl::Abort("JSON.stringify: too deeply nested (or circular)".into()));
         }
+        if out.len() > MAX_STRING {
+            return Err(Ctrl::Abort("string too long".into()));
+        }
+        i.charge(16)?;
         match v {
             Value::Undefined => return Ok(false),
             Value::Null => out.push_str("null"),
@@ -1588,19 +1733,107 @@ fn array_join(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
         Some(Value::Undefined) | None => ",".to_string(),
         Some(v) => i.to_string(v)?,
     };
+    // an array that contains itself (however deep) joins as nothing at the point of the cycle
+    if let Value::Obj(o) = this {
+        if i.joining.iter().any(|j| Rc::ptr_eq(j, o)) {
+            return Ok(str_value(""));
+        }
+        i.joining.push(o.clone());
+    }
+    let items = array_items(this);
+    i.charge(items.len())?;
     let mut out = String::new();
-    for (k, item) in array_items(this).iter().enumerate() {
+    let mut result = Ok(());
+    for (k, item) in items.iter().enumerate() {
         if k > 0 {
             out.push_str(&sep);
         }
         if !matches!(item, Value::Undefined | Value::Null) {
-            out.push_str(&i.to_string(item)?);
+            match i.to_string(item) {
+                Ok(s) => out.push_str(&s),
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
         }
         if out.len() > MAX_STRING {
-            return Err(Ctrl::Abort("string too long".into()));
+            result = Err(Ctrl::Abort("string too long".into()));
+            break;
         }
     }
+    if matches!(this, Value::Obj(_)) {
+        i.joining.pop();
+    }
+    result?;
+    i.spend_bytes(out.len())?;
     Ok(str_value(&out))
+}
+
+/// A possibly negative position (from a number argument) against a length: NaN is 0, negative
+/// counts from the end, and the result is never past the end.
+fn rel_len(n: f64, len: usize) -> usize {
+    let n = if n.is_nan() { 0.0 } else { n.trunc() };
+    if n < 0.0 { (len as f64 + n).max(0.0) as usize } else { n.min(len as f64) as usize }
+}
+
+fn array_items_len(v: &Value) -> usize {
+    match v {
+        Value::Obj(o) => match &o.borrow().kind {
+            Kind::Array(a) => a.len(),
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// Compare two elements for `sort`: the script's comparator, or by their text.
+fn sort_compare(i: &mut Interp, cmp: &Option<Value>, x: &Value, y: &Value) -> Result<f64, Ctrl> {
+    let n = match cmp {
+        Some(f) if f.is_callable() => {
+            let v = i.call(f, &Value::Undefined, &[x.clone(), y.clone()])?;
+            i.to_number(&v)?
+        }
+        _ => {
+            let (sx, sy) = (i.to_string(x)?, i.to_string(y)?);
+            if sx < sy { -1.0 } else if sx > sy { 1.0 } else { 0.0 }
+        }
+    };
+    Ok(if n.is_nan() { 0.0 } else { n })
+}
+
+/// A stable merge sort whose comparator may fail, and may be inconsistent (a shuffle written as
+/// `sort(() => Math.random() - 0.5)`): it always finishes, in whatever order. `undefined`s go last.
+fn sort_values(i: &mut Interp, items: Vec<Value>, cmp: Option<Value>) -> Result<Vec<Value>, Ctrl> {
+    let (mut src, undefs): (Vec<Value>, Vec<Value>) = items.into_iter().partition(|v| !matches!(v, Value::Undefined));
+    let n = src.len();
+    i.charge(n * 8)?;
+    let mut dst: Vec<Value> = Vec::with_capacity(n);
+    let mut width = 1;
+    while width < n {
+        dst.clear();
+        let mut start = 0;
+        while start < n {
+            let (mid, end) = ((start + width).min(n), (start + 2 * width).min(n));
+            let (mut l, mut r) = (start, mid);
+            while l < mid && r < end {
+                if sort_compare(i, &cmp, &src[r], &src[l])? < 0.0 {
+                    dst.push(src[r].clone());
+                    r += 1;
+                } else {
+                    dst.push(src[l].clone());
+                    l += 1;
+                }
+            }
+            dst.extend_from_slice(&src[l..mid]);
+            dst.extend_from_slice(&src[r..end]);
+            start = end;
+        }
+        std::mem::swap(&mut src, &mut dst);
+        width *= 2;
+    }
+    src.extend(undefs);
+    Ok(src)
 }
 
 /// Resolve a possibly negative index argument against a length.
@@ -1626,7 +1859,7 @@ fn array_method(name: &str) -> Option<NativeFn> {
             if n > MAX_ARRAY {
                 return Err(Ctrl::Abort("array too big".into()));
             }
-            let _ = i;
+            i.bytes += 16 * a.len() as u64;
             Ok(Value::Num(n as f64))
         },
         "pop" => |_, this, _| Ok(with_array(this, |v| v.pop()).flatten().unwrap_or(Value::Undefined)),
@@ -1646,13 +1879,30 @@ fn array_method(name: &str) -> Option<NativeFn> {
             Ok(i.new_array(if from < to { items[from..to].to_vec() } else { vec![] }))
         },
         "splice" => |i, this, a| {
-            let len = array_items(this).len();
-            let start = rel_index(i, a, 0, len, 0)?;
-            let count = match a.get(1) {
-                Some(v) => (i.to_number(v)?.max(0.0) as usize).min(len - start),
-                None => len - start,
+            // (converting the arguments can run script code that changes the array, so the
+            // lengths are worked out after that, inside the borrow)
+            let start_n = match a.first() {
+                Some(v) => Some(i.to_number(v)?),
+                None => None,
             };
-            let removed = with_array(this, |v| v.splice(start..start + count, a.iter().skip(2).cloned()).collect::<Vec<_>>()).unwrap_or_default();
+            let count_n = match a.get(1) {
+                Some(v) => Some(i.to_number(v)?),
+                None => None,
+            };
+            let removed = with_array(this, |v| {
+                let len = v.len();
+                let start = rel_len(start_n.unwrap_or(0.0), len);
+                let count = match count_n {
+                    Some(c) => (if c.is_nan() { 0.0 } else { c.trunc() }).clamp(0.0, (len - start) as f64) as usize,
+                    None if a.is_empty() => 0,
+                    None => len - start,
+                };
+                v.splice(start..start + count, a.iter().skip(2).cloned()).collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+            if array_items_len(this) > MAX_ARRAY {
+                return Err(Ctrl::Abort("array too big".into()));
+            }
             Ok(i.new_array(removed))
         },
         "concat" => |i, this, a| {
@@ -1724,31 +1974,7 @@ fn array_method(name: &str) -> Option<NativeFn> {
         },
         "sort" => |i, this, a| {
             let items = array_items(this);
-            let cmp = a.first().cloned();
-            // insertion-free merge via sort_by with a fallible comparator: errors are kept aside
-            let mut error: Option<Ctrl> = None;
-            let mut sorted = items;
-            sorted.sort_by(|x, y| {
-                if error.is_some() {
-                    return std::cmp::Ordering::Equal;
-                }
-                let r = match &cmp {
-                    Some(f) if f.is_callable() => i.call(f, &Value::Undefined, &[x.clone(), y.clone()]).and_then(|v| i.to_number(&v)),
-                    _ => i.to_string(x).and_then(|sx| i.to_string(y).map(|sy| if sx < sy { -1.0 } else if sx > sy { 1.0 } else { 0.0 })),
-                };
-                match r {
-                    Ok(n) if n < 0.0 => std::cmp::Ordering::Less,
-                    Ok(n) if n > 0.0 => std::cmp::Ordering::Greater,
-                    Ok(_) => std::cmp::Ordering::Equal,
-                    Err(e) => {
-                        error = Some(e);
-                        std::cmp::Ordering::Equal
-                    }
-                }
-            });
-            if let Some(e) = error {
-                return Err(e);
-            }
+            let sorted = sort_values(i, items, a.first().cloned())?;
             with_array(this, |v| *v = sorted);
             Ok(this.clone())
         },
@@ -1810,13 +2036,18 @@ fn string_method(name: &str) -> Option<NativeFn> {
             if !(0.0..=1e7).contains(&n) || (s.len() as f64) * n > MAX_STRING as f64 {
                 return i.throw("RangeError", "Invalid count value");
             }
+            i.spend_bytes(s.len() * n as usize)?;
             Ok(str_value(&s.repeat(n as usize)))
         },
         "concat" => |i, t, a| {
             let mut s = i.to_string(t)?;
             for v in a {
                 s.push_str(&i.to_string(v)?);
+                if s.len() > MAX_STRING {
+                    return Err(Ctrl::Abort("string too long".into()));
+                }
             }
+            i.spend_bytes(s.len())?;
             Ok(str_value(&s))
         },
         "toString" => |i, t, _| Ok(str_value(&i.to_string(t)?)),
@@ -1830,7 +2061,7 @@ mod tests {
 
     /// Run on a thread with a roomy stack (the interpreter recurses as deep as the script does).
     fn on_big_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
-        std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(f).unwrap().join().unwrap()
+        std::thread::Builder::new().stack_size(256 * 1024 * 1024).spawn(f).unwrap().join().unwrap()
     }
 
     /// Run a script and return what it logged, joined by newlines (or the error).
@@ -1941,6 +2172,47 @@ mod tests {
         assert_eq!(run("var o = {}; o.o = o; JSON.stringify(o)"), "ERR JSON.stringify: too deeply nested (or circular)");
         // an error in the script text is reported, not a crash
         assert!(run("var = ;").starts_with("ERR line 1"));
+    }
+
+    #[test]
+    fn crashes_found_in_review_are_stopped_cleanly() {
+        // cycles and deep nesting in conversions used to overflow the Rust stack
+        assert_eq!(run("var a=[]; a[0]=a; console.log(String(a) === '', a.join() === '', (a + '') === '')"), "true true true");
+        assert_eq!(run("var a=[1]; var b=[a]; a.push(b); console.log(String(b))"), "1,");
+        assert_eq!(run("var a=[1]; for (var i=0;i<20000;i++){a=[a]} console.log(String(a).length)"), "ERR script nested too deeply and was stopped");
+        // a million nested arrays: refused (too many objects), and dropping what exists is safe
+        assert_eq!(run("var a=[1]; for (var i=0;i<1000000;i++){a=[a]} console.log('built')"), "ERR script made too many objects and was stopped");
+        assert_eq!(run("var o={}; for (var i=0;i<1000000;i++){o={x:o}} console.log('built')"), "ERR script made too many objects and was stopped");
+        // deeply nested expressions with calls cannot use unbounded stack
+        let deep = format!("function f(n) {{ return {}n{} }} console.log(f(1))", "(".repeat(100) + &"1+".repeat(2900), ")".repeat(100));
+        let out = run(Box::leak(deep.into_boxed_str()));
+        assert!(out.starts_with("ERR") || out == "2901", "either runs or is refused, never a crash: {out}");
+        // the same shape inside a recursion that is as deep as a call may go: bounded by the nesting limit
+        let nest = format!("function f(n) {{ return n <= 0 ? 0 : {}f(n - 1){} }} console.log(f(40))", "1+(".repeat(200), ")".repeat(200));
+        let out = run(Box::leak(nest.into_boxed_str()));
+        assert!(out.starts_with("ERR"), "{out}");
+        // an inconsistent comparator (the usual shuffle) finishes
+        assert_eq!(run("var a=[]; for (var i=0;i<200;i++) a.push(i); a.sort(function(x,y){ return Math.random()-0.5 }); console.log(a.length)"), "200");
+        assert_eq!(run("console.log([3,1,2,undefined,10].sort().join(), [3,1,2].sort(function(a,b){return b-a}).join(), [5,1,4].sort(function(){ return NaN }).join())"), "1,10,2,3, 3,2,1 5,1,4");
+        // splice when converting an argument changes the array
+        assert_eq!(run("var a=[1,2,3,4,5,6]; a.splice(0, {toString:function(){ a.length=0; return '3' }}); console.log(a.length)"), "0");
+        assert_eq!(run("var a=[1,2,3]; a.splice({toString:function(){ a.length=0; return '1' }}, 1); console.log(a.length)"), "0");
+    }
+
+    #[test]
+    fn limits_catch_slow_and_hungry_scripts() {
+        // natives are charged for the size of what they work on
+        assert_eq!(run("var a=[]; for (var i=0;i<300000;i++) a.push(i); for (var i=0;i<100000;i++) a.unshift(i)"), "ERR script ran for too long and was stopped");
+        assert_eq!(run("var o={}; for (var i=0;i<200000;i++){ o['k'+i]=i } for (var i=0;i<200000;i++){ delete o['k'+i] }"), "ERR script ran for too long and was stopped");
+        assert_eq!(run("var s='x'; for (var i=0;i<27;i++) s=s.concat(s); console.log(s.length)"), "ERR string too long");
+        assert_eq!(run("var keep=[]; for (var i=0;i<1000;i++){ var a=[]; a.length=900000; keep.push(a) } console.log('done')"), "ERR script used too much memory and was stopped");
+        assert_eq!(run("var a=[]; a.length=4e6"), "ERR array too big");
+        assert_eq!(run("var a=[]; a.length=-1"), "ERR Uncaught RangeError: Invalid array length");
+        // what a script prints is bounded
+        let out = run("console.log('y'.repeat(3000000)); console.log([ 'z'.repeat(1000000), 'w'.repeat(1000000) ])");
+        assert!(out.len() < 40_000, "{}", out.len());
+        // a normal amount of work is fine
+        assert_eq!(run("var a=[]; for (var i=0;i<20000;i++) a.push(i); var s=0; a.forEach(function(x){ s+=x }); var o={}; for (var i=0;i<5000;i++) o['k'+i]=i; for (var k in o) delete o[k]; console.log(s, a.slice(0,3).join(), a.indexOf(19999))"), "199990000 0,1,2 19999");
     }
 
     #[test]

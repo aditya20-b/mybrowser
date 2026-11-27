@@ -75,10 +75,24 @@ pub struct Anchor {
     pub y: f32,
 }
 
+/// The border box of a block-level element, so a click can be traced to the element under it.
+pub struct BoxRegion {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub node: NodeId,
+}
+
+/// Most boxes recorded (a page with more still lays out; its far-away boxes just can't be clicked).
+const MAX_BOXES: usize = 50_000;
+
 pub struct Layout {
     pub items: Vec<Item>,
     pub links: Vec<LinkRegion>,
     pub controls: Vec<ControlRegion>,
+    /// Block boxes, innermost first (children are recorded before their parents).
+    pub boxes: Vec<BoxRegion>,
     pub anchors: Vec<Anchor>,
     pub height: f32,
     pub canvas_bg: Option<Color>,
@@ -123,7 +137,7 @@ pub fn layout_document(
         });
     }
     let mut cx = Ctx {
-        dom, styles, fonts, images, form, has_block, items: vec![], links: vec![], controls: vec![], blocks: vec![],
+        dom, styles, fonts, images, form, has_block, items: vec![], links: vec![], controls: vec![], boxes: vec![], blocks: vec![],
         forced_outer: None, label_cache: HashMap::new(), id_map: None,
     };
     let (bottom, mb) = cx.layout_block(0, 0.0, 0.0, 0.0, width, None, false);
@@ -132,7 +146,7 @@ pub fn layout_document(
     let body = dom.nodes[0].children.iter().copied().find(|&c| dom.tag(c) == Some("body"));
     let canvas_bg = styles[0].background.or(body.and_then(|b| styles[b].background));
     let anchors = collect_anchors(dom, styles, &cx.blocks);
-    Layout { items: cx.items, links: cx.links, controls: cx.controls, anchors, height: bottom + mb, canvas_bg }
+    Layout { items: cx.items, links: cx.links, controls: cx.controls, boxes: cx.boxes, anchors, height: bottom + mb, canvas_bg }
 }
 
 /// Every element with an `id` (or an `<a name>`), with the y of its box, or of the
@@ -192,6 +206,7 @@ struct Ctx<'a> {
     items: Vec<Item>,
     links: Vec<LinkRegion>,
     controls: Vec<ControlRegion>,
+    boxes: Vec<BoxRegion>,
     /// (element, y of its top edge) for every box laid out, and for inline elements the
     /// y of the line or block they start in, in layout order. Table cells shift theirs
     /// along with their content.
@@ -275,6 +290,7 @@ struct CellOut {
     links: (usize, usize),
     controls: (usize, usize),
     blocks: (usize, usize),
+    boxes: (usize, usize),
 }
 
 struct Cell {
@@ -582,6 +598,9 @@ impl<'a> Ctx<'a> {
         if let Some(i) = summary_region {
             self.controls[i].h = bottom - top;
         }
+        if self.boxes.len() < MAX_BOXES {
+            self.boxes.push(BoxRegion { x: bx, y: top, w: border_w, h: bottom - top, node: id });
+        }
         self.emit_decor(s, bg_slot, bx, top, border_w, bottom, bw, None);
         (bottom, eff_mb)
     }
@@ -713,14 +732,14 @@ impl<'a> Ctx<'a> {
             let auto_unit = if auto_count > 0 && leftover > 0.0 { leftover / auto_count as f32 } else { 0.0 };
             let (offset, extra_gap) = if auto_unit > 0.0 { (0.0, 0.0) } else { (sizes.offset, sizes.extra_gap) };
             let mut cx = x + offset;
-            let mut placed: Vec<([(usize, usize); 4], f32)> = vec![];
+            let mut placed: Vec<([(usize, usize); 5], f32)> = vec![];
             let mut line_h = 0.0f32;
             for (it, &w) in members.iter().zip(&sizes.widths) {
                 let (auto_l, auto_r) = auto_sides(it);
                 if auto_l {
                     cx += auto_unit;
                 }
-                let before = (self.items.len(), self.links.len(), self.controls.len(), self.blocks.len());
+                let before = (self.items.len(), self.links.len(), self.controls.len(), self.blocks.len(), self.boxes.len());
                 let h = if let Some(v) = &it.inline {
                     self.layout_inline(v, cx, cy, w, Align::Left, id)
                 } else if styles[it.id].display == Display::Table {
@@ -730,8 +749,8 @@ impl<'a> Ctx<'a> {
                     let (bottom, mb) = self.layout_block(it.id, cx, cy, 0.0, w, None, false);
                     bottom + mb - cy
                 };
-                let after = (self.items.len(), self.links.len(), self.controls.len(), self.blocks.len());
-                placed.push(([(before.0, after.0), (before.1, after.1), (before.2, after.2), (before.3, after.3)], h));
+                let after = (self.items.len(), self.links.len(), self.controls.len(), self.blocks.len(), self.boxes.len());
+                placed.push(([(before.0, after.0), (before.1, after.1), (before.2, after.2), (before.3, after.3), (before.4, after.4)], h));
                 line_h = line_h.max(h);
                 cx += w + gap_c + extra_gap;
                 if auto_r {
@@ -746,7 +765,7 @@ impl<'a> Ctx<'a> {
                     AlignItems::End => line_h - h,
                 };
                 if dy > 0.0 {
-                    self.shift(ranges[0], ranges[1], ranges[2], ranges[3], dy);
+                    self.shift(ranges[0], ranges[1], ranges[2], ranges[3], ranges[4], dy);
                 }
             }
             end = cy + line_h;
@@ -813,7 +832,10 @@ impl<'a> Ctx<'a> {
     }
 
     /// Move a range of already-emitted content down by `dy`.
-    fn shift(&mut self, items: (usize, usize), links: (usize, usize), controls: (usize, usize), blocks: (usize, usize), dy: f32) {
+    fn shift(&mut self, items: (usize, usize), links: (usize, usize), controls: (usize, usize), blocks: (usize, usize), boxes: (usize, usize), dy: f32) {
+        for b in &mut self.boxes[boxes.0..boxes.1] {
+            b.y += dy;
+        }
         for it in &mut self.items[items.0..items.1] {
             match it {
                 Item::Rect { y, .. } | Item::Image { y, .. } => *y += dy,
@@ -1847,8 +1869,10 @@ impl<'a> Ctx<'a> {
         // when the content inside is later centred or bottom-aligned
         self.blocks.push((id, y));
         let blocks_start = self.blocks.len();
+        let boxes_start = self.boxes.len();
 
         let (end_y, last_mb) = self.layout_children(id, x + bw[3] + pad[3], y + bw[0] + pad[0], content_w, false);
+        let boxes = (boxes_start, self.boxes.len());
         let content = (content_start, self.items.len());
         let links = (links_start, self.links.len());
         let controls = (controls_start, self.controls.len());
@@ -1861,7 +1885,7 @@ impl<'a> Ctx<'a> {
             height = height.max(h + pad[0] + pad[2] + bw[0] + bw[2]);
         }
         let decor = self.emit_decor(s, bg_slot, x, y, outer_w, y + height, bw, color);
-        CellOut { height, decor, content, links, controls, blocks }
+        CellOut { height, decor, content, links, controls, blocks, boxes }
     }
 
     /// Vertically align a laid-out cell inside the box `[top, bottom]` and stretch
@@ -1874,7 +1898,7 @@ impl<'a> Ctx<'a> {
             VAlign::Bottom => free,
         };
         if dy != 0.0 {
-            self.shift(out.content, out.links, out.controls, out.blocks, dy);
+            self.shift(out.content, out.links, out.controls, out.blocks, out.boxes, dy);
         }
         self.stretch_decor(&out.decor, bottom);
     }

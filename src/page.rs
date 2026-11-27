@@ -539,8 +539,15 @@ impl Page {
             }
         }
 
-        let layout = Layout { items: vec![], links: vec![], controls: vec![], anchors: vec![], height: 0.0, canvas_bg: None };
+        let layout = Layout { items: vec![], links: vec![], controls: vec![], boxes: vec![], anchors: vec![], height: 0.0, canvas_bg: None };
         Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false, no_store: false, scripts, console, rules }
+    }
+
+    /// The innermost block element whose box contains layout position `(x, y)`: where a click
+    /// there starts for the page's scripts.
+    pub fn element_at(&self, x: f32, y: f32) -> Option<NodeId> {
+        // (children are recorded before their parents, so the first hit is the innermost)
+        self.layout.boxes.iter().find(|b| x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h).map(|b| b.node)
     }
 
     /// The `<body>` element, if the document has one.
@@ -937,6 +944,38 @@ mod tests {
         let p = Page::from_source(&Url::parse("data:text/html,x").unwrap(), &src);
         assert!(p.scripts.is_none() && !p.console.contains(&"ran".to_string()), "{:?}", p.console);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_click_on_a_plain_block_starts_at_that_block_and_bubbles() {
+        let fonts = Fonts::load();
+        let src = "<style>body{margin:0} div{margin:0;padding:0} #a{height:50px} #b{height:50px} table{border-collapse:collapse} td{padding:0;height:40px;vertical-align:bottom}</style>\
+            <body><div id=outer><div id=a>first</div><div id=b><p id=inner>second</p></div></div>\
+            <table><tr><td id=cell><div id=incell>x</div></td></tr></table>\
+            <script>
+              function log(e) { console.log(this.id + ' <- ' + e.target.id) }
+              ['outer', 'a', 'inner', 'cell'].forEach(function (id) { document.getElementById(id).addEventListener('click', log) });
+            </script></body>";
+        let mut p = Page::from_source(&Url::parse("file:///tmp/h.html").unwrap(), src);
+        p.relayout(&fonts, 400.0);
+        let at = |p: &Page, id: &str| {
+            let node = (0..p.dom.nodes.len()).find(|&n| p.dom.attr(n, "id") == Some(id)).unwrap();
+            let b = p.layout.boxes.iter().find(|b| b.node == node).unwrap();
+            (b.x + 1.0, b.y + 1.0)
+        };
+        let (x, y) = at(&p, "a");
+        assert_eq!(p.element_at(x, y), (0..p.dom.nodes.len()).find(|&n| p.dom.attr(n, "id") == Some("a")));
+        let target = p.element_at(x, y).unwrap();
+        p.run_event(target, "click");
+        let (x, y) = at(&p, "inner");
+        let target = p.element_at(x, y).unwrap();
+        p.run_event(target, "click");
+        // a table cell's content is where it was drawn (the cell is bottom-aligned, so it moved)
+        let (x, y) = at(&p, "incell");
+        let target = p.element_at(x, y).unwrap();
+        assert_eq!(p.dom.attr(target, "id"), Some("incell"));
+        p.run_event(target, "click");
+        assert_eq!(p.console, ["a <- a", "outer <- a", "inner <- inner", "outer <- inner", "cell <- incell"], "{:?}", p.console);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::fonts::{Face, Family, Fonts};
 use crate::forms::{self, ControlKind, FormState};
 use crate::images::Image;
 use crate::style::{Align, Display, Style, VAlign};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// A table never has more columns than this (cells beyond it are dropped), so
@@ -60,7 +60,7 @@ pub struct ControlRegion {
 
 /// Where a `#fragment` target is: an element's `id` (or an `<a name>`) and the y of
 /// the top of its box. Elements that don't have a box of their own (inline ones) resolve to
-/// the top of the line or block they sit in.
+/// the top of the line they start on, or of the block they sit in if they have no text.
 pub struct Anchor {
     pub name: String,
     pub y: f32,
@@ -577,7 +577,8 @@ impl<'a> Ctx<'a> {
                 d => {
                     self.flush_run(id, &mut run, x, &mut cursor, &mut prev_mb, width);
                     // inline elements wrapped around this block (`<a id=x><div>..</div></a>`) have
-                    // no box of their own: they start where this block does
+                    // no box of their own: they start where this block does (if text came first
+                    // inside them, that text recorded them already, and the first record wins)
                     let mut wrapper = self.dom.nodes[c].parent;
                     while let Some(w) = wrapper.filter(|&w| w != id) {
                         self.blocks.push((w, cursor + prev_mb));
@@ -642,18 +643,29 @@ impl<'a> Ctx<'a> {
         mt
     }
 
+    /// Does this element name a `#fragment` target (`id`, or `name` on an `<a>`)?
+    fn names_a_target(&self, n: NodeId) -> bool {
+        match &self.dom.nodes[n].kind {
+            Kind::Element { tag, attrs } => {
+                attrs.get("id").is_some_and(|v| !v.is_empty()) || (tag == "a" && attrs.get("name").is_some_and(|v| !v.is_empty()))
+            }
+            _ => false,
+        }
+    }
+
     /// Record the y of every element with an `id` (or an `<a name>`) inside the inline
-    /// run `run`, which is about to be laid out starting at `y`. Inline elements have no box
-    /// of their own, so this is what makes `<a name=x></a>` between two paragraphs point
-    /// at the gap between them rather than at the top of the parent.
+    /// run `run`, which was laid out starting at `y`. Inline elements have no box of
+    /// their own; the ones that have text were already recorded at the line they start on
+    /// (the first record wins), so this is for the empty ones: `<a name=x></a>` between two
+    /// paragraphs points at the gap between them rather than at the top of the parent.
     fn record_inline_anchors(&mut self, run: &[NodeId], y: f32) {
         let mut stack: Vec<NodeId> = run.iter().rev().copied().collect();
         while let Some(n) = stack.pop() {
             if self.styles[n].display == Display::None {
                 continue;
             }
-            if let Kind::Element { tag, attrs } = &self.dom.nodes[n].kind {
-                if attrs.get("id").is_some_and(|v| !v.is_empty()) || (tag == "a" && attrs.get("name").is_some_and(|v| !v.is_empty())) {
+            if let Kind::Element { .. } = &self.dom.nodes[n].kind {
+                if self.names_a_target(n) {
                     self.blocks.push((n, y));
                 }
                 stack.extend(self.dom.nodes[n].children.iter().rev().copied());
@@ -673,19 +685,21 @@ impl<'a> Ctx<'a> {
         if run.is_empty() {
             return;
         }
-        self.record_inline_anchors(run, *cursor + *prev_mb);
+        let nodes: Vec<NodeId> = std::mem::take(run);
+        let y0 = *cursor + *prev_mb;
         let mut items = vec![];
-        for &n in run.iter() {
+        for &n in &nodes {
             self.flatten(n, &mut items);
         }
-        run.clear();
         if items.iter().all(|i| matches!(i, Inl::Space(_))) {
+            self.record_inline_anchors(&nodes, y0);
             return; // only whitespace between blocks: no anonymous box
         }
         *cursor += *prev_mb;
         *prev_mb = 0.0;
         let align = self.styles[parent].align;
         *cursor += self.layout_inline(&items, x, *cursor, width, align, parent);
+        self.record_inline_anchors(&nodes, y0);
     }
 
     fn flatten(&self, id: NodeId, out: &mut Vec<Inl>) {
@@ -1064,6 +1078,9 @@ impl<'a> Ctx<'a> {
 
         // ---- emit
         let mut cy = y;
+        // elements with an `id` that already have a place, so each is recorded once, at the
+        // first line it has anything on
+        let mut recorded: HashSet<NodeId> = HashSet::new();
         for line in &lines {
             if !line.content {
                 continue;
@@ -1076,7 +1093,19 @@ impl<'a> Ctx<'a> {
                 Align::Right => (width - line_w).max(0.0),
             };
             let baseline = cy + line.asc;
+            let mut previous: Option<NodeId> = None;
             for (i, w) in line.words.iter().enumerate() {
+                // `#fragment` targets around this word start on this line, if not already seen
+                if previous != Some(w.node) {
+                    let mut cur = Some(w.node);
+                    while let Some(n) = cur.filter(|&n| n != parent) {
+                        if self.names_a_target(n) && recorded.insert(n) {
+                            self.blocks.push((n, cy));
+                        }
+                        cur = self.dom.nodes[n].parent;
+                    }
+                    previous = Some(w.node);
+                }
                 let s = &styles[w.node];
                 let face = s.face();
                 let ax = x + off + w.x;
@@ -1779,7 +1808,7 @@ mod tests {
         assert_eq!(y("sec"), Some(100.0), "a block's anchor is its top edge");
         let empty = y("empty").expect("an empty element is still a target");
         assert!(empty > 100.0, "below the heading: {empty}");
-        // inline elements resolve to the block that holds them
+        // inline elements on the same line resolve to the same place
         assert_eq!(y("old"), y("inl"));
         assert!(y("old").unwrap() >= empty);
         assert_eq!(y("nope"), None);
@@ -1788,6 +1817,32 @@ mod tests {
         let p = render("<h2 id=dup style='margin:0'>one</h2><p style='margin:0;height:50px'>x</p><h2 id=dup style='margin:0'>two</h2>");
         assert_eq!(p.layout.anchor_y("dup"), Some(0.0));
         assert_eq!(p.layout.anchors.iter().filter(|a| a.name == "dup").count(), 2);
+    }
+
+    #[test]
+    fn an_inline_anchor_in_a_long_paragraph_points_at_its_own_line() {
+        // `#cite_note` style targets live far down a paragraph, not at its top
+        let words = "word ".repeat(300);
+        let p = render_w(&format!("<p style='margin:0'><span id=first>start</span> {words}<span id=late>late</span> tail</p>"), 200.0);
+        let (first, late) = (p.layout.anchor_y("first").unwrap(), p.layout.anchor_y("late").unwrap());
+        assert_eq!(first, 0.0);
+        let late_text = at(&p, "late").1;
+        assert!(late > 200.0 && late < late_text && late_text - late < 40.0, "late={late} drawn at baseline {late_text}");
+        // a target inside a link or nested inline is found at the line of its first word too
+        let p = render_w(&format!("<p style='margin:0'>{words}<a href=x><b><i id=deep>deep</i></b></a></p>"), 200.0);
+        let deep = p.layout.anchor_y("deep").unwrap();
+        assert!(deep > 200.0 && at(&p, "deep").1 - deep < 40.0);
+        // one that wraps over several lines is where it starts
+        let p = render_w(&format!("<p style='margin:0'>pre <span id=wrap>{words}</span></p>"), 200.0);
+        assert_eq!(p.layout.anchor_y("wrap"), Some(0.0));
+    }
+
+    #[test]
+    fn an_inline_wrapper_with_text_before_its_block_starts_at_the_text() {
+        let p = render("<p style='margin:0;height:100px'>x</p><span id=s>lead text<div>blk</div></span>");
+        assert_eq!(p.layout.anchor_y("s"), Some(100.0));
+        let p = render("<p style='margin:0;height:100px'>x</p><a name=s>lead text<div>b</div>tail</a>");
+        assert_eq!(p.layout.anchor_y("s"), Some(100.0));
     }
 
     #[test]
@@ -1830,11 +1885,10 @@ mod tests {
         let p = render("<table style='border-spacing:0'><tr><td id=c1><b id=in1>short</b></td><td id=c2>1<br>2<br>3<br>4<br>5</td></tr></table>");
         let (c1, c2, in1) = (p.layout.anchor_y("c1").unwrap(), p.layout.anchor_y("c2").unwrap(), p.layout.anchor_y("in1").unwrap());
         assert_eq!(c1, c2, "both cells start at the top of the row");
-        // (an inline element inside the cell resolves to the block that holds it, which was shifted)
-        assert!(in1 >= c1);
+        assert!(in1 > c1 + 10.0, "the inline target moved down with its (centred) text: {in1} vs {c1}");
         let nested = render("<table style='border-spacing:0'><tr><td><div id=d>short</div></td><td>1<br>2<br>3<br>4<br>5</td></tr></table>");
         let d = nested.layout.anchor_y("d").unwrap();
-        assert!(d > nested.layout.anchor_y("d").unwrap() - 1.0 && d > 10.0, "a block in a centred cell was shifted down: {d}");
+        assert!(d > 10.0, "a block in a centred cell was shifted down: {d}");
         let top = render("<table style='border-spacing:0'><tr valign=top><td id=c1>short</td><td id=c2>1<br>2<br>3<br>4<br>5</td></tr></table>");
         assert_eq!(top.layout.anchor_y("c1"), top.layout.anchor_y("c2"));
         // a table and an element in a cell that is shifted by rowspan
@@ -1868,6 +1922,12 @@ mod tests {
         let inline: String = (0..5000).map(|i| format!("<a name=n{i}>x</a> ")).collect();
         let p = render(&format!("<p>{inline}</p>"));
         assert_eq!(p.layout.anchors.len(), 5000);
+        // and so is one id wrapped around a whole page of words
+        let words = "word ".repeat(20_000);
+        let t = std::time::Instant::now();
+        let p = render(&format!("<p><span id=all>{words}</span></p>"));
+        assert!(t.elapsed().as_secs() < 20, "{:?}", t.elapsed());
+        assert_eq!(p.layout.anchors.len(), 1);
     }
 
     // ---------------------------------------------------------------- tables

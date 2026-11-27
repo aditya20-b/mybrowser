@@ -45,10 +45,13 @@ fn fold(c: char) -> char {
 }
 
 /// Characters that are never drawn and have no width (zero-width spaces and joiners,
-/// soft hyphens, byte-order marks, variation selectors): what you can't see, you
-/// can't find, and they must not split a word you can.
+/// soft hyphens, byte-order marks, variation selectors, bidi controls, invisible math
+/// operators): what you can't see, you can't find, and they must not split a word you can.
 fn is_ignorable(c: char) -> bool {
-    matches!(c, '\u{ad}' | '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}' | '\u{fe00}'..='\u{fe0f}')
+    matches!(
+        c,
+        '\u{ad}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{feff}' | '\u{fe00}'..='\u{fe0f}'
+    )
 }
 
 impl Find {
@@ -130,6 +133,9 @@ struct Line {
     right: Vec<f32>,
     baseline: f32,
     size: f32,
+    /// Font size of the last word added (the space after it is in that font, or the
+    /// next word's, whichever is smaller).
+    last_size: f32,
 }
 
 /// Search one line for the (already folded) `needle`.
@@ -169,25 +175,30 @@ pub fn find_all(layout: &Layout, fonts: &Fonts, query: &str) -> Vec<Match> {
             continue;
         }
         let Item::Text { x, baseline, text, size, face, .. } = item else { continue };
-        if text.is_empty() {
+        // a word made only of invisible characters is nothing at all (not a gap)
+        if text.chars().all(is_ignorable) {
             continue;
         }
+        // the gap before a word is judged by the smaller of the two neighbouring font sizes, so
+        // a space in small print next to a huge word is still a space
+        let gap_unit = if line.last_size > 0.0 { size.min(line.last_size) } else { *size };
         // is this word the continuation of the line so far?
         let continues = !line.chars.is_empty()
             && (line.baseline - baseline).abs() < 0.5
             && *x >= *line.right.last().unwrap_or(&0.0) - 0.5
-            && *x - *line.right.last().unwrap_or(&0.0) < size * 2.0;
+            && *x - *line.right.last().unwrap_or(&0.0) < size.max(line.last_size) * 2.0;
         if !continues {
             flush(&mut line, &mut out);
             line.baseline = *baseline;
             line.size = *size;
-        } else if *x - *line.right.last().unwrap_or(&0.0) > size * 0.15 {
+        } else if *x - *line.right.last().unwrap_or(&0.0) > gap_unit * 0.15 {
             // a gap between the words: a space, spanning it
             let from = *line.right.last().unwrap_or(x);
             line.chars.push(' ');
             line.left.push(from);
             line.right.push(*x);
         }
+        line.last_size = *size;
         // one running pen position: every glyph's advance is added once (no kerning in this
         // engine), so a long word costs time in proportion to its length
         let mut pen = *x;
@@ -262,6 +273,17 @@ mod tests {
     }
 
     #[test]
+    fn a_space_in_small_print_next_to_a_huge_word_is_still_a_space() {
+        let (layout, fonts) = laid_out("<p><span style='font-size:12px'>fine print</span> <span style='font-size:60px'>Big</span></p>", 800.0);
+        assert_eq!(find_all(&layout, &fonts, "print big").len(), 1);
+        assert!(find_all(&layout, &fonts, "printbig").is_empty());
+        // and the other way round, as before
+        let (layout, fonts) = laid_out("<p><span style='font-size:60px'>Big</span> <span style='font-size:12px'>fine print</span></p>", 800.0);
+        assert_eq!(find_all(&layout, &fonts, "big fine").len(), 1);
+        assert!(find_all(&layout, &fonts, "bigfine").is_empty());
+    }
+
+    #[test]
     fn hidden_text_is_not_found_and_overlapping_matches_are_not_double_counted() {
         let (layout, fonts) = laid_out("<p>visible</p><p style='display:none'>secret secret</p><p>aaaa</p>", 600.0);
         assert!(find_all(&layout, &fonts, "secret").is_empty(), "display:none text isn't on screen");
@@ -311,6 +333,14 @@ mod tests {
         // and typing one into the query doesn't change what matches
         assert_eq!(find_all(&layout, &fonts, "a\u{200b}b").len(), 1);
         assert!(find_all(&layout, &fonts, "\u{200b}").is_empty(), "a query of nothing visible finds nothing");
+        // bidi controls and invisible operators are not drawn either
+        let (layout, fonts) = laid_out("<p>a&#x202E;b c&#x2061;d e&#x202A;f</p>", 600.0);
+        for q in ["ab", "cd", "ef"] {
+            assert_eq!(find_all(&layout, &fonts, q).len(), 1, "{q}");
+        }
+        // a lone zero-width space between words is not a second space
+        let (layout, fonts) = laid_out("<p>a &#x200B; b</p>", 600.0);
+        assert_eq!(find_all(&layout, &fonts, "a b").len(), 1);
     }
 
     #[test]

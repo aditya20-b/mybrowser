@@ -75,6 +75,8 @@ pub enum Kind {
     Bound(Box<(Value, Value, Vec<Value>)>),
     /// An element or text node of the page (see `dom_bindings`).
     Node(usize),
+    /// `element.style`: reads and writes the node's `style` attribute.
+    Style(usize),
     Error,
 }
 
@@ -1168,6 +1170,10 @@ impl Interp {
                         None => dom_bindings::node_get(self, id, name),
                     };
                 }
+                let style = if let Kind::Style(id) = o.borrow().kind { Some(id) } else { None };
+                if let Some(id) = style {
+                    return dom_bindings::style_get(self, id, name);
+                }
                 // own properties, then the prototype chain
                 let mut cur = Some(o.clone());
                 while let Some(obj) = cur {
@@ -1243,6 +1249,10 @@ impl Interp {
                 let node = if let Kind::Node(id) = o.borrow().kind { Some(id) } else { None };
                 if let Some(id) = node {
                     return dom_bindings::node_set(self, id, name, value);
+                }
+                let style = if let Kind::Style(id) = o.borrow().kind { Some(id) } else { None };
+                if let Some(id) = style {
+                    return dom_bindings::style_set(self, id, name, value);
                 }
                 let mut b = o.borrow_mut();
                 if let Kind::Array(a) = &mut b.kind {
@@ -3273,6 +3283,26 @@ mod tests {
         done.host.dispatch(&mut dom, dom_bindings::DOCUMENT, "click");
         let lines = done.host.take_console();
         assert!(lines.iter().any(|l| l.contains("too much memory")), "{lines:?} (load: {:?})", done.console);
+    }
+
+    #[test]
+    fn element_style_reads_and_writes_the_style_attribute() {
+        let (log, body) = page(
+            "<body><p id=a style='color: red; margin: 0'>x</p></body>",
+            &["var p = document.getElementById('a'); console.log(p.style.color, p.style.fontSize === '');
+               p.style.fontSize = '20px'; p.style.backgroundColor = 'blue'; p.style.color = '';
+               p.style.setProperty('margin-top', '3px'); console.log(p.style.getPropertyValue('font-size'), p.style.cssText);
+               p.style.display = 'none; color: green'; console.log(p.style.display === '');
+               console.log(p.style.removeProperty('margin'), p.getAttribute('style'));
+               p.style.cssText = 'top: 1px'; console.log(p.style.top, p.style.cssFloat === '')"],
+        );
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines[0], "red true", "{log}");
+        assert_eq!(lines[1], "20px margin: 0; font-size: 20px; background-color: blue; margin-top: 3px", "{log}");
+        assert_eq!(lines[2], "true", "an invalid value that would add a declaration is ignored");
+        assert_eq!(lines[3], "0 font-size: 20px; background-color: blue; margin-top: 3px", "{log}");
+        assert_eq!(lines[4], "1px true", "{log}");
+        assert!(body.contains("style=\"top: 1px\""), "{body}");
     }
 
     #[test]

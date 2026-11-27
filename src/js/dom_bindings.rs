@@ -61,6 +61,155 @@ fn this_node(i: &mut Interp, this: &Value) -> Result<NodeId, Ctrl> {
     i.throw("TypeError", "this is not an element")
 }
 
+// ------------------------------------------------------------------ element.style
+
+/// `fontSize` -> `font-size` (and `cssFloat` -> `float`); None for a name that isn't a property.
+fn css_name(js: &str) -> Option<String> {
+    if js.is_empty() || js.len() > 64 {
+        return None;
+    }
+    if js == "cssFloat" {
+        return Some("float".into());
+    }
+    let mut out = String::new();
+    for c in js.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('-');
+            out.push(c.to_ascii_lowercase());
+        } else if c.is_ascii_alphanumeric() || c == '-' {
+            out.push(c);
+        } else {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+fn camel_name(css: &str) -> String {
+    let mut out = String::new();
+    let mut up = false;
+    for c in css.chars() {
+        if c == '-' {
+            up = true;
+        } else if up {
+            out.push(c.to_ascii_uppercase());
+            up = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The `style` attribute as (property, value) pairs.
+fn style_decls(dom: &Dom, id: NodeId) -> Vec<(String, String)> {
+    dom.attr(id, "style")
+        .unwrap_or("")
+        .split(';')
+        .filter_map(|d| {
+            let (k, v) = d.split_once(':')?;
+            let (k, v) = (k.trim().to_ascii_lowercase(), v.trim().to_string());
+            (!k.is_empty() && !v.is_empty()).then_some((k, v))
+        })
+        .collect()
+}
+
+fn store_style(i: &mut Interp, id: NodeId, decls: Vec<(String, String)>) {
+    let text = decls.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("; ");
+    if let Some(d) = i.dom.as_mut() {
+        set_attr(d, id, "style", text);
+    }
+}
+
+/// Set (or, with an empty value, remove) one property. A value that would smuggle in another
+/// declaration or rule is ignored, as a browser ignores an invalid value.
+fn set_style_property(i: &mut Interp, id: NodeId, css: &str, value: &str) {
+    if value.contains([';', '{', '}']) || value.len() > 4096 {
+        return;
+    }
+    let Some(d) = i.dom.as_ref() else { return };
+    let mut decls = style_decls(d, id);
+    decls.retain(|(k, _)| k != css);
+    if !value.trim().is_empty() {
+        if decls.len() >= 200 {
+            return;
+        }
+        decls.push((css.to_string(), value.trim().to_string()));
+    }
+    store_style(i, id, decls);
+}
+
+fn this_style(i: &mut Interp, this: &Value) -> Result<NodeId, Ctrl> {
+    if let Value::Obj(o) = this {
+        if let Kind::Style(id) = o.borrow().kind {
+            return Ok(id);
+        }
+    }
+    i.throw("TypeError", "this is not a style object")
+}
+
+pub(super) fn style_get(i: &mut Interp, id: NodeId, name: &str) -> Res {
+    match name {
+        "setProperty" => return Ok(i.method(style_set_property, name)),
+        "getPropertyValue" => return Ok(i.method(style_get_property_value, name)),
+        "removeProperty" => return Ok(i.method(style_remove_property, name)),
+        _ => {}
+    }
+    let Some(dom) = dom_ref(i).filter(|d| id < d.nodes.len()) else { return Ok(Value::Undefined) };
+    if name == "cssText" {
+        return Ok(str_value(dom.attr(id, "style").unwrap_or("")));
+    }
+    let Some(css) = css_name(name) else { return Ok(Value::Undefined) };
+    let found = style_decls(dom, id).into_iter().rev().find(|(k, _)| *k == css).map(|(_, v)| v);
+    Ok(str_value(&found.unwrap_or_default()))
+}
+
+pub(super) fn style_set(i: &mut Interp, id: NodeId, name: &str, value: Value) -> Result<(), Ctrl> {
+    if i.dom.as_ref().is_none_or(|d| id >= d.nodes.len()) {
+        return Ok(());
+    }
+    let text = i.to_string(&value)?;
+    if name == "cssText" {
+        if text.len() > 8192 {
+            return Ok(());
+        }
+        if let Some(d) = i.dom.as_mut() {
+            set_attr(d, id, "style", text);
+        }
+        return Ok(());
+    }
+    if let Some(css) = css_name(name) {
+        set_style_property(i, id, &css, &text);
+    }
+    Ok(())
+}
+
+fn style_set_property(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
+    let id = this_style(i, this)?;
+    let (name, value) = (i.arg_string(a, 0)?, i.arg_string(a, 1)?);
+    if let Some(css) = css_name(&camel_name(&name)) {
+        set_style_property(i, id, &css, &value);
+    }
+    Ok(Value::Undefined)
+}
+
+fn style_get_property_value(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
+    let id = this_style(i, this)?;
+    let name = i.arg_string(a, 0)?.to_ascii_lowercase();
+    let found = dom_ref(i).filter(|d| id < d.nodes.len()).and_then(|d| style_decls(d, id).into_iter().rev().find(|(k, _)| *k == name));
+    Ok(str_value(&found.map(|(_, v)| v).unwrap_or_default()))
+}
+
+fn style_remove_property(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
+    let id = this_style(i, this)?;
+    let name = i.arg_string(a, 0)?.to_ascii_lowercase();
+    let old = style_get_property_value(i, this, a)?;
+    if let Some(css) = css_name(&camel_name(&name)) {
+        set_style_property(i, id, &css, "");
+    }
+    Ok(old)
+}
+
 fn node_arg(i: &mut Interp, a: &[Value], at: usize) -> Result<NodeId, Ctrl> {
     match a.get(at) {
         Some(Value::Obj(o)) => {
@@ -456,6 +605,11 @@ pub(super) fn node_get(i: &mut Interp, id: NodeId, name: &str) -> Res {
         }
         "checked" => Value::Bool(dom.attr(id, "checked").is_some()),
         "disabled" | "hidden" | "readOnly" | "required" => Value::Bool(dom.attr(id, &name.to_ascii_lowercase()).is_some()),
+        "style" if is_el => {
+            let o = i.new_object();
+            o.borrow_mut().kind = Kind::Style(id);
+            return Ok(Value::Obj(o));
+        }
         "classList" => {
             let list = i.new_object();
             Interp::set_prop(&list, "__node", Value::Num(id as f64));

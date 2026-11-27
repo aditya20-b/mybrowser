@@ -842,6 +842,20 @@ mod tests {
     }
 
     #[test]
+    fn styles_set_by_scripts_change_the_layout() {
+        let fonts = Fonts::load();
+        let mut p = Page::from_source(
+            &Url::parse("file:///tmp/s.html").unwrap(),
+            "<body><p id=a>hidden soon</p><p id=b>big soon</p><script>document.getElementById('a').style.display = 'none'; document.getElementById('b').style.fontSize = '33px'</script></body>",
+        );
+        p.relayout(&fonts, 400.0);
+        let w = words(&p);
+        assert!(!w.contains(&"hidden".to_string()) && w.contains(&"big".to_string()), "{w:?}");
+        let size = p.layout.items.iter().find_map(|i| match i { Item::Text { text, size, .. } if text == "big" => Some(*size), _ => None }).unwrap();
+        assert_eq!(size, 33.0);
+    }
+
+    #[test]
     fn script_edge_cases_from_review() {
         // the same script twice, and scripts that are inert in <noscript> / <template>
         let p = Page::from_source(

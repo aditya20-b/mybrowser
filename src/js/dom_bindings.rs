@@ -1122,6 +1122,7 @@ impl Interp {
     /// schedule, until none are left or a limit is reached. Intervals fire a few times, then stop.
     pub fn run_timers(&mut self) {
         self.run_jobs();
+        let clock_at_start = self.clock;
         let mut runs = 0;
         let mut all_timers_spent: u64 = 0;
         while runs < MAX_TIMER_RUNS {
@@ -1168,6 +1169,11 @@ impl Interp {
                     break;
                 }
                 Err(_) => {}
+            }
+            // a timer that was waiting for a while (a "redirecting in 5 seconds" page) doesn't send the
+            // page away at once: there is no real waiting here, so its navigation is dropped
+            if timer.due > clock_at_start {
+                let _ = self.pending_navigation();
             }
             // (promise callbacks go before the next timer; what they use counts towards the total)
             all_timers_spent += self.run_jobs();
@@ -1231,14 +1237,20 @@ impl Interp {
         Interp::set_prop(&location, "href", str_value(&self.page_url));
         // `location.assign(url)` and `.replace(url)` are the same as setting `href`: the browser
         // looks at `href` once the script has run (see `pending_navigation`)
-        for name in ["assign", "replace"] {
-            let f = self.native(|i, this, a| {
-                let target = i.arg_string(a, 0)?;
-                i.set_member(this, "href", str_value(&target))?;
-                Ok(Value::Undefined)
-            });
-            Interp::set_prop(&location, name, f);
-        }
+        let assign = self.native(|i, this, a| {
+            let target = i.arg_string(a, 0)?;
+            i.set_member(this, "href", str_value(&target))?;
+            Ok(Value::Undefined)
+        });
+        Interp::set_prop(&location, "assign", assign);
+        let replace = self.native(|i, this, a| {
+            let target = i.arg_string(a, 0)?;
+            i.set_member(this, "href", str_value(&target))?;
+            i.set_member(this, "__replace", Value::Bool(true))?;
+            Ok(Value::Undefined)
+        });
+        Interp::set_prop(&location, "replace", replace);
+        self.location_obj = Value::Obj(location.clone());
         let reload = self.native(|_, _, _| Ok(Value::Undefined));
         Interp::set_prop(&location, "reload", reload);
         Interp::set_prop(&window, "location", Value::Obj(location.clone()));
@@ -1254,16 +1266,42 @@ impl Interp {
 
     /// Where the scripts have asked the page to go (they set `location.href`, or called `assign`
     /// or `replace`), once: the address is put back, so the same request isn't seen twice.
-    pub(super) fn pending_navigation(&mut self) -> Option<String> {
+    /// The flag says it was `location.replace` (the page is replaced in the history, not added to it).
+    pub(super) fn pending_navigation(&mut self) -> Option<(String, bool)> {
+        let global = self.global.clone();
         let loc = self.lookup_global("location");
-        let Value::Str(href) = self.get_member(&loc, "href").ok()? else { return None };
-        if *href == *self.page_url || href.len() > 2000 || href.trim().is_empty() {
+        let window = self.lookup_global("window");
+        let own = self.location_obj.clone();
+        // `location = 'x'` replaces the global; `window.location = 'x'` sets a property of window
+        let target = if let Value::Str(s) = &loc {
+            Interp::declare(&global, "location", own.clone(), true);
+            s.to_string()
+        } else if let Ok(Value::Str(s)) = self.get_member(&window, "location") {
+            self.set_member(&window, "location", own.clone()).ok()?;
+            s.to_string()
+        } else {
+            let href = self.get_member(&loc, "href").ok()?;
+            let href = match href {
+                Value::Str(s) => s.to_string(),
+                v @ (Value::Num(_) | Value::Bool(_)) => self.to_string(&v).ok()?,
+                _ => return None,
+            };
+            if href == *self.page_url {
+                return None;
+            }
+            let back = str_value(&self.page_url.clone());
+            self.set_member(&loc, "href", back).ok()?;
+            href
+        };
+        let replace = matches!(self.get_member(&own, "__replace"), Ok(Value::Bool(true)));
+        if replace {
+            self.set_member(&own, "__replace", Value::Bool(false)).ok()?;
+        }
+        let target = target.trim();
+        if target.is_empty() || target.len() > 2000 || target == self.page_url {
             return None;
         }
-        let target = href.trim().to_string();
-        let back = str_value(&self.page_url.clone());
-        self.set_member(&loc, "href", back).ok()?;
-        Some(target)
+        Some((target.to_string(), replace))
     }
 
     fn lookup_global(&mut self, name: &str) -> Value {

@@ -60,7 +60,7 @@ pub struct Page {
     /// What the scripts logged, and why one failed to load or run.
     pub console: Vec<String>,
     /// Where the scripts asked to go (`location.href = ...`): the tab takes it from here.
-    pub nav_request: Option<String>,
+    pub nav_request: Option<(String, bool)>,
     /// The stylesheets, kept so styles can be recomputed after scripts change the page.
     rules: Vec<Rule>,
     /// Nodes below this index have had their `<style>` taken into `rules`.

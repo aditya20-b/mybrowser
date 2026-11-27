@@ -301,6 +301,8 @@ pub struct Interp {
     requests: u32,
     /// Time spent waiting for those requests.
     net_time: std::time::Duration,
+    /// The page's own `location` object (put back if a script replaces the global with a string).
+    location_obj: Value,
     /// Promises created so far.
     promises: u32,
     /// Promise callbacks waiting to run (microtasks), in order.
@@ -343,7 +345,7 @@ unsafe impl Send for ScriptHost {}
 
 impl ScriptHost {
     /// A navigation the scripts asked for (by `location.href = ...`), if any: a link to follow.
-    pub fn requested_navigation(&mut self) -> Option<String> {
+    pub fn requested_navigation(&mut self) -> Option<(String, bool)> {
         self.interp().pending_navigation()
     }
 
@@ -630,6 +632,7 @@ impl Interp {
             requests: 0,
             net_time: std::time::Duration::ZERO,
             promises: 0,
+            location_obj: Value::Undefined,
             jobs: std::collections::VecDeque::new(),
             joining: vec![],
             console: vec![],

@@ -474,7 +474,7 @@ impl Tab {
     /// (replacing the page in the history, a few hops at most, only to places a link could go).
     /// Returns whether a load began.
     fn follow_script_navigation(&mut self) -> bool {
-        let Some(href) = self.page.nav_request.take() else { return false };
+        let Some((href, _)) = self.page.nav_request.take() else { return false };
         if self.refresh_hops >= MAX_REFRESH_HOPS {
             return false;
         }
@@ -847,9 +847,21 @@ impl Tab {
         let prevented = self.page.run_event(node, "click");
         self.form_changed(); // (the scripts may have changed what is on the page)
         // a handler that set `location.href` sends the tab there, as a followed link would
-        if let Some(href) = self.page.nav_request.take() {
-            self.follow(&href);
-            return true;
+        // (the click is only taken from the link if the handler's address went somewhere)
+        if let Some((href, replace)) = self.page.nav_request.take() {
+            let went = if replace {
+                match self.classify(&href) {
+                    Link::Navigate(url) if url != self.page.url => {
+                        self.next_initiator = Some(self.page.url.clone());
+                        self.begin_load(url, Hist::Replace, None);
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                self.follow(&href)
+            };
+            return prevented || went;
         }
         prevented
     }
@@ -1697,6 +1709,37 @@ mod tests {
         assert!(deliver(&mut tab, &rx));
         assert!(!tab.is_loading());
         assert_eq!(tab.page.url, file("evil.html"));
+        // assigning to `location` itself, or to `window.location`, is the same as setting its href
+        std::fs::write(dir.join("global.html"), "<script>location = 'b.html'</script>").unwrap();
+        std::fs::write(dir.join("win.html"), "<script>window.location = 'b.html'</script>").unwrap();
+        std::fs::write(dir.join("later.html"), "<p>wait</p><script>setTimeout(function () { location.href = 'b.html' }, 5000)</script>").unwrap();
+        std::fs::write(dir.join("now.html"), "<p>now</p><script>setTimeout(function () { location.href = 'b.html' }, 0)</script>").unwrap();
+        for name in ["global.html", "win.html", "now.html"] {
+            tab.open(file(name));
+            assert!(deliver(&mut tab, &rx));
+            assert!(deliver(&mut tab, &rx), "{name} sends the tab on");
+            assert_eq!(tab.page.url, b, "{name}");
+        }
+        tab.open(file("later.html"));
+        assert!(deliver(&mut tab, &rx));
+        assert!(!tab.is_loading(), "a redirect that waits five seconds doesn't happen at once");
+        assert_eq!(tab.page.url, file("later.html"));
+        // replace() from a click replaces the page in the history; an address that goes nowhere doesn't swallow the click
+        std::fs::write(dir.join("rep.html"), "<p id=p>x</p><script>document.getElementById('p').onclick = function () { location.replace('b.html') }</script>").unwrap();
+        std::fs::write(dir.join("mail.html"), "<a id=l href='a.html'>l</a><script>document.getElementById('l').onclick = function () { location.href = 'mailto:x@y.z' }</script>").unwrap();
+        tab.open(file("rep.html"));
+        assert!(deliver(&mut tab, &rx));
+        let before = tab.history.back.len();
+        let p = (0..tab.page.dom.nodes.len()).find(|&n| tab.page.dom.attr(n, "id") == Some("p")).unwrap();
+        assert!(tab.script_click(p));
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.page.url, b);
+        assert_eq!(tab.history.back.len(), before, "replaced, not added");
+        assert!(!tab.history.back.contains(&file("rep.html")));
+        tab.open(file("mail.html"));
+        assert!(deliver(&mut tab, &rx));
+        let l = (0..tab.page.dom.nodes.len()).find(|&n| tab.page.dom.tag(n) == Some("a")).unwrap();
+        assert!(!tab.script_click(l), "the handler went nowhere, so the link keeps its own click");
         // a click handler that sets location (and stops the link) sends the tab on
         tab.open(file("click.html"));
         assert!(deliver(&mut tab, &rx));

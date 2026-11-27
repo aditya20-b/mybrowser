@@ -53,6 +53,9 @@ pub struct LinkRegion {
     pub w: f32,
     pub h: f32,
     pub href: String,
+    /// The node the click lands on (a word's text or inline element inside the link): where a
+    /// script's click event starts.
+    pub node: NodeId,
 }
 
 /// The area a form control occupies, for hit-testing clicks.
@@ -1488,7 +1491,7 @@ impl<'a> Ctx<'a> {
                 if let (Some(h), Some(img)) = (w.image_h, self.images.get(&w.node)) {
                     self.items.push(Item::Image { x: ax, y: baseline - h, w: w.w, h, img: img.clone() });
                     if let Some(href) = &w.href {
-                        self.links.push(LinkRegion { x: ax, y: baseline - h, w: w.w, h, href: href.clone() });
+                        self.links.push(LinkRegion { x: ax, y: baseline - h, w: w.w, h, href: href.clone(), node: w.node });
                     }
                     continue;
                 }
@@ -1521,7 +1524,7 @@ impl<'a> Ctx<'a> {
                     });
                 }
                 if let Some(href) = &w.href {
-                    self.links.push(LinkRegion { x: ax, y: cy, w: span, h: line_h, href: href.clone() });
+                    self.links.push(LinkRegion { x: ax, y: cy, w: span, h: line_h, href: href.clone(), node: w.node });
                 }
                 // text in a <label> activates its control: a click region that hit-tests like one
                 if let Some(target) = w.label {

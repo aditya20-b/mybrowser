@@ -59,7 +59,12 @@ pub struct Page {
     pub scripts: Option<ScriptHost>,
     /// What the scripts logged, and why one failed to load or run.
     pub console: Vec<String>,
+    /// The stylesheets, kept so styles can be recomputed after scripts change the page.
+    rules: Vec<Rule>,
 }
+
+/// Console lines kept per page.
+const MAX_CONSOLE_LINES: usize = 1000;
 
 /// The most scripts a page may run, and the most source text.
 const MAX_SCRIPTS: usize = 60;
@@ -512,7 +517,26 @@ impl Page {
         }
 
         let layout = Layout { items: vec![], links: vec![], controls: vec![], anchors: vec![], height: 0.0, canvas_bg: None };
-        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false, no_store: false, scripts, console }
+        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false, no_store: false, scripts, console, rules }
+    }
+
+    /// Send `event` (say "click") to the page's scripts, starting at `node`. Returns whether a
+    /// handler called `preventDefault()`. If the page has scripts, the styles are recomputed
+    /// afterwards (a handler may have changed classes or added elements), so the caller must lay
+    /// the page out again.
+    pub fn run_event(&mut self, node: NodeId, event: &str) -> bool {
+        let Some(host) = self.scripts.as_mut() else { return false };
+        if node >= self.dom.nodes.len() {
+            return false;
+        }
+        let prevented = host.dispatch(&mut self.dom, node, event);
+        for line in host.take_console() {
+            if self.console.len() < MAX_CONSOLE_LINES {
+                self.console.push(line);
+            }
+        }
+        self.styles = style::compute(&self.dom, &self.rules);
+        prevented
     }
 
     /// Re-run layout for a new viewport width (logical pixels), or after the
@@ -765,6 +789,33 @@ mod tests {
         // a page with no scripts has no script host at all
         assert!(Page::from_source(&url_of(&dir.join("t.html")), "<p>plain</p>").scripts.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_click_reaches_handlers_which_can_change_the_page_and_stop_the_default() {
+        let fonts = Fonts::load();
+        let src = "<style>.on{font-size:30px} body{margin:0}</style><body><p id=out>idle</p>\
+            <a id=go href='/next'>go</a><button id=b>press</button>\
+            <script>
+              document.getElementById('go').addEventListener('click', function (e) { e.preventDefault(); this.className = 'on'; console.log('go clicked') });
+              document.getElementById('b').onclick = function () { document.getElementById('out').textContent = 'pressed'; var d = document.createElement('p'); d.textContent = 'added'; document.body.appendChild(d) };
+            </script></body>";
+        let mut p = Page::from_source(&Url::parse("file:///tmp/c.html").unwrap(), src);
+        p.relayout(&fonts, 400.0);
+        let link = p.layout.links[0].node;
+        assert!(p.run_event(link, "click"), "preventDefault is reported");
+        assert_eq!(p.console.last().unwrap(), "go clicked");
+        p.relayout(&fonts, 400.0);
+        let size = p.layout.items.iter().find_map(|i| match i { Item::Text { text, size, .. } if text == "go" => Some(*size), _ => None }).unwrap();
+        assert_eq!(size, 30.0, "the class a handler set is styled");
+        let button = p.layout.controls.iter().map(|c| c.node).find(|&n| p.dom.tag(n) == Some("button")).unwrap();
+        assert!(!p.run_event(button, "click"), "this handler lets the default happen");
+        p.relayout(&fonts, 400.0);
+        let w = words(&p);
+        assert!(w.contains(&"pressed".to_string()) && w.contains(&"added".to_string()) && !w.contains(&"idle".to_string()), "{w:?}");
+        // a page without scripts ignores events
+        let mut plain = Page::from_source(&Url::parse("file:///tmp/d.html").unwrap(), "<a href=x>x</a>");
+        assert!(!plain.run_event(1, "click"));
     }
 
     #[test]

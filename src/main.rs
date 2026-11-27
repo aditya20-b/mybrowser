@@ -847,7 +847,9 @@ impl App {
             if let Some(id) = self.tab().page.control_at(px, py) {
                 // clicking a page field takes the keyboard from the find box
                 self.close_find();
-                self.activate_control(id);
+                if !self.tab_mut().script_click(id) {
+                    self.activate_control(id);
+                }
             } else {
                 // clicking anywhere else leaves the control that had focus
                 let tab = self.tab_mut();
@@ -855,7 +857,10 @@ impl App {
                     tab.form_changed();
                 }
                 self.update_hover(); // hit-test at release time rather than trusting a stale hover
-                if let Some(href) = self.hover.clone() {
+                let clicked = self.tab().link_node_at(px, py);
+                // a script's click handler runs first; `preventDefault()` keeps the link from being followed
+                let prevented = clicked.is_some_and(|n| self.tab_mut().script_click(n));
+                if let (Some(href), false) = (self.hover.clone(), prevented) {
                     if self.modifiers.super_key() {
                         // Cmd+click opens the link in a new tab
                         if let Some(url) = self.tab().link_target(&href) {

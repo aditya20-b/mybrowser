@@ -812,6 +812,22 @@ impl Tab {
         l.map(|l| l.href.clone())
     }
 
+    /// The node of the link under layout position `(x, y)` (where a click event starts).
+    pub fn link_node_at(&self, x: f32, y: f32) -> Option<NodeId> {
+        self.page.layout.links.iter().find(|l| x >= l.x && x <= l.x + l.w && y >= l.y && y <= l.y + l.h).map(|l| l.node)
+    }
+
+    /// Tell the page's scripts about a click on `node`. Returns true if one of them called
+    /// `preventDefault()`: the browser must then not do what the click would normally do.
+    pub fn script_click(&mut self, node: NodeId) -> bool {
+        if self.page.scripts.is_none() {
+            return false;
+        }
+        let prevented = self.page.run_event(node, "click");
+        self.form_changed(); // (the scripts may have changed what is on the page)
+        prevented
+    }
+
     /// The form state changed (focus, text, a toggle): the page must be laid out again.
     pub fn form_changed(&mut self) {
         self.laid_out_width = -1.0;

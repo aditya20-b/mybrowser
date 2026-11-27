@@ -214,6 +214,9 @@ pub struct Tab {
     pub scroll: f32,
     /// The viewport width the page was last laid out for (`-1` forces a relayout).
     pub laid_out_width: f32,
+    /// `page` is just the "Loading…" stand-in of a tab opened straight onto a URL,
+    /// not something that was ever loaded.
+    placeholder: bool,
     /// Form data for the next `begin_load` to POST (set by `submit_form`).
     next_post: Option<String>,
     /// Form data of the navigation in flight, so restarting it (reload while
@@ -231,6 +234,7 @@ impl Tab {
     pub fn new(id: u64, start: Url, initiator: Option<Url>, notify: Notify) -> Tab {
         let mut tab = Tab::blank(id, notify);
         tab.page = Page::from_source(&start, "<p style='color:#666'>Loading…</p>");
+        tab.placeholder = true;
         tab.next_initiator = initiator;
         tab.begin_load(start, Hist::Replace, None);
         tab
@@ -245,6 +249,7 @@ impl Tab {
             nav: Navigation::default(),
             scroll: 0.0,
             laid_out_width: -1.0,
+            placeholder: false,
             next_post: None,
             inflight_post: None,
             next_initiator: None,
@@ -311,17 +316,24 @@ impl Tab {
         self.inflight_initiator = None;
         self.history.apply(pending.hist, pending.from, &page.url);
         self.page = page;
+        self.placeholder = false;
         self.laid_out_width = -1.0; // force relayout on the next redraw
         self.scroll = pending.keep_scroll.unwrap_or(0.0); // clamped on the next redraw
         true
     }
 
-    /// Give up on the load in flight. Returns whether there was one.
+    /// Give up on the load in flight. Returns whether there was one. A tab that was
+    /// opened straight onto a URL and has shown nothing yet goes back to being a blank tab.
     pub fn cancel_load(&mut self) -> bool {
         let was = self.nav.cancel();
         if was {
             self.inflight_post = None;
             self.inflight_initiator = None;
+            if self.placeholder {
+                self.page = blank_page(&blank_url());
+                self.placeholder = false;
+                self.laid_out_width = -1.0;
+            }
         }
         was
     }
@@ -729,6 +741,26 @@ mod tests {
         assert!(!deliver(&mut tab, &rx), "the cancelled result is dropped");
         assert_eq!((tab.title().as_str(), tab.history.back.len()), ("Page A", 0));
         assert!(!tab.cancel_load(), "nothing left to cancel");
+    }
+
+    #[test]
+    fn cancelling_the_first_load_of_a_new_tab_leaves_a_blank_tab() {
+        // the "Loading…" stand-in page used to stay forever, titled with the host name
+        let (_dir, a, _b) = site("cancel-first");
+        let (notify, rx) = queue();
+        let mut tab = Tab::new(1, a.clone(), Some(u("https://opener.test/")), notify);
+        assert!(tab.is_loading());
+        assert!(tab.cancel_load());
+        assert_eq!((tab.title().as_str(), tab.address().as_str()), ("New Tab", ""));
+        assert!(tab.page.dom.text_content(0).contains("New tab"), "{}", tab.page.dom.text_content(0));
+        assert!(!deliver(&mut tab, &rx), "the abandoned load is dropped");
+        assert!(tab.history.back.is_empty());
+        // a tab that has shown a real page keeps it when a later load is cancelled
+        tab.open(a.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.open(a.clone());
+        assert!(tab.cancel_load());
+        assert_eq!(tab.title(), "Page A");
     }
 
     #[test]

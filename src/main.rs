@@ -528,9 +528,9 @@ impl App {
                 None => {}
             }
         } else {
-            // clicking the page ends address editing
+            // clicking the page ends address editing (a blank tab shows an empty address, not about:blank)
             if self.bar.is_focused() {
-                let url = if self.tab().is_loading() { self.bar.submit_text().to_string() } else { self.tab().page.url.to_string() };
+                let url = if self.tab().is_loading() { self.bar.submit_text().to_string() } else { self.tab().address() };
                 self.bar.show(&url);
             }
             let (px, py) = (cx, cy - TOP + self.tab().scroll);

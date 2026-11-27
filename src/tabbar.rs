@@ -10,7 +10,9 @@ pub const MAX_TABS: usize = 20;
 const PADDING: f32 = 8.0;
 const TOP_GAP: f32 = 4.0;
 const MAX_TAB_WIDTH: f32 = 220.0;
-const MIN_TAB_WIDTH: f32 = 48.0;
+/// Narrow enough that `MAX_TABS` tabs and the + button fit a 600 px window; at this
+/// width a tab is just its close button.
+const MIN_TAB_WIDTH: f32 = 28.0;
 const CLOSE_SIZE: f32 = 16.0;
 const NEW_BUTTON: f32 = 24.0;
 
@@ -64,8 +66,9 @@ pub fn new_rect(count: usize, width: f32) -> Rect {
 }
 
 /// Which part of the strip is at logical `(x, y)` (`y` measured from the top of the window).
+/// Parts that fall outside a (very narrow) window can't be hit.
 pub fn hit_test(x: f32, y: f32, count: usize, width: f32) -> Option<TabHit> {
-    if !(0.0..HEIGHT).contains(&y) {
+    if !(0.0..HEIGHT).contains(&y) || !(x < width) {
         return None;
     }
     for i in 0..count {
@@ -107,7 +110,7 @@ mod tests {
     fn tabs_share_the_width_within_limits() {
         assert_eq!(tab_width(1, 1000.0), MAX_TAB_WIDTH, "a lone tab doesn't stretch across the window");
         assert_eq!(tab_width(4, 600.0), (600.0 - 2.0 * PADDING - NEW_BUTTON) / 4.0);
-        assert_eq!(tab_width(MAX_TABS, 400.0), MIN_TAB_WIDTH, "they stop shrinking at a minimum");
+        assert_eq!(tab_width(MAX_TABS, 300.0), MIN_TAB_WIDTH, "they stop shrinking at a minimum");
         assert_eq!(tab_width(0, 500.0), MAX_TAB_WIDTH, "no tabs doesn't divide by zero");
         assert_eq!(tab_width(3, 0.0), MIN_TAB_WIDTH);
     }
@@ -137,6 +140,31 @@ mod tests {
         // the close button is inside its tab
         let (t, c) = (tab_rect(0, count, width), close_rect(0, count, width));
         assert!(c.x >= t.x && c.x + c.w <= t.x + t.w && c.y >= t.y && c.y + c.h <= t.y + t.h);
+    }
+
+    #[test]
+    fn every_tab_and_the_plus_button_stay_reachable_in_a_modest_window() {
+        // with 20 tabs in a 700 px window the strip used to run past the right edge
+        let (count, width) = (MAX_TABS, 700.0);
+        for i in 0..count {
+            let t = tab_rect(i, count, width);
+            assert!(t.x + t.w <= width, "tab {i} ends at {}", t.x + t.w);
+            let (cx, cy) = centre(close_rect(i, count, width));
+            assert_eq!(hit_test(cx, cy, count, width), Some(TabHit::Close(i)));
+            // the close button stays inside its own (narrow) tab and clear of the next one
+            let (c, t) = (close_rect(i, count, width), tab_rect(i, count, width));
+            assert!(c.x >= t.x && c.x + c.w <= t.x + t.w, "tab {i}");
+        }
+        let plus = new_rect(count, width);
+        assert!(plus.x + plus.w <= width);
+        let (px, py) = centre(plus);
+        assert_eq!(hit_test(px, py, count, width), Some(TabHit::New));
+        // in a window too narrow for the strip, parts beyond the right edge can't be clicked
+        assert_eq!(hit_test(width + 5.0, 10.0, count, width), None);
+        let narrow = 200.0;
+        let (lx, ly) = centre(tab_rect(count - 1, count, narrow));
+        assert!(lx > narrow, "the last tab is off screen here");
+        assert_eq!(hit_test(lx, ly, count, narrow), None);
     }
 
     #[test]

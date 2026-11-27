@@ -227,11 +227,12 @@ impl Page {
         Page::build(url, src, HashMap::new())
     }
 
-    /// A short label for tabs and the window title.
+    /// A short, single-line label for tabs and the window title: the page title with
+    /// line breaks and runs of spaces collapsed, else the document's name.
     pub fn display_title(&self) -> String {
-        let title = self.title.trim();
+        let title = self.title.split_whitespace().collect::<Vec<_>>().join(" ");
         if !title.is_empty() {
-            return truncate_chars(title, MAX_TITLE_CHARS);
+            return truncate_chars(&title, MAX_TITLE_CHARS);
         }
         document_name(&self.url)
     }
@@ -726,6 +727,16 @@ mod tests {
         // and a very long <title> is clipped for the window
         let p = Page::from_source(&t_url(), &format!("<title>{}</title>", "z".repeat(5000)));
         assert!(p.display_title().chars().count() <= MAX_TITLE_CHARS + 1);
+    }
+
+    #[test]
+    fn multi_line_titles_become_one_clean_line() {
+        // line breaks and tabs used to be drawn as glyphs in the tab label
+        let p = Page::from_source(&t_url(), "<title>\n  Foo\n\t  Bar   baz\n</title><p>x</p>");
+        assert_eq!(p.display_title(), "Foo Bar baz");
+        // a title of only whitespace falls back to the file name
+        let p = Page::from_source(&t_url(), "<title> \n\t </title>");
+        assert_eq!(p.display_title(), "t.html");
     }
 
     /// A tiny multi-route HTTP server: serves `routes` (path -> (content type, body))

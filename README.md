@@ -1,6 +1,6 @@
 # mybrowser
 
-I wanted to understand what a browser actually does, so I'm writing one from scratch in Rust. The goal is a *functional* browser: type an address, fetch the page over HTTPS, parse the HTML and CSS, lay it out, and paint it. There's no WebKit or Blink underneath and no UI toolkit doing the text layout for me. Only the window, the TLS stack and the font rasterizer come from crates.
+I wanted to understand what a browser actually does, so I'm writing one from scratch in Rust. The goal is a *functional* browser: type an address, fetch the page over HTTPS, parse the HTML and CSS, lay it out, and paint it. There's no WebKit or Blink underneath and no UI toolkit doing the text layout for me. Only the window, the TLS stack, the font rasterizer and the image decoders come from crates.
 
 It is early. It can load and read plain, document-style websites today, including older table-based ones like Hacker News, and it falls over on anything that depends on JavaScript or flexbox. The [roadmap](#whats-missing) below is honest about the distance to a real browser.
 
@@ -62,7 +62,7 @@ One heads-up: fonts are loaded from the macOS system font folder (see `src/fonts
 
 **Layout.** Block and inline flow, lists, `<pre>`, and **tables**: column widths from min and max content, percentage and fixed widths, `colspan` and `rowspan`, captions, row and cell backgrounds that stretch to the row, vertical alignment, nested tables, and the legacy attributes older pages rely on (`border`, `cellpadding`, `cellspacing`, `bgcolor`, `align`, `valign`, `<font>`).
 
-**Text and images.** Text wraps using real glyph widths with alignment, bold, italic, monospace, underlines, highlights and clickable links. Characters missing from the main fonts (arrows, CJK) fall back to a wide-coverage font. PNG images flow inline with the text, scaled with bilinear filtering, with alt text as the fallback.
+**Text and images.** Text wraps using real glyph widths with alignment, bold, italic, monospace, underlines, highlights and clickable links. Characters missing from the main fonts (arrows, CJK) fall back to a wide-coverage font. PNG, JPEG and GIF images flow inline with the text, scaled with bilinear filtering, with alt text as the fallback. The format is recognised from the bytes (a JPEG named `.png` still works), a GIF shows its first frame, and every decoder checks the size a file claims before allocating, so a tiny file can't demand gigabytes.
 
 ## How it works
 
@@ -82,7 +82,7 @@ URL -> fetch -> HTML -> DOM --\
 | Styles | `src/style.rs` | Walks the DOM once, collects every matching declaration, sorts by importance, origin, specificity and order, and fills in a typed `Style` for each node. Legacy presentational attributes act as very low-priority rules. |
 | Forms | `src/forms.rs` | Pure logic: which elements are controls, their typed or chosen values, Tab order, and turning a submitted form into a request. |
 | Layout | `src/layout.rs` | Stacks blocks, collapses margins, breaks text into lines, sizes and positions table cells and form controls. The output is a flat list of "draw this rect" and "draw this text" commands. |
-| Painting | `src/paint.rs`, `src/fonts.rs`, `src/images.rs` | Fills rectangles into a `u32` buffer, blends glyph bitmaps and scaled images on top; also draws the toolbar and tab strip. |
+| Painting | `src/paint.rs`, `src/fonts.rs`, `src/images.rs` | Fills rectangles into a `u32` buffer, blends glyph bitmaps and scaled images on top; also draws the toolbar and tab strip. `images.rs` decodes PNG, JPEG and GIF. |
 | Browser | `src/page.rs`, `src/tab.rs`, `src/tabbar.rs`, `src/chrome.rs`, `src/main.rs` | A page ties the stages together; a tab owns a page, its history and its loads; the tab strip and toolbar are pure state and geometry; `main` runs the window and routes input. |
 
 A few choices worth explaining:
@@ -107,7 +107,7 @@ The engine itself is hand-written. I only used crates for the parts that talk to
 - `fontdue` to turn a TrueType glyph into a bitmap and report its metrics
 - `ureq` (with rustls) for HTTP and TLS, and `url` for parsing and resolving URLs
 - `cookie_store` and `cookie` to parse and match cookies, and `psl` (the public suffix list) to know which domains cookies must never be shared across
-- `png` to decode PNG images and save screenshots
+- `png`, `jpeg-decoder` and `gif` to decode images (`png` also saves screenshots)
 
 ## Tests
 
@@ -115,7 +115,7 @@ The engine itself is hand-written. I only used crates for the parts that talk to
 cargo test
 ```
 
-There are over two hundred tests. They cover the parsers, selector matching, the cascade, layout, tables and form controls, address editing, tabs, URL handling, history, form submission, the cookie rules, and networking (against throwaway local HTTP servers, so no internet is needed). Many are regression tests for real bugs found by throwing nasty input at the engine and by independent review passes: quadratic-time parsing, exponential selector matching, crashes on odd Unicode and huge values, unbounded memory use, history desyncs, and so on. The tests load system fonts, so they also need macOS for now.
+There are over two hundred tests. They cover the parsers, selector matching, the cascade, layout, tables and form controls, address editing, tabs, image decoding, URL handling, history, form submission, the cookie rules, and networking (against throwaway local HTTP servers, so no internet is needed). Many are regression tests for real bugs found by throwing nasty input at the engine and by independent review passes: quadratic-time parsing, exponential selector matching, crashes on odd Unicode and huge values, unbounded memory use, history desyncs, and so on. The tests load system fonts, so they also need macOS for now.
 
 ## What's missing
 
@@ -125,14 +125,14 @@ The honest list, roughly by how much it matters for a real browser:
 - **Layout.** No flexbox, grid, floats or positioning, no inline padding or margins, and no `vh`/`vw`/`calc()`. A lot of the modern web depends on these.
 - **Selectors.** No pseudo-classes (even `:link` and `:first-child`), attribute selectors or `@media`, so many stylesheets lose rules.
 - **Forms.** No `multipart/form-data` (so no file uploads; a form asking for it is sent urlencoded), no `<select multiple>`, and `<label>` clicks don't focus their control. Reloading or going back to a page a `POST` produced fetches its URL with a `GET`. No caret movement or selection inside fields (typing appends, backspace deletes), no file, date or colour inputs, radio buttons draw as squares, and selects cycle on click instead of opening a menu. Controls hidden with CSS (`display:none`) can still be tabbed to.
-- **Tabs.** No dragging to reorder, no restoring closed tabs, and tabs shrink to a minimum width rather than scrolling when there are many (at most 20 can be open).
+- **Tabs.** No dragging to reorder or restoring closed tabs. With many tabs open they shrink until only the close button shows (at most 20 can be open).
 - **Cookies.** Nothing persists between runs, and there's no UI to see or clear them.
 - **Browser features.** No caching, bookmarks, find-in-page or downloads.
-- **Media.** PNG only: no JPEG, GIF, WebP or SVG. No fonts from the web (`@font-face`).
+- **Media.** Animated GIFs show their first frame only; no WebP or SVG. No fonts from the web (`@font-face`).
 - **Text.** No shaping, so no kerning, ligatures or complex scripts, and no right-to-left text.
 - **Platform.** macOS fonts only, for now.
 
-The order I'm tackling things in: the CSS gaps above (pseudo-classes, inline boxes, viewport units), a flexbox subset, more image formats, and eventually a JavaScript engine. Until then it's best at documents, blogs, articles and older table-based sites.
+The order I'm tackling things in: the CSS gaps above (pseudo-classes, inline boxes, viewport units), a flexbox subset, and eventually a JavaScript engine. Until then it's best at documents, blogs, articles and older table-based sites.
 
 ## Where to learn more
 

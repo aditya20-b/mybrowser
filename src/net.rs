@@ -58,7 +58,20 @@ pub struct Fetched {
 
 /// Does a `Cache-Control` header value contain the `no-store` directive?
 pub fn has_no_store(value: &str) -> bool {
-    value.split(',').any(|d| d.trim().split('=').next().unwrap_or("").trim().eq_ignore_ascii_case("no-store"))
+    // directives are separated by commas outside quoted strings
+    let (mut directives, mut current, mut quoted) = (vec![], String::new(), false);
+    for c in value.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                current.push(c);
+            }
+            ',' if !quoted => directives.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    directives.push(current);
+    directives.iter().any(|d| d.trim().split('=').next().unwrap_or("").trim().eq_ignore_ascii_case("no-store"))
 }
 
 /// What we say we accept: pages and styles, and the image formats we can decode (so a
@@ -219,7 +232,8 @@ fn fetch_http(start: &Url, top: Option<&Url>, post: Option<&str>) -> Result<Fetc
                 continue;
             }
         }
-        let no_store = resp.headers().get_all("cache-control").iter().any(|v| v.to_str().is_ok_and(has_no_store));
+        // (header values may hold bytes outside ASCII: read them lossily, never fail open)
+        let no_store = resp.headers().get_all("cache-control").iter().any(|v| has_no_store(&String::from_utf8_lossy(v.as_bytes())));
         let content_type = resp.body().mime_type().unwrap_or("").to_ascii_lowercase();
         let charset = resp.body().charset().map(|c| c.to_ascii_lowercase());
         let body = resp
@@ -487,6 +501,8 @@ mod tests {
         for yes in ["no-store", "No-Store", "no-cache, no-store, must-revalidate", "private,max-age=0 , no-store", "no-store=\"x\""] {
             assert!(has_no_store(yes), "{yes}");
         }
+        assert!(has_no_store("no-store, x=\"a,b\""), "a quoted comma doesn't hide a later directive");
+        assert!(!has_no_store("foo=\"a,no-store,b\""), "no-store inside a quoted value is not a directive");
         for no in ["", "no-cache", "max-age=3600", "public", "no-storefront", "x-no-store"] {
             assert!(!has_no_store(no), "{no}");
         }
@@ -498,6 +514,19 @@ mod tests {
         let (a, b) = (fetch(&url("/a")).unwrap(), fetch(&url("/b")).unwrap());
         h.join().unwrap();
         assert!(a.no_store && !b.no_store);
+        // a header with a byte outside ASCII still counts (it must not fail open)
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-store, x=\"\xE9\"\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(&raw);
+        });
+        let f = fetch(&Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap()).unwrap();
+        server.join().unwrap();
+        assert!(f.no_store);
     }
 
     #[test]

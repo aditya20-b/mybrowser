@@ -397,7 +397,8 @@ impl Tab {
         // leaving the note page of a download (a tab opened onto a file) leaves nothing behind in history
         // a new document: the fragment entries before it belong to the old one (kept with the
         // old page if it goes into the cache, so a later restore can pick them up again)
-        let left_frags = (self.frag_back, self.frag_forward);
+        // (a fresh load clears the forward history, so no fragment steps lie ahead of the old page)
+        let left_frags = (self.frag_back, if pending.hist == Hist::Push { 0 } else { self.frag_forward });
         (self.frag_back, self.frag_forward) = (0, 0);
         let leaving_note = std::mem::take(&mut self.on_download_page);
         let pending = if leaving_note && pending.hist == Hist::Push { Pending { hist: Hist::Replace, ..pending } } else { pending };
@@ -734,6 +735,9 @@ impl Tab {
                         self.remember_scroll(here.clone());
                         self.history.back.push(here);
                         self.history.forward.clear();
+                        // pages remembered for the forward entries just dropped (or for this depth) are dead weight
+                        let depth = self.history.back.len();
+                        self.page_cache.retain(|c| c.key.1 < depth);
                         (self.frag_back, self.frag_forward) = (self.frag_back + 1, 0);
                     }
                 }
@@ -1652,6 +1656,28 @@ mod tests {
         tab.go_back();
         assert!(!tab.is_loading());
         assert_eq!(tab.page.form.value(&tab.page.dom, input), "1typed");
+    }
+
+    #[test]
+    fn a_fresh_load_leaves_no_fragment_steps_ahead_of_the_page_it_replaced() {
+        let (dir, a, _b) = site("fragforward");
+        std::fs::write(dir.join("f.html"), "<p id=x>x</p><p id=y>y</p>").unwrap();
+        let f = Url::from_file_path(dir.join("f.html")).unwrap();
+        let _ = a;
+        let (notify, rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        tab.open(f.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.follow("#x");
+        tab.follow("#y");
+        tab.go_back(); // f#x, with one fragment step still ahead
+        tab.open(f.clone()); // a fresh load: that step is gone
+        assert!(deliver(&mut tab, &rx));
+        assert!(tab.go_back(), "f#x comes back from memory");
+        assert_eq!(tab.page.url.fragment(), Some("x"));
+        assert_eq!(tab.frag_forward, 0);
+        let swapped = tab.go_forward();
+        assert!(swapped || tab.is_loading(), "Forward reaches the freshly loaded page, not a fake fragment move");
     }
 
     #[test]

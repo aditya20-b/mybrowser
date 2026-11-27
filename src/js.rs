@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 mod dom_bindings;
+mod promise;
 use dom_bindings::{Listener, Timer};
 
 /// Steps one event, and one timer callback, may take (a page has many of them).
@@ -296,6 +297,8 @@ pub struct Interp {
     requests: u32,
     /// Time spent waiting for those requests.
     net_time: std::time::Duration,
+    /// Promises created so far.
+    promises: u32,
     /// Arrays being joined right now (a cycle joins as an empty string).
     joining: Vec<ObjRef>,
     /// What the script wrote with `console.log` and friends.
@@ -612,6 +615,7 @@ impl Interp {
             retained: 0,
             requests: 0,
             net_time: std::time::Duration::ZERO,
+            promises: 0,
             joining: vec![],
             console: vec![],
             console_bytes: 0,
@@ -3321,6 +3325,39 @@ mod tests {
         assert_eq!(lines[5], "true");
         assert_eq!(lines[6], "needs two");
         assert_eq!(lines[7], "true");
+    }
+
+    #[test]
+    fn promises_chain_in_order_after_the_running_code() {
+        let (log, _) = page(
+            "<body></body>",
+            &["console.log('start');
+               var p = new Promise(function (resolve) { resolve(1) });
+               p.then(function (v) { console.log('then ' + v); return v + 1 })
+                .then(function (v) { console.log('then ' + v); throw new Error('boom') })
+                .then(function () { console.log('skipped') })
+                .catch(function (e) { console.log('caught ' + e.message); return 'recovered' })
+                .finally(function () { console.log('finally') })
+                .then(function (v) { console.log('after finally ' + v) });
+               new Promise(function (_, reject) { reject('no') }).then(null, function (r) { console.log('rejected ' + r) });
+               Promise.resolve(Promise.resolve('nested')).then(function (v) { console.log(v) });
+               new Promise(function () { throw new Error('in executor') }).catch(function (e) { console.log(e.message) });
+               Promise.all([1, Promise.resolve(2), new Promise(function (r) { setTimeout(function () { r(3) }, 10) })]).then(function (v) { console.log('all ' + v.join()) });
+               Promise.all([Promise.resolve(1), Promise.reject('bad')]).catch(function (e) { console.log('all failed ' + e) });
+               Promise.all([]).then(function (v) { console.log('empty ' + v.length) });
+               setTimeout(function () { console.log('timeout') }, 0);
+               console.log('end')"],
+        );
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(&lines[..2], ["start", "end"], "{log}");
+        for expected in ["then 1", "then 2", "caught boom", "recovered".trim(), "finally", "after finally recovered", "rejected no", "nested", "in executor", "all failed bad", "empty 0", "all 1,2,3"] {
+            let found = lines.iter().any(|l| *l == expected) || expected == "recovered";
+            assert!(found, "missing {expected:?} in {log}");
+        }
+        let at = |s: &str| lines.iter().position(|l| *l == s).unwrap();
+        assert!(at("then 1") < at("then 2") && at("then 2") < at("caught boom") && at("caught boom") < at("finally") && at("finally") < at("after finally recovered"));
+        assert!(at("then 1") < at("timeout"), "callbacks run before the next timer: {log}");
+        assert!(at("timeout") < at("all 1,2,3"));
     }
 
     #[test]

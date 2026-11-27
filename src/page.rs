@@ -889,6 +889,23 @@ mod tests {
     }
 
     #[test]
+    fn fetch_returns_a_promise_of_a_response_from_the_pages_own_site() {
+        let (port, server) = serve_routes(vec![("/data.json", "application/json", br#"{"name":"mybrowser","n":[1,2]}"#.to_vec())], 2);
+        let src = "<body><p id=out>waiting</p><script>
+            fetch('/data.json').then(function (r) { console.log('ok ' + r.ok + ' ' + r.status + ' ' + r.headers.get('content-type')); return r.json() })
+              .then(function (d) { document.getElementById('out').textContent = d.name + d.n.length });
+            fetch('http://example.invalid/x').catch(function (e) { console.log('failed: ' + e.message) });
+            fetch('/missing.txt').then(function (r) { console.log('missing ' + r.ok + ' ' + r.status); return r.text() }).then(function (t) { console.log('body ' + t) });
+        </script></body>";
+        let p = Page::from_source(&Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(), src);
+        let _ = server.join();
+        assert!(p.dom.text_content(0).contains("mybrowser2"), "{:?}", p.console);
+        assert!(p.console.contains(&"ok true 200 application/json".to_string()), "{:?}", p.console);
+        assert!(p.console.iter().any(|l| l.starts_with("failed: Failed to fetch: blocked")), "{:?}", p.console);
+        assert!(p.console.contains(&"missing false 404".to_string()) && p.console.contains(&"body nope".to_string()), "{:?}", p.console);
+    }
+
+    #[test]
     fn a_scripts_request_is_not_redirected_to_another_site() {
         // B is "another site": nothing may connect to it
         let other = TcpListener::bind("127.0.0.1:0").unwrap();

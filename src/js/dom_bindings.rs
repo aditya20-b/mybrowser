@@ -1229,6 +1229,7 @@ impl Interp {
         Interp::declare(&g, "globalThis", Value::Obj(window), true);
         let xhr = self.native(xhr_construct);
         Interp::declare(&g, "XMLHttpRequest", xhr, true);
+        self.install_promises();
     }
 
     fn lookup_global(&mut self, name: &str) -> Value {
@@ -1327,6 +1328,41 @@ fn xhr_add_listener(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
     Ok(Value::Undefined)
 }
 
+/// One request a page's script makes (XMLHttpRequest and fetch share it): within the page's
+/// request and waiting-time budgets, to its own origin only. Returns the response and its text.
+pub(super) fn script_request(i: &mut Interp, method: &str, url: &str, body: Option<&str>) -> Result<(crate::net::Fetched, String), String> {
+    if i.requests >= MAX_REQUESTS {
+        return Err("too many requests".to_string());
+    }
+    if i.net_time > MAX_NET_TIME {
+        // the page has already spent its share of waiting: the window is held up while a request runs
+        return Err("too much time spent waiting for the network".to_string());
+    }
+    i.requests += 1;
+    let started = std::time::Instant::now();
+    let r = xhr_fetch(&i.page_url, method, url, body);
+    i.net_time += started.elapsed();
+    let f = r?;
+    let mut text = crate::net::decode_text(&f.body, f.charset.as_deref(), false);
+    if text.len() > MAX_RESPONSE {
+        let mut cut = MAX_RESPONSE;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+    }
+    Ok((f, text))
+}
+
+/// Run `func(args)` soon, after the code that is running now (a promise's callbacks).
+pub(super) fn queue_job(i: &mut Interp, func: Value, args: Vec<Value>) {
+    if i.timers.len() < MAX_TIMERS {
+        i.timer_seq += 1;
+        let (id, due) = (i.timer_seq, i.clock);
+        i.timers.push(Timer { id, due, func, args, interval: None, runs: 0 });
+    }
+}
+
 fn xhr_send(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
     let method = i.get_member(this, "__method")?;
     let url = i.get_member(this, "__url")?;
@@ -1337,28 +1373,9 @@ fn xhr_send(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
         Some(Value::Undefined | Value::Null) | None => None,
         Some(v) => Some(i.to_string(v)?),
     };
-    let result = if i.requests >= MAX_REQUESTS {
-        Err("too many requests".to_string())
-    } else if i.net_time > MAX_NET_TIME {
-        // the page has already spent its share of waiting: the window is held up while a request runs
-        Err("too much time spent waiting for the network".to_string())
-    } else {
-        i.requests += 1;
-        let started = std::time::Instant::now();
-        let r = xhr_fetch(&i.page_url, &method, &url, body.as_deref());
-        i.net_time += started.elapsed();
-        r
-    };
+    let result = script_request(i, &method, &url, body.as_deref());
     match result {
-        Ok(f) => {
-            let mut text = crate::net::decode_text(&f.body, f.charset.as_deref(), false);
-            if text.len() > MAX_RESPONSE {
-                let mut cut = MAX_RESPONSE;
-                while !text.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                text.truncate(cut);
-            }
+        Ok((f, text)) => {
             i.set_member(this, "status", Value::Num(f.status as f64))?;
             i.set_member(this, "responseText", str_value(&text))?;
             i.set_member(this, "response", str_value(&text))?;

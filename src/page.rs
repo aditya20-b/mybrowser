@@ -162,7 +162,38 @@ enum Sheet {
     Link(Url),
 }
 
+/// Parse the `content` of `<meta http-equiv=refresh>`: `5`, `0; url=/next`, `0;URL='x'`, `3, /y`.
+/// Returns the delay in seconds and the target, if there is one.
+pub fn parse_refresh(content: &str) -> Option<(f32, Option<String>)> {
+    let content = content.trim();
+    let end = content.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(content.len());
+    let delay: f32 = content[..end].parse().ok().filter(|d: &f32| d.is_finite())?;
+    let rest = content[end..].trim_start_matches(|c: char| c.is_whitespace() || c == ';' || c == ',');
+    if rest.is_empty() {
+        return Some((delay, None));
+    }
+    let lower = rest.to_ascii_lowercase();
+    let target = match lower.strip_prefix("url") {
+        Some(after) if after.trim_start().starts_with('=') => rest[rest.len() - after.len()..].trim_start().trim_start_matches('=').trim(),
+        _ => rest,
+    };
+    let target = target.trim_matches(|c| c == '\'' || c == '"').trim();
+    Some((delay, (!target.is_empty()).then(|| target.to_string())))
+}
+
 impl Page {
+    /// A `<meta http-equiv=refresh content="N; url=...">` in the document: (delay, target href).
+    /// The first one that names a target counts.
+    pub fn meta_refresh(&self) -> Option<(f32, String)> {
+        (0..self.dom.nodes.len())
+            .filter(|&n| self.dom.tag(n) == Some("meta"))
+            .filter(|&n| self.dom.attr(n, "http-equiv").is_some_and(|h| h.trim().eq_ignore_ascii_case("refresh")))
+            .find_map(|n| match parse_refresh(self.dom.attr(n, "content")?)? {
+                (delay, Some(href)) => Some((delay, href)),
+                _ => None,
+            })
+    }
+
     /// Fetch and build the page at `url`. Never fails: network and decoding
     /// errors become an error page.
     pub fn load(url: &Url) -> Page {
@@ -526,6 +557,23 @@ mod tests {
         let p = render("<style>body{margin:0}p{margin:0;height:40px}</style><p>a</p><div id='a%20b'>x</div><div id='c d'>y</div>", 400.0);
         assert_eq!(p.fragment_y("a%20b"), Some(40.0), "the raw spelling is tried before decoding");
         assert!(p.fragment_y("c%20d").is_some(), "and the decoded one still works");
+    }
+
+    #[test]
+    fn meta_refresh_content_parses_in_its_usual_spellings() {
+        let s = |t: &str| Some(t.to_string());
+        assert_eq!(parse_refresh("5"), Some((5.0, None)));
+        assert_eq!(parse_refresh("0; url=/next"), Some((0.0, s("/next"))));
+        assert_eq!(parse_refresh(" 0 ; URL = 'x.html' "), Some((0.0, s("x.html"))));
+        assert_eq!(parse_refresh("3, /y"), Some((3.0, s("/y"))));
+        assert_eq!(parse_refresh("0;\"quoted.html\""), Some((0.0, s("quoted.html"))));
+        assert_eq!(parse_refresh("0;url="), Some((0.0, None)));
+        assert_eq!(parse_refresh("soon"), None);
+        assert_eq!(parse_refresh(""), None);
+        assert_eq!(parse_refresh("0;urlish.html"), Some((0.0, s("urlish.html"))));
+        let p = Page::from_source(&Url::parse("http://h.test/a/").unwrap(), "<meta http-equiv=refresh content='5'><meta http-equiv=Refresh content='1; url=z'><meta name=x content='0;url=no'>");
+        assert_eq!(p.meta_refresh(), Some((1.0, "z".to_string())));
+        assert_eq!(Page::from_source(&Url::parse("http://h.test/").unwrap(), "<p>hi</p>").meta_refresh(), None);
     }
 
     #[test]

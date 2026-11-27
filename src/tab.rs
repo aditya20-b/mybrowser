@@ -252,8 +252,16 @@ pub struct Tab {
     inflight_initiator: Option<Url>,
     /// Where each page left behind in this tab was scrolled to (by full URL, fragment included).
     scroll_memory: HashMap<(Url, usize), f32>,
+    /// How many meta-refresh redirects led to the page on screen, and to the load in flight.
+    refresh_hops: u8,
+    inflight_hops: u8,
+    /// Set just before `begin_load` by a meta refresh; taken by it.
+    next_hops: u8,
     notify: Notify,
 }
+
+/// A chain of zero-delay meta refreshes is cut off after this many.
+const MAX_REFRESH_HOPS: u8 = 5;
 
 /// A tab remembers the scroll position of at most this many pages.
 const MAX_REMEMBERED_SCROLLS: usize = 200;
@@ -285,6 +293,9 @@ impl Tab {
             next_initiator: None,
             inflight_initiator: None,
             scroll_memory: HashMap::new(),
+            refresh_hops: 0,
+            inflight_hops: 0,
+            next_hops: 0,
             notify,
         }
     }
@@ -315,6 +326,7 @@ impl Tab {
     /// with that body; `next_initiator` names the page it came from.
     pub fn begin_load(&mut self, url: Url, hist: Hist, keep_scroll: Option<f32>) {
         let ticket = self.nav.start(self.page.url.clone(), url.clone(), hist, keep_scroll);
+        self.inflight_hops = std::mem::take(&mut self.next_hops);
         let post = self.next_post.take();
         let initiator = self.next_initiator.take();
         self.inflight_post = post.clone();
@@ -372,7 +384,26 @@ impl Tab {
         self.placeholder = false;
         self.laid_out_width = -1.0; // force relayout on the next redraw
         self.scroll = restored.or(pending.keep_scroll).unwrap_or(0.0); // clamped on the next redraw
+        self.refresh_hops = std::mem::take(&mut self.inflight_hops);
+        self.follow_meta_refresh();
         true
+    }
+
+    /// A page that says `<meta http-equiv=refresh content="0; url=...">` sends the tab on to
+    /// that address at once (replacing the page in the history). Only zero-delay refreshes
+    /// are followed (there are no timers), at most `MAX_REFRESH_HOPS` in a row, and only to
+    /// places an ordinary link could go.
+    fn follow_meta_refresh(&mut self) {
+        let Some((delay, href)) = self.page.meta_refresh() else { return };
+        if delay > 0.0 || self.refresh_hops >= MAX_REFRESH_HOPS {
+            return;
+        }
+        if let Link::Navigate(url) = self.classify(&href) {
+            if url != self.page.url {
+                self.next_hops = self.refresh_hops + 1;
+                self.begin_load(url, Hist::Replace, None);
+            }
+        }
     }
 
     /// Note the current scroll position as the one for `url`, the page on screen at this
@@ -1166,6 +1197,52 @@ mod tests {
         assert_eq!(tab.scroll, 300.0);
         tab.go_forward();
         assert_eq!(tab.scroll, 650.0);
+    }
+
+    #[test]
+    fn a_zero_delay_meta_refresh_sends_the_tab_on_and_replaces_its_history_entry() {
+        let (dir, a, b) = site("metarefresh");
+        std::fs::write(dir.join("hop.html"), "<meta http-equiv=refresh content='0; url=b.html'><p>moved</p>").unwrap();
+        std::fs::write(dir.join("slow.html"), "<meta http-equiv=refresh content='5; url=b.html'><p>wait</p>").unwrap();
+        std::fs::write(dir.join("loop1.html"), "<meta http-equiv=REFRESH content=\"0;URL='loop2.html'\">").unwrap();
+        std::fs::write(dir.join("loop2.html"), "<meta http-equiv=refresh content='0;loop1.html'>").unwrap();
+        std::fs::write(dir.join("self.html"), "<meta http-equiv=refresh content='0; url=self.html'><p>me</p>").unwrap();
+        std::fs::write(dir.join("evil.html"), "<meta http-equiv=refresh content='0; url=javascript:alert(1)'>").unwrap();
+        let file = |n: &str| Url::from_file_path(dir.join(n)).unwrap();
+        let (notify, rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        tab.open(a.clone());
+        assert!(deliver(&mut tab, &rx));
+        tab.open(file("hop.html"));
+        assert!(deliver(&mut tab, &rx));
+        assert!(tab.is_loading(), "the refresh started a load");
+        assert!(deliver(&mut tab, &rx));
+        assert_eq!(tab.page.url, b);
+        assert_eq!(tab.history.back.last(), Some(&a), "Back goes to where the refresh started from");
+        assert!(!tab.history.back.contains(&file("hop.html")), "the refreshing page isn't left in the history");
+        // a delay is not honoured (there are no timers), and neither are self-refreshes or odd schemes
+        for name in ["slow.html", "self.html", "evil.html"] {
+            tab.open(file(name));
+            assert!(deliver(&mut tab, &rx));
+            assert!(!tab.is_loading(), "{name} stays put");
+            assert_eq!(tab.page.url, file(name));
+        }
+        // two pages refreshing to each other are cut off after a few hops
+        tab.open(file("loop1.html"));
+        let mut loads = 0;
+        loop {
+            assert!(deliver(&mut tab, &rx));
+            loads += 1;
+            if !tab.is_loading() {
+                break;
+            }
+            assert!(loads < 20, "never ends");
+        }
+        assert_eq!(loads, 1 + MAX_REFRESH_HOPS as usize);
+        // a fresh navigation starts the count again
+        tab.open(file("hop.html"));
+        assert!(deliver(&mut tab, &rx));
+        assert!(tab.is_loading());
     }
 
     #[test]

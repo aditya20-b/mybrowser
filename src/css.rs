@@ -339,13 +339,13 @@ pub fn parse_declarations(text: &str) -> Vec<Declaration> {
 // ---------- selectors -------------------------------------------------------
 //
 // Supported: type, `*`, `.class`, `#id`, attribute selectors (`[a]`, `[a=v]`, `~=`,
-// `|=`, `^=`, `$=`, `*=`, with an optional `i` flag), the structural pseudo-classes
-// (`:first-child`, `:last-child`, `:only-child`, `:nth-child()`, `:nth-last-child()`
-// and the `-of-type` versions), `:link`, `:root` and `:not()`, and the descendant,
-// child (`>`), adjacent (`+`) and general sibling (`~`) combinators. Anything that
-// needs state this browser doesn't have (`:hover`, `:focus`, `:visited`, ...) or
-// pseudo-elements (`::before`) makes the whole selector unsupported, so its rule is
-// dropped instead of being applied where it doesn't belong.
+// `|=`, `^=`, `$=`, `*=`, with an optional `i` or `s` flag), the structural
+// pseudo-classes (`:first-child`, `:last-child`, `:only-child`, `:nth-child()`,
+// `:nth-last-child()` and the `-of-type` versions), `:link`, `:root` and `:not()`,
+// and the descendant, child (`>`), adjacent (`+`) and general sibling (`~`)
+// combinators. Anything that needs state this browser doesn't have (`:hover`,
+// `:focus`, `:visited`, ...) or pseudo-elements (`::before`) makes the whole selector
+// unsupported, so its rule is dropped instead of being applied where it doesn't belong.
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Comb {
@@ -370,16 +370,37 @@ enum AttrOp {
     Substring,
 }
 
+/// How an attribute selector compares case.
+#[derive(Clone, Copy, PartialEq)]
+enum CaseMode {
+    /// No flag: case-insensitive for the HTML attributes whose values are keywords
+    /// (`type`, `lang`, ...), case-sensitive for the rest.
+    Default,
+    /// The `i` flag.
+    Insensitive,
+    /// The `s` flag.
+    Sensitive,
+}
+
+/// HTML attributes whose values are ASCII case-insensitive, so `[type=text]` matches `type=TEXT`.
+const CASE_INSENSITIVE_ATTRS: &[&str] = &[
+    "type", "lang", "dir", "align", "valign", "rel", "rev", "method", "target", "media", "shape", "scope", "clear", "checked",
+    "disabled", "readonly", "multiple", "selected", "nowrap", "wrap", "frame", "rules", "charset", "http-equiv", "language",
+    "compact", "noshade", "hreflang", "enctype", "accept-charset", "dirname", "kind", "scheme", "axis",
+];
+
 struct AttrSel {
     name: String,
     op: AttrOp,
     value: String,
-    ignore_case: bool,
+    case: CaseMode,
 }
 
 enum Pseudo {
     /// `:nth-child(an+b)` and friends; `:first-child` is `0n+1`.
     Nth { a: i64, b: i64, from_end: bool, of_type: bool },
+    /// `:only-child` / `:only-of-type`: no sibling (of the same type).
+    Only { of_type: bool },
     Link,
     Root,
     /// `:not(a, b)`: none of the compounds match.
@@ -393,6 +414,12 @@ pub struct Compound {
     classes: Vec<String>,
     attrs: Vec<AttrSel>,
     pseudos: Vec<Pseudo>,
+}
+
+impl Compound {
+    fn is_empty(&self) -> bool {
+        self.tag.is_none() && self.id.is_none() && self.classes.is_empty() && self.attrs.is_empty() && self.pseudos.is_empty()
+    }
 }
 
 pub struct Selector {
@@ -487,6 +514,29 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
     out
 }
 
+/// The `{` that opens a rule's block: the first one outside quotes and brackets, so
+/// `a[title="{"] { ... }` isn't cut at the brace in the attribute value.
+fn find_block_open(s: &str) -> Option<usize> {
+    let (mut depth, mut quote) = (0i32, None::<char>);
+    for (i, c) in s.char_indices() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '[' | '(' => depth += 1,
+                ']' | ')' => depth = (depth - 1).max(0),
+                '{' if depth == 0 => return Some(i),
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
 /// `an+b` as written in `:nth-child(...)`: `odd`, `even`, `3`, `2n+1`, `-n+3`, `n`.
 fn parse_nth(arg: &str) -> Option<(i64, i64)> {
     let s: String = arg.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
@@ -517,7 +567,7 @@ fn parse_attr(inner: &str) -> Option<AttrSel> {
     }
     let rest = inner[name_end..].trim_start();
     if rest.is_empty() {
-        return Some(AttrSel { name, op: AttrOp::Exists, value: String::new(), ignore_case: false });
+        return Some(AttrSel { name, op: AttrOp::Exists, value: String::new(), case: CaseMode::Default });
     }
     let (op, len) = if rest.starts_with('=') {
         (AttrOp::Equals, 1)
@@ -548,12 +598,13 @@ fn parse_attr(inner: &str) -> Option<AttrSel> {
             (&rest[..end], &rest[end..])
         }
     };
-    let ignore_case = match tail.trim().to_ascii_lowercase().as_str() {
-        "" | "s" => false,
-        "i" => true,
+    let case = match tail.trim().to_ascii_lowercase().as_str() {
+        "" => CaseMode::Default,
+        "i" => CaseMode::Insensitive,
+        "s" => CaseMode::Sensitive,
         _ => return None,
     };
-    Some(AttrSel { name, op, value: value.to_string(), ignore_case })
+    Some(AttrSel { name, op, value: value.to_string(), case })
 }
 
 /// Turn `:name` or `:name(arg)` into pseudo-classes on `c`, or `None` if unsupported.
@@ -562,10 +613,10 @@ fn add_pseudo(c: &mut Compound, name: &str, arg: Option<&str>) -> Option<()> {
     match (name, arg) {
         ("first-child", None) => c.pseudos.push(nth(0, 1, false, false)),
         ("last-child", None) => c.pseudos.push(nth(0, 1, true, false)),
-        ("only-child", None) => c.pseudos.extend([nth(0, 1, false, false), nth(0, 1, true, false)]),
+        ("only-child", None) => c.pseudos.push(Pseudo::Only { of_type: false }),
         ("first-of-type", None) => c.pseudos.push(nth(0, 1, false, true)),
         ("last-of-type", None) => c.pseudos.push(nth(0, 1, true, true)),
-        ("only-of-type", None) => c.pseudos.extend([nth(0, 1, false, true), nth(0, 1, true, true)]),
+        ("only-of-type", None) => c.pseudos.push(Pseudo::Only { of_type: true }),
         ("nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type", Some(arg)) => {
             let (a, b) = parse_nth(arg)?;
             c.pseudos.push(nth(a, b, name.contains("last"), name.contains("of-type")));
@@ -574,12 +625,14 @@ fn add_pseudo(c: &mut Compound, name: &str, arg: Option<&str>) -> Option<()> {
         ("link" | "any-link", None) => c.pseudos.push(Pseudo::Link),
         ("root", None) => c.pseudos.push(Pseudo::Root),
         ("not", Some(arg)) => {
-            let args: Option<Vec<Compound>> = split_top_level_commas(arg).into_iter().map(|a| parse_compound(a.trim())).collect();
-            let args = args?;
-            // `:not()` and `:not(,)` select nothing useful: an empty argument is invalid
-            let empty = |a: &Compound| a.tag.is_none() && a.id.is_none() && a.classes.is_empty() && a.attrs.is_empty() && a.pseudos.is_empty();
-            if args.is_empty() || args.iter().any(|a| empty(a) && !arg.contains('*')) {
-                return None;
+            let mut args = vec![];
+            for piece in split_top_level_commas(arg) {
+                let compound = parse_compound(piece.trim())?;
+                // an empty argument (`:not()`, `:not(a,)`) is invalid; only a lone `*` is empty on purpose
+                if compound.is_empty() && piece.trim() != "*" {
+                    return None;
+                }
+                args.push(compound);
             }
             c.pseudos.push(Pseudo::Not(args));
         }
@@ -725,12 +778,13 @@ fn element_children(dom: &Dom, parent: NodeId) -> impl Iterator<Item = NodeId> +
     dom.nodes[parent].children.iter().copied().filter(|&n| is_element(dom, n))
 }
 
-/// Does position `pos` (1-based) fit `an+b` for some n >= 0?
+/// Does position `pos` (1-based) fit `an+b` for some n >= 0? (Computed in i128 so
+/// extreme values in a stylesheet can't overflow.)
 fn nth_fits(a: i64, b: i64, pos: i64) -> bool {
     if a == 0 {
         return pos == b;
     }
-    let d = pos - b;
+    let (a, d) = (a as i128, pos as i128 - b as i128);
     d % a == 0 && d / a >= 0
 }
 
@@ -739,7 +793,12 @@ fn attr_matches(sel: &AttrSel, attrs: &std::collections::HashMap<String, String>
     if sel.op == AttrOp::Exists {
         return true;
     }
-    let (have, want) = if sel.ignore_case { (have.to_lowercase(), sel.value.to_lowercase()) } else { (have.clone(), sel.value.clone()) };
+    let ignore_case = match sel.case {
+        CaseMode::Insensitive => true,
+        CaseMode::Sensitive => false,
+        CaseMode::Default => CASE_INSENSITIVE_ATTRS.contains(&sel.name.as_str()),
+    };
+    let (have, want) = if ignore_case { (have.to_lowercase(), sel.value.to_lowercase()) } else { (have.clone(), sel.value.clone()) };
     match sel.op {
         AttrOp::Exists => true,
         AttrOp::Equals => have == want,
@@ -759,6 +818,10 @@ fn pseudo_matches(p: &Pseudo, dom: &Dom, id: NodeId, tag: &str, attrs: &std::col
             let Some(index) = same.iter().position(|&n| n == id) else { return false };
             let pos = if *from_end { same.len() - index } else { index + 1 };
             nth_fits(*a, *b, pos as i64)
+        }
+        Pseudo::Only { of_type } => {
+            let Some(parent) = dom.nodes[id].parent else { return false };
+            element_children(dom, parent).filter(|&n| !*of_type || dom.tag(n) == Some(tag)).count() == 1
         }
         Pseudo::Link => matches!(tag, "a" | "area") && attrs.contains_key("href"),
         Pseudo::Root => dom.nodes[id].parent.is_none_or(|p| !is_element(dom, p)),
@@ -908,7 +971,7 @@ pub fn parse_stylesheet_origin(text: &str, rules: &mut Vec<Rule>, ua: bool) {
     let mut i = 0;
     while i < text.len() {
         let rest = &text[i..];
-        let Some(brace) = rest.find('{') else { break };
+        let Some(brace) = find_block_open(rest) else { break };
         if rest.trim_start().starts_with('@') {
             // at-rules (@media, @font-face, @import ...) are skipped wholesale
             let semi = rest.find(';');
@@ -999,10 +1062,12 @@ mod tests {
         for s in [
             "a:hover", "a:focus", "a:active", "a:visited", "input:checked", "::before", "a::after", "p:first-line",
             "a:made-up", ".", "#", "a[href", "a[=x]", "a[href=]", "a[href='x]", "a[href!=x]", "a:nth-child()", "a:nth-child(foo)",
-            "a:nth-child", "a:first-child(2)", "a:not()", "a:not(:hover)", "a:link(x)",
+            "a:nth-child", "a:first-child(2)", "a:not()", "a:not(:hover)", "a:link(x)", "a:not(*, )", "a:not(, *)", "a:not(,)",
+            "a[type=x z]", "a[type=x s i]",
         ] {
             assert!(parse_selector(s).is_none(), "{s} should be rejected");
         }
+        assert!(parse_selector("a:not(*)").is_some(), "a lone * is a valid (if useless) argument");
     }
 
     #[test]
@@ -1037,14 +1102,31 @@ mod tests {
             assert!(matches_sel(&dom, a, yes), "{yes}");
         }
         for no in [
-            "[src]", "[href='x']", "[href^='http://']", "[href$='.pdf']", "[href*='nope']", "[lang|=e]", "[lang|=GB]", "[data-k~='alp']",
-            "[data-k~='alpha beta']", "[data-k~='']", "[href^='']", "[href$='']", "[href*='']",
+            "[src]", "[href='x']", "[href^='http://']", "[href$='.pdf']", "[href*='nope']", "[lang|=e]", "[data-k~='alp']",
+            "[data-k~='alpha beta']", "[data-k~='']", "[href^='']", "[href$='']", "[href*='']", "[data-k=ALPHA]",
         ] {
             assert!(!matches_sel(&dom, a, no), "{no}");
         }
         assert_eq!(parse_selector("a[href]").unwrap().specificity(), (0, 1, 1), "an attribute counts like a class");
         let input = find(&dom, "input", 0);
         assert!(matches_sel(&dom, input, "input[disabled]"), "valueless attributes exist");
+    }
+
+    #[test]
+    fn keyword_attributes_ignore_case_like_html_does() {
+        // `[type=text]` used to miss <input type=TEXT>; browsers match it
+        let dom = html::parse("<input type=TEXT name=Q><a href=x lang=EN-gb rel='NoFollow External'>t</a>");
+        let (input, a) = (find(&dom, "input", 0), find(&dom, "a", 0));
+        for yes in ["input[type=text]", "input[type='text']", "[type^=TE]", "[type=TEXT s]", "[type=text i]", "[name=Q]"] {
+            assert!(matches_sel(&dom, input, yes), "{yes}");
+        }
+        for yes in ["a[lang|=en]", "a[rel~=nofollow]", "a[rel~=EXTERNAL]"] {
+            assert!(matches_sel(&dom, a, yes), "{yes}");
+        }
+        // attributes whose values are free text stay case-sensitive, and `s` forces it everywhere
+        assert!(!matches_sel(&dom, input, "[name=q]"));
+        assert!(!matches_sel(&dom, input, "[type=text s]"));
+        assert!(matches_sel(&dom, input, "[name=q i]"));
     }
 
     #[test]
@@ -1076,6 +1158,39 @@ mod tests {
         assert!(matches_sel(&dom3, find(&dom3, "b", 0), "b:only-child") && !matches_sel(&dom3, find(&dom3, "b", 1), "b:only-child"));
         // a pseudo-class counts like a class for specificity
         assert_eq!(parse_selector("li:first-child").unwrap().specificity(), (0, 1, 1));
+    }
+
+    #[test]
+    fn only_child_counts_as_one_pseudo_class_for_specificity() {
+        // it used to be stored as first-child + last-child and counted twice, outranking `.x`
+        assert_eq!(parse_selector(":only-child").unwrap().specificity(), (0, 1, 0));
+        assert_eq!(parse_selector("a:only-of-type").unwrap().specificity(), (0, 1, 1));
+        let mut rules = vec![];
+        parse_stylesheet("li:only-child { color: red } li.x { color: blue }", &mut rules);
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].selector.specificity(), rules[1].selector.specificity(), "equal, so the later rule wins");
+    }
+
+    #[test]
+    fn extreme_nth_arguments_cannot_overflow() {
+        // `pos - b` overflowed for b = i64::MIN and panicked in debug builds
+        let dom = html::parse("<ul><li>a</li><li>b</li></ul>");
+        let li = find(&dom, "li", 0);
+        for s in [
+            "li:nth-child(n-9223372036854775808)", "li:nth-child(-n-9223372036854775808)", "li:nth-child(-9223372036854775808)",
+            "li:nth-child(9223372036854775807n+9223372036854775807)", "li:nth-last-child(-9223372036854775808n+1)",
+            "li:nth-child(-9223372036854775807n-9223372036854775808)",
+        ] {
+            if let Some(sel) = parse_selector(s) {
+                let _ = selector_matches(&dom, li, &sel);
+            }
+        }
+        // the arithmetic itself, at the edges
+        assert!(nth_fits(1, i64::MIN, 1), "every position is >= a huge negative offset");
+        assert!(!nth_fits(-1, i64::MIN, 1), "but a negative step can't reach it");
+        assert!(!nth_fits(i64::MIN, 1, 5));
+        assert!(nth_fits(2, 1, 5) && !nth_fits(2, 1, 4) && nth_fits(-1, 3, 2) && !nth_fits(-1, 3, 4));
+        assert!(nth_fits(0, 7, 7) && !nth_fits(0, 7, 6));
     }
 
     #[test]
@@ -1139,6 +1254,29 @@ mod tests {
         let hits = |i: usize| rules.iter().filter(|r| selector_matches(&dom, i, &r.selector)).count();
         assert_eq!(hits(find(&dom, "p", 0)), 1);
         assert_eq!(hits(find(&dom, "p", 1)), 0, ":not(.a, .b) excludes it");
+    }
+
+    #[test]
+    fn a_brace_inside_an_attribute_selector_does_not_swallow_the_stylesheet() {
+        // the block's `{` was searched for naively, found the one inside the quotes, and the
+        // rest of the stylesheet (every later rule) was lost
+        let mut rules = vec![];
+        parse_stylesheet("a[title=\"{\"] { color:red } p { color:blue } div { color:green }", &mut rules);
+        assert_eq!(rules.len(), 3, "the quoted brace rule and both rules after it");
+        let mut rules = vec![];
+        parse_stylesheet("a[title='}{'] { color:red } p { color:blue }", &mut rules);
+        assert_eq!(rules.len(), 2);
+        let mut rules = vec![];
+        parse_stylesheet("a[href$=';'], b[x='{'] { color:red } i { color:blue }", &mut rules);
+        assert_eq!(rules.len(), 3);
+        // an at-rule is still skipped as a unit
+        let mut rules = vec![];
+        parse_stylesheet("@media (min-width: 1px) { p { color: red } } b { color: blue }", &mut rules);
+        assert_eq!(rules.len(), 1);
+        // an unterminated bracket or quote can't hang or panic
+        for s in ["a[ { color:red } p { color:blue }", "a[title=\"{ { color:red } p { color:blue }", "p:not( { color:red }"] {
+            parse_stylesheet(s, &mut vec![]);
+        }
     }
 
     #[test]

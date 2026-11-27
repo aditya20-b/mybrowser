@@ -1,6 +1,7 @@
 //! Stage 5: display list -> pixels. A tiny software rasterizer.
 use crate::chrome::{self, ChromeView};
 use crate::css::Color;
+use crate::find::Find;
 use crate::fonts::{invisible, Face, Family, Fonts};
 use crate::layout::{Item, Layout};
 use crate::tabbar::{self, StripView};
@@ -20,6 +21,8 @@ const ICON_DISABLED: Color = Color { r: 0xb0, g: 0xb4, b: 0xb8 };
 const ERROR_TEXT: Color = Color { r: 0xc5, g: 0x22, b: 0x1f };
 const STRIP_BG: Color = Color { r: 0xde, g: 0xe1, b: 0xe6 };
 const TAB_INACTIVE: Color = Color { r: 0xd2, g: 0xd5, b: 0xda };
+const FIND_MATCH: Color = Color { r: 0xff, g: 0xeb, b: 0x3b };
+const FIND_CURRENT: Color = Color { r: 0xff, g: 0x98, b: 0x00 };
 
 #[derive(Default)]
 pub struct Painter {
@@ -137,6 +140,57 @@ impl Painter {
                 }
             }
             pen += m.advance_width;
+        }
+    }
+
+    /// Draw the find-in-page overlay on an already painted page: every match
+    /// tinted yellow (the selected one orange), and a small search box at the top
+    /// right showing the query and "n of m". `scroll` is the page's scroll offset.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_find(&mut self, buf: &mut [u32], w: usize, h: usize, fonts: &Fonts, scale: f32, scroll: f32, find: &Find) {
+        let scale = sane_scale(scale);
+        let px = |v: f32| (v * scale).round() as i32;
+        let line = scale.round().max(1.0) as i32;
+        let face = Face { family: Family::Sans, bold: false, italic: false };
+
+        // match highlights: a translucent tint, so the text stays readable underneath
+        let current = find.current_index();
+        for (i, m) in find.matches().iter().enumerate() {
+            let (top, bottom) = (m.baseline - m.size * 0.85 - scroll, m.baseline + m.size * 0.25 - scroll);
+            if bottom < 0.0 || top * scale > h as f32 {
+                continue;
+            }
+            let (x0, x1) = (px(m.x), px(m.x + m.w));
+            let (color, alpha) = if current == Some(i) { (FIND_CURRENT, 150) } else { (FIND_MATCH, 110) };
+            tint_rect(buf, w, h, x0, px(top), x1.max(x0.saturating_add(1)), px(bottom), color, alpha);
+        }
+
+        // the search box
+        let (bw, bh) = (px(300.0), px(32.0));
+        let x0 = (w as i32 - bw - px(14.0)).max(0);
+        let y0 = px(8.0);
+        fill_rect(buf, w, h, x0, y0, x0 + bw, y0 + bh, FIELD_FOCUS);
+        fill_rect(buf, w, h, x0 + line, y0 + line, x0 + bw - line, y0 + bh - line, Color::WHITE);
+        let size = 13.0 * scale;
+        let baseline = (y0 + bh / 2) as f32 + size * 0.35;
+        let text_x = (x0 + px(10.0)) as f32;
+        let label = if find.query().is_empty() {
+            String::new()
+        } else if let Some(i) = current {
+            format!("{} of {}", i + 1, find.matches().len())
+        } else {
+            "No results".to_string()
+        };
+        let label_w = fonts.measure(face, size, &label);
+        let avail = bw as f32 - px(20.0) as f32 - label_w - px(8.0) as f32;
+        let shown = fit_text(fonts, face, size, find.query(), avail);
+        let ink = Color { r: 0x20, g: 0x21, b: 0x24 };
+        self.draw_text(buf, w, h, fonts, face, size, text_x, baseline, &shown, ink);
+        let caret_x = (text_x + fonts.measure(face, size, &shown)) as i32;
+        fill_rect(buf, w, h, caret_x, y0 + px(7.0), caret_x + line, y0 + bh - px(7.0), ink);
+        if !label.is_empty() {
+            let lc = if current.is_some() { ICON_DISABLED } else { ERROR_TEXT };
+            self.draw_text(buf, w, h, fonts, face, size, (x0 + bw) as f32 - px(10.0) as f32 - label_w, baseline, &label, lc);
         }
     }
 
@@ -289,6 +343,21 @@ fn fill_rect(buf: &mut [u32], w: usize, h: usize, x0: i32, y0: i32, x1: i32, y1:
     let c = color.to_u32();
     for y in y0..y1 {
         buf[y as usize * w + x0 as usize..y as usize * w + x1 as usize].fill(c);
+    }
+}
+
+/// Like `fill_rect`, but blends `color` over what is already there (`alpha` of 255).
+#[allow(clippy::too_many_arguments)]
+fn tint_rect(buf: &mut [u32], w: usize, h: usize, x0: i32, y0: i32, x1: i32, y1: i32, color: Color, alpha: u32) {
+    let (x0, x1) = (x0.clamp(0, w as i32), x1.clamp(0, w as i32));
+    let (y0, y1) = (y0.clamp(0, h as i32), y1.clamp(0, h as i32));
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    for y in y0..y1 {
+        for p in &mut buf[y as usize * w + x0 as usize..y as usize * w + x1 as usize] {
+            *p = blend(*p, color, alpha);
+        }
     }
 }
 
@@ -478,5 +547,69 @@ mod tests {
             }
         }
         paint_strip(&["a", "b"], 9, 200, 40, 1.0); // an out-of-range active index
+    }
+
+    fn find_for(src: &str, query: &str) -> (Page, Find, Fonts) {
+        let fonts = Fonts::load();
+        let mut page = Page::from_source(&page_url(), src);
+        page.relayout(&fonts, 400.0);
+        let mut find = Find::new();
+        find.type_text(query);
+        find.search(&page.layout, &fonts);
+        (page, find, fonts)
+    }
+
+    #[test]
+    fn find_highlights_matches_and_marks_the_selected_one() {
+        let (page, mut find, fonts) = find_for("<style>body{margin:0}</style><p style='margin:0'>cat dog cat</p>", "cat");
+        let (w, h) = (400usize, 120usize);
+        let mut plain = vec![0u32; w * h];
+        let mut painter = Painter::default();
+        painter.paint(&mut plain, w, h, &page.layout, &fonts, 0.0, 1.0);
+        let mut marked = plain.clone();
+        painter.paint_find(&mut marked, w, h, &fonts, 1.0, 0.0, &find);
+        let m = find.matches().to_vec();
+        assert_eq!(m.len(), 2);
+        // a background pixel inside each match changes colour: yellowish for one, orange for the selected one
+        let probe = |m: &crate::find::Match| ((m.baseline - m.size * 0.8) as usize) * w + (m.x + 1.0) as usize;
+        let (first, second) = (marked[probe(&m[0])], marked[probe(&m[1])]);
+        assert_ne!(first, plain[probe(&m[0])], "the match is tinted");
+        assert_ne!(second, plain[probe(&m[1])]);
+        assert_ne!(first, second, "the selected match looks different from the others");
+        // selecting the other one swaps them
+        find.next();
+        let mut swapped = plain.clone();
+        painter.paint_find(&mut swapped, w, h, &fonts, 1.0, 0.0, &find);
+        assert_eq!((swapped[probe(&m[0])], swapped[probe(&m[1])]), (second, first));
+        // text between the matches is untouched
+        let gap = (m[0].baseline as usize - 3) * w + (m[0].x + m[0].w + 3.0) as usize;
+        assert_eq!(marked[gap], plain[gap]);
+        // the search box is drawn at the top right: its blue border sits on the 9th row from the box's left edge
+        let (box_x, box_y) = (w - 14 - 300, 8);
+        assert_eq!(marked[box_y * w + box_x + 5], FIND_BOX_BORDER_FOR_TEST.to_u32());
+        assert_eq!(plain[box_y * w + box_x + 5], 0xFFFFFF, "and it wasn't there before");
+    }
+
+    /// The colour the find box's border is drawn in (the focus blue).
+    const FIND_BOX_BORDER_FOR_TEST: Color = FIELD_FOCUS;
+
+    #[test]
+    fn find_overlay_survives_odd_sizes_scales_scrolls_and_queries() {
+        let fonts = Fonts::load();
+        let mut page = Page::from_source(&page_url(), &format!("<p>{}</p>", "needle ".repeat(500)));
+        page.relayout(&fonts, 300.0);
+        for query in ["", "needle", "zzz", &"é日本".repeat(60)] {
+            let mut find = Find::new();
+            find.type_text(query);
+            find.search(&page.layout, &fonts);
+            for (w, h) in [(1, 1), (10, 5), (100, 40), (400, 300)] {
+                for scale in [0.0, f32::NAN, 0.5, 1.0, 2.0] {
+                    for scroll in [0.0, 100.0, 1e9, -50.0, f32::NAN] {
+                        let mut buf = vec![0u32; w * h];
+                        Painter::default().paint_find(&mut buf, w, h, &fonts, scale, scroll, &find);
+                    }
+                }
+            }
+        }
     }
 }

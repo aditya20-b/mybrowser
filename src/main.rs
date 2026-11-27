@@ -2,6 +2,7 @@ mod chrome;
 mod cookies;
 mod css;
 mod dom;
+mod find;
 mod fonts;
 mod forms;
 mod html;
@@ -16,6 +17,7 @@ mod tabbar;
 
 use chrome::{AddressBar, ChromeView, Hit};
 use dom::NodeId;
+use find::Find;
 use fonts::Fonts;
 use forms::{ControlKind, FormState};
 use page::Page;
@@ -170,6 +172,8 @@ struct App {
     active: usize,
     next_tab_id: u64,
     bar: AddressBar,
+    /// Find-in-page, while its box is open (it belongs to the active tab's page).
+    find: Option<Find>,
     cwd: std::path::PathBuf,
     notify: Notify,
     cursor: (f32, f32), // physical pixels
@@ -190,7 +194,7 @@ impl App {
         let first = Tab::new(0, start, None, notify.clone());
         let bar = AddressBar::new(&first.address());
         App {
-            fonts, painter: Painter::default(), tabs: vec![first], active: 0, next_tab_id: 1, bar, cwd, notify,
+            fonts, painter: Painter::default(), tabs: vec![first], active: 0, next_tab_id: 1, bar, find: None, cwd, notify,
             cursor: (0.0, 0.0), hover: None, modifiers: ModifiersState::empty(), window: None, surface: None,
         }
     }
@@ -292,6 +296,93 @@ impl App {
         self.request_redraw();
     }
 
+    // ---------- find in page ----------
+
+    /// Open the find box (Cmd+F), taking keyboard focus from the address bar.
+    fn open_find(&mut self) {
+        if self.find.is_none() {
+            self.find = Some(Find::new());
+        }
+        let address = self.tab().address();
+        self.bar.show(&address); // leave address editing
+        self.request_redraw();
+    }
+
+    fn close_find(&mut self) {
+        if self.find.take().is_some() {
+            self.request_redraw();
+        }
+    }
+
+    /// Scroll so the selected match is in view.
+    fn scroll_to_find(&mut self) {
+        let view = self.view_height();
+        if let Some(target) = self.find.as_ref().and_then(|f| f.scroll_for_current(view)) {
+            self.tab_mut().scroll = target;
+            self.clamp_scroll();
+            self.update_hover();
+        }
+        self.request_redraw();
+    }
+
+    /// The query changed: search again from the first match and show it.
+    fn find_query_changed(&mut self) {
+        if let Some(find) = self.find.as_mut() {
+            find.search(&self.tabs[self.active].page.layout, &self.fonts);
+        }
+        self.scroll_to_find();
+    }
+
+    fn find_step(&mut self, forward: bool) {
+        if let Some(find) = self.find.as_mut() {
+            if forward { find.next() } else { find.prev() }
+        }
+        self.scroll_to_find();
+    }
+
+    /// A key while the find box is open. Returns true if it was used.
+    fn find_key(&mut self, event: &KeyEvent, cmd: bool) -> bool {
+        if self.find.is_none() {
+            return false;
+        }
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.close_find();
+                true
+            }
+            Key::Named(NamedKey::Enter) => {
+                let forward = !self.modifiers.shift_key();
+                self.find_step(forward);
+                true
+            }
+            Key::Named(NamedKey::Backspace) if !cmd => {
+                if let Some(f) = self.find.as_mut() {
+                    f.backspace();
+                }
+                self.find_query_changed();
+                true
+            }
+            Key::Character(c) if cmd && c.eq_ignore_ascii_case("v") => {
+                if let (Some(text), Some(f)) = (chrome::clipboard_get(), self.find.as_mut()) {
+                    f.type_text(&text);
+                }
+                self.find_query_changed();
+                true
+            }
+            _ if !cmd => match &event.text {
+                Some(text) if !text.is_empty() => {
+                    if let Some(f) = self.find.as_mut() {
+                        f.type_text(text.as_str());
+                    }
+                    self.find_query_changed();
+                    true
+                }
+                _ => false, // arrows, Page Down and the like still scroll the page
+            },
+            _ => false,
+        }
+    }
+
     // ---------- tabs ----------
 
     /// Open a tab (loading `url`, or empty) and switch to it.
@@ -309,6 +400,7 @@ impl App {
         };
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
+        self.find = None;
         self.sync_chrome();
         if blank {
             self.bar.focus(); // ready to type an address
@@ -330,6 +422,7 @@ impl App {
             self.tabs.remove(index);
             self.active = tabbar::active_after_close(self.active, index, self.tabs.len());
         }
+        self.find = None;
         self.sync_chrome();
         self.update_hover();
     }
@@ -337,6 +430,7 @@ impl App {
     fn switch_tab(&mut self, index: usize) {
         if index < self.tabs.len() && index != self.active {
             self.active = index;
+            self.find = None;
             self.sync_chrome();
             self.update_hover();
         }
@@ -377,6 +471,7 @@ impl App {
             return; // superseded or cancelled
         }
         if index == self.active {
+            self.find = None; // it was searching the old page
             self.sync_chrome();
             self.update_hover();
         } else {
@@ -601,7 +696,7 @@ impl App {
         }
     }
 
-    /// Shortcuts that work wherever the focus is: new tab, close tab, switch tab.
+    /// Shortcuts that work wherever the focus is: new tab, close tab, switch tab, find.
     /// Returns true if the key was one of them.
     fn tab_shortcut(&mut self, event: &KeyEvent, cmd: bool) -> bool {
         match &event.logical_key {
@@ -619,6 +714,15 @@ impl App {
                 }
                 "w" => {
                     self.close_tab(self.active);
+                    true
+                }
+                "f" => {
+                    self.open_find();
+                    true
+                }
+                "g" if self.find.is_some() => {
+                    let forward = !self.modifiers.shift_key();
+                    self.find_step(forward);
                     true
                 }
                 d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && d != "0" => {
@@ -641,6 +745,10 @@ impl App {
         }
         if self.bar.is_focused() {
             self.address_key(event, cmd);
+            self.request_redraw();
+            return;
+        }
+        if self.find_key(event, cmd) {
             self.request_redraw();
             return;
         }
@@ -691,11 +799,19 @@ impl App {
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
         let scale = self.scale();
         let logical_w = size.width as f32 / scale;
-        {
+        let relaid = {
             let tab = &mut self.tabs[self.active];
-            if (logical_w - tab.laid_out_width).abs() > 0.5 {
+            let needed = (logical_w - tab.laid_out_width).abs() > 0.5;
+            if needed {
                 tab.page.relayout(&self.fonts, logical_w);
                 tab.laid_out_width = logical_w;
+            }
+            needed
+        };
+        // a different layout means the matches moved
+        if relaid {
+            if let Some(find) = self.find.as_mut() {
+                find.refresh(&self.tabs[self.active].page.layout, &self.fonts);
             }
         }
         // The page height or the window height may have changed (resize, reload,
@@ -714,8 +830,12 @@ impl App {
         surface.resize(w, h).unwrap();
         let mut buffer = surface.buffer_mut().unwrap();
         let pixels: &mut [u32] = &mut buffer;
-        // The page goes in the rows below the chrome; then the toolbar, then the tab strip on top.
+        // The page goes in the rows below the chrome (with the find overlay on top of it);
+        // then the toolbar, then the tab strip.
         self.painter.paint(&mut pixels[top * w_px..], w_px, h_px - top, &tab.page.layout, &self.fonts, tab.scroll, scale);
+        if let Some(find) = &self.find {
+            self.painter.paint_find(&mut pixels[top * w_px..], w_px, h_px - top, &self.fonts, scale, tab.scroll, find);
+        }
         let view = ChromeView {
             bar: &self.bar,
             can_back: tab.history.back_target().is_some(),

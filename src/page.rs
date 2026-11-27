@@ -216,7 +216,7 @@ impl Page {
                 }
                 None => Page::error(
                     &f.url,
-                    &format!("Cannot decode this {} image (it may be damaged, or a format we can't show yet: PNG, JPEG and GIF work)", f.content_type),
+                    &format!("Cannot decode this {} image (it may be damaged, or a format we can't show yet: PNG, JPEG, GIF and WebP work)", f.content_type),
                 ),
             },
             other => Page::error(&f.url, &format!("Cannot display content of type '{other}' (downloads aren't supported yet)")),
@@ -584,6 +584,13 @@ mod tests {
         out
     }
 
+    fn webp_bytes(w: u32, h: u32) -> Vec<u8> {
+        let mut out = vec![];
+        let px: Vec<u8> = (0..w * h).flat_map(|_| [20u8, 90, 200]).collect();
+        image_webp::WebPEncoder::new(&mut out).encode(&px, w, h, image_webp::ColorType::Rgb8).unwrap();
+        out
+    }
+
     /// A fresh temp dir containing `a.png` (solid red, w x h).
     fn temp_dir_with_png(name: &str, w: u32, h: u32) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mybrowser-test-{}-{name}", std::process::id()));
@@ -636,18 +643,22 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_and_gif_images_render_inline() {
+    fn jpeg_gif_and_webp_images_render_inline() {
         let dir = temp_dir_with_png("formats", 4, 4);
         std::fs::write(dir.join("photo.jpg"), jpeg_bytes(24, 12)).unwrap();
         std::fs::write(dir.join("anim.gif"), gif_bytes(10, 6)).unwrap();
+        std::fs::write(dir.join("pic.webp"), webp_bytes(14, 9)).unwrap();
         // the file name says nothing about the format: it is sniffed from the bytes
         std::fs::write(dir.join("really-a-jpeg.png"), jpeg_bytes(8, 8)).unwrap();
-        let p = render_in(&dir, "<img src=photo.jpg><img src=anim.gif><img src=really-a-jpeg.png>", 400.0);
+        let p = render_in(&dir, "<img src=photo.jpg><img src=anim.gif><img src=really-a-jpeg.png><img src=pic.webp>", 400.0);
         let sizes: Vec<(f32, f32)> = images_of(&p).iter().map(|i| (i.2, i.3)).collect();
-        assert_eq!(sizes, [(24.0, 12.0), (10.0, 6.0), (8.0, 8.0)]);
+        assert_eq!(sizes, [(24.0, 12.0), (10.0, 6.0), (8.0, 8.0), (14.0, 9.0)]);
         // and an image document shows them too, with the size in the title
         let page = Page::load(&url_of(&dir.join("photo.jpg")));
         assert_eq!(page.title, "photo.jpg (24×12)");
+        assert_eq!(page.images.len(), 1);
+        let page = Page::load(&url_of(&dir.join("pic.webp")));
+        assert_eq!(page.title, "pic.webp (14×9)");
         assert_eq!(page.images.len(), 1);
         // a corrupt one still falls back to its alt text, and the error says what works
         std::fs::write(dir.join("broken.jpg"), b"\xFF\xD8\xFFthis is not a jpeg").unwrap();
@@ -656,7 +667,7 @@ mod tests {
         assert!(p.layout.items.iter().any(|i| matches!(i, Item::Text { text, .. } if text == "[oops]")));
         let doc = Page::load(&url_of(&dir.join("broken.jpg")));
         assert_eq!(doc.title, "Error");
-        assert!(doc.dom.text_content(0).contains("PNG, JPEG and GIF"), "{}", doc.dom.text_content(0));
+        assert!(doc.dom.text_content(0).contains("PNG, JPEG, GIF and WebP work"), "{}", doc.dom.text_content(0));
     }
 
     #[test]
@@ -860,15 +871,16 @@ mod tests {
 
     #[test]
     fn a_page_over_http_loads_its_stylesheet_and_image_from_the_network() {
-        let html = "<!doctype html><title>Net page</title><link rel=stylesheet href=/s.css><body style='margin:0'><div id=a></div><img src='/pic.png'><img src='/photo.jpg'>";
+        let html = "<!doctype html><title>Net page</title><link rel=stylesheet href=/s.css><body style='margin:0'><div id=a></div><img src='/pic.png'><img src='/photo.jpg'><img src='/p.webp'>";
         let (port, server) = serve_routes(
             vec![
                 ("/index.html", "text/html; charset=utf-8", html.as_bytes().to_vec()),
                 ("/s.css", "text/css", b"#a { height: 11px; background: red }".to_vec()),
                 ("/pic.png", "image/png", png_bytes(20, 10)),
                 ("/photo.jpg", "image/jpeg", jpeg_bytes(16, 16)),
+                ("/p.webp", "image/webp", webp_bytes(12, 12)),
             ],
-            4,
+            5,
         );
         let fonts = Fonts::load();
         let mut p = Page::load(&Url::parse(&format!("http://127.0.0.1:{port}/index.html")).unwrap());
@@ -878,6 +890,7 @@ mod tests {
         assert_eq!(rects(&p)[0].3, 11.0, "stylesheet from the network applied");
         assert_eq!(images_of(&p)[0].2, 20.0, "PNG from the network decoded");
         assert_eq!(images_of(&p)[1].2, 16.0, "JPEG from the network decoded");
+        assert_eq!(images_of(&p)[2].2, 12.0, "WebP from the network decoded");
     }
 
     #[test]

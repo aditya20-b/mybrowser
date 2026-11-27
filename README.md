@@ -64,7 +64,7 @@ One heads-up: fonts are loaded from the macOS system font folder (see `src/fonts
 
 **Layout.** Block and inline flow, lists, `<pre>`, and **tables**: column widths from min and max content, percentage and fixed widths, `colspan` and `rowspan`, captions, row and cell backgrounds that stretch to the row, vertical alignment, nested tables, and the legacy attributes older pages rely on (`border`, `cellpadding`, `cellspacing`, `bgcolor`, `align`, `valign`, `<font>`).
 
-**Text and images.** Text wraps using real glyph widths with alignment, bold, italic, monospace, underlines, highlights and clickable links. Characters missing from the main fonts (arrows, CJK) fall back to a wide-coverage font. PNG, JPEG (including CMYK), GIF and WebP (lossy, lossless and with transparency) images flow inline with the text, scaled with bilinear filtering, with alt text as the fallback. The format is recognised from the bytes (a JPEG named `.png` still works), a GIF or an animated WebP shows its first frame, and every decoder checks the size a file claims before allocating, so a tiny file can't demand gigabytes.
+**Text and images.** Text wraps using real glyph widths with alignment, bold, italic, monospace, underlines, highlights and clickable links. Characters missing from the main fonts (arrows, CJK) fall back to a wide-coverage font. PNG, JPEG (including CMYK), GIF and WebP (lossy, lossless and with transparency) images flow inline with the text, scaled with bilinear filtering, with alt text as the fallback. The format is recognised from the bytes (a JPEG named `.png` still works), a GIF or an animated WebP shows its first frame, and every decoder checks the size a file claims before allocating, so a tiny file can't demand gigabytes. A decoder that crashes on a corrupt file costs that one picture, not the page.
 
 ## How it works
 
@@ -132,7 +132,7 @@ The honest list, roughly by how much it matters for a real browser:
 - **Cookies.** Nothing persists between runs, and there's no UI to see or clear them.
 - **Browser features.** No caching, bookmarks or downloads. Clicking a `#fragment` link doesn't add a history entry, so Back skips over it. A `<base>` tag inside a `<template>` is honoured, and a bad `href` on the first `<base>` doesn't stop the search for the next one.
 - **Find and anchors.** Placeholder text in empty fields (and the dots of a password field) is found by search; browsers skip them. An empty `<a name=x></a>` in the middle of a paragraph points at the top of that paragraph rather than its own line.
-- **Media.** Animated GIFs and WebPs show their first frame only; no SVG or AVIF. No fonts from the web (`@font-face`). The error page for an image it can't decode still lists only "PNG, JPEG and GIF" as supported.
+- **Media.** Animated GIFs and WebPs show their first frame only; no SVG or AVIF. No fonts from the web (`@font-face`).
 - **Text.** No shaping, so no kerning, ligatures or complex scripts, and no right-to-left text.
 - **Platform.** macOS fonts only, for now.
 

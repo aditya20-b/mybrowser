@@ -305,6 +305,8 @@ struct FlexItem {
     /// Starting size before growing or shrinking, outer width.
     basis: f32,
     grow: f32,
+    /// `flex-shrink`: 0 = this item keeps its size when the line is too full.
+    shrink: f32,
 }
 
 /// Where each item of a flex line goes: the main-axis widths, then the offset of the first
@@ -332,12 +334,14 @@ fn flex_line_sizes(items: &[&FlexItem], width: f32, gap: f32, justify: Justify) 
             *w += free * grow_sum.min(1.0) * it.grow / grow_sum;
         }
     } else if free < 0.0 {
-        let room: Vec<f32> = items.iter().map(|i| (i.basis - i.min).max(0.0)).collect();
-        let total_room: f32 = room.iter().sum();
-        if total_room > 0.0 {
+        // how much each item can give up (nothing for `flex-shrink: 0`), and how willingly
+        let room: Vec<f32> = items.iter().map(|i| if i.shrink > 0.0 { (i.basis - i.min).max(0.0) } else { 0.0 }).collect();
+        let weight: Vec<f32> = items.iter().zip(&room).map(|(i, r)| r * i.shrink).collect();
+        let (total_room, total_weight): (f32, f32) = (room.iter().sum(), weight.iter().sum());
+        if total_room > 0.0 && total_weight > 0.0 {
             let cut = (-free).min(total_room);
-            for (w, r) in widths.iter_mut().zip(&room) {
-                *w -= cut * r / total_room;
+            for ((w, r), wt) in widths.iter_mut().zip(&room).zip(&weight) {
+                *w -= (cut * wt / total_weight).min(*r);
             }
         }
     }
@@ -606,7 +610,7 @@ impl<'a> Ctx<'a> {
                 Some(b) => b.max(0.0) + extras,
                 None => max,
             };
-            items.push(FlexItem { id: c, inline, min, basis, grow: st.flex_grow });
+            items.push(FlexItem { id: c, inline, min, basis, grow: st.flex_grow, shrink: st.flex_shrink });
         }
         if items.is_empty() {
             return (y, 0.0);
@@ -2358,6 +2362,17 @@ mod tests {
     }
 
     #[test]
+    fn flex_shrink_zero_keeps_a_text_item_on_one_line() {
+        let words = "word ".repeat(40);
+        let squeezed = flex("", &format!("<div>{words}</div><div>zz</div>"));
+        let kept = flex("", &format!("<div style='flex-shrink:0'>{words}</div><div>zz</div>"));
+        let lines = |p: &Page| texts(p).iter().filter(|(t, _)| t == "word").map(|(_, b)| *b as i32).collect::<std::collections::BTreeSet<_>>().len();
+        assert!(lines(&squeezed) > 3, "the default shrinks it into several lines");
+        assert_eq!(lines(&kept), 1, "flex-shrink:0 keeps it on one line (and it overflows)");
+        assert!(at(&kept, "zz").0 > 300.0, "{:?}", at(&kept, "zz"));
+    }
+
+    #[test]
     fn flex_review_regressions() {
         // a column container keeps its first child's top margin
         let q = render_w("<div style='display:flex;flex-direction:column'><div style='margin-top:30px;height:5px;background:red'></div></div>", 300.0);
@@ -2376,7 +2391,7 @@ mod tests {
 
     #[test]
     fn flex_lines_are_sized_by_grow_shrink_and_justify() {
-        let item = |basis: f32, min: f32, grow: f32| FlexItem { id: 0, inline: None, min, basis, grow };
+        let item = |basis: f32, min: f32, grow: f32| FlexItem { id: 0, inline: None, min, basis, grow, shrink: 1.0 };
         // leftover goes to growers by weight
         let (a, b) = (item(50.0, 0.0, 1.0), item(50.0, 0.0, 3.0));
         let l = flex_line_sizes(&[&a, &b], 300.0, 0.0, Justify::Start);
@@ -2391,6 +2406,16 @@ mod tests {
         let (e, f) = (item(200.0, 0.0, 0.0), item(100.0, 0.0, 0.0));
         let l = flex_line_sizes(&[&e, &f], 150.0, 0.0, Justify::Start);
         assert!((l.widths[0] - 100.0).abs() < 0.01 && (l.widths[1] - 50.0).abs() < 0.01, "shrinks in proportion to basis: {:?}", l.widths);
+        // flex-shrink: 0 items keep their size, and bigger factors give up more
+        let keep = FlexItem { shrink: 0.0, ..item(200.0, 0.0, 0.0) };
+        let (h, k) = (item(200.0, 0.0, 0.0), item(200.0, 0.0, 0.0));
+        let l = flex_line_sizes(&[&keep, &h], 300.0, 0.0, Justify::Start);
+        assert_eq!(l.widths, [200.0, 100.0]);
+        let eager = FlexItem { shrink: 3.0, ..item(200.0, 0.0, 0.0) };
+        let l = flex_line_sizes(&[&eager, &k], 300.0, 0.0, Justify::Start);
+        assert!(l.widths[0] < l.widths[1] && (l.widths.iter().sum::<f32>() - 300.0).abs() < 0.01, "{:?}", l.widths);
+        let l = flex_line_sizes(&[&keep, &FlexItem { shrink: 0.0, ..item(200.0, 0.0, 0.0) }], 300.0, 0.0, Justify::Start);
+        assert_eq!(l.widths, [200.0, 200.0], "nothing may shrink: they overflow");
         // justify with leftover
         let g = item(50.0, 0.0, 0.0);
         let l = flex_line_sizes(&[&g, &g], 300.0, 0.0, Justify::SpaceBetween);

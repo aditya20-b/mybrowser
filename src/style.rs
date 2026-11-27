@@ -100,6 +100,8 @@ pub struct Style {
     pub gap_row: f32,
     /// `flex-grow`: this item's share of a line's leftover space.
     pub flex_grow: f32,
+    /// `flex-shrink`: how readily this item gives up width when a line is too full (0 = never).
+    pub flex_shrink: f32,
     /// `flex-basis` in px (None = auto: the item's own content width).
     pub flex_basis: Option<f32>,
 }
@@ -138,6 +140,7 @@ impl Style {
             gap_col: 0.0,
             gap_row: 0.0,
             flex_grow: 0.0,
+            flex_shrink: 1.0,
             flex_basis: None,
         }
     }
@@ -221,7 +224,8 @@ fn copy_prop(dst: &mut Style, src: &Style, name: &str) {
         "gap" => (dst.gap_col, dst.gap_row) = (src.gap_col, src.gap_row),
         "flex-grow" => dst.flex_grow = src.flex_grow,
         "flex-basis" => dst.flex_basis = src.flex_basis,
-        "flex" => (dst.flex_grow, dst.flex_basis) = (src.flex_grow, src.flex_basis),
+        "flex-shrink" => dst.flex_shrink = src.flex_shrink,
+        "flex" => (dst.flex_grow, dst.flex_shrink, dst.flex_basis) = (src.flex_grow, src.flex_shrink, src.flex_basis),
         _ => {
             if let Some(i) = name.strip_prefix("margin-").and_then(side) {
                 dst.margin[i] = src.margin[i];
@@ -285,36 +289,31 @@ fn parse_factor(t: &str) -> Option<f32> {
 }
 
 /// The `flex` shorthand: `none`, `auto`, `initial`, `<grow>`, `<grow> <shrink>`, and an optional basis.
-fn parse_flex(v: &str, fs: f32) -> Option<(f32, Option<f32>)> {
+/// Returns (grow, shrink, basis); shrink is 1 unless the value says otherwise.
+fn parse_flex(v: &str, fs: f32) -> Option<(f32, f32, Option<f32>)> {
     let lv = v.trim().to_ascii_lowercase();
     match lv.as_str() {
-        "none" | "initial" => return Some((0.0, None)),
-        "auto" => return Some((1.0, None)),
+        "none" => return Some((0.0, 0.0, None)),
+        "initial" => return Some((0.0, 1.0, None)),
+        "auto" => return Some((1.0, 1.0, None)),
         _ => {}
     }
     let tokens: Vec<&str> = lv.split_whitespace().collect();
     match tokens.len() {
         // `flex: 1` means `1 1 0%`; a lone length (`flex: 200px`) is a basis with grow 0
         1 => match tokens[0].parse::<f32>() {
-            Ok(_) => Some((parse_factor(tokens[0])?, Some(0.0))),
-            Err(_) => Some((0.0, parse_basis(tokens[0], fs)?)),
+            Ok(_) => Some((parse_factor(tokens[0])?, 1.0, Some(0.0))),
+            Err(_) => Some((0.0, 1.0, parse_basis(tokens[0], fs)?)),
         },
-        // `grow shrink` (the shrink factor is ignored) or `grow basis`
+        // `grow shrink` or `grow basis`
         2 => {
             let grow = parse_factor(tokens[0])?;
             match tokens[1].parse::<f32>() {
-                Ok(_) => {
-                    parse_factor(tokens[1])?;
-                    Some((grow, Some(0.0)))
-                }
-                Err(_) => Some((grow, parse_basis(tokens[1], fs)?)),
+                Ok(_) => Some((grow, parse_factor(tokens[1])?, Some(0.0))),
+                Err(_) => Some((grow, 1.0, parse_basis(tokens[1], fs)?)),
             }
         }
-        3 => {
-            let grow = parse_factor(tokens[0])?;
-            parse_factor(tokens[1])?;
-            Some((grow, parse_basis(tokens[2], fs)?))
-        }
+        3 => Some((parse_factor(tokens[0])?, parse_factor(tokens[1])?, parse_basis(tokens[2], fs)?)),
         _ => None,
     }
 }
@@ -437,10 +436,11 @@ fn apply(s: &mut Style, parent: &Style, d: &Declaration) {
         "column-gap" => { if let Some(Length::Px(p)) = css::parse_length(v, fs) { s.gap_col = p.clamp(0.0, 10_000.0); } }
         "row-gap" => { if let Some(Length::Px(p)) = css::parse_length(v, fs) { s.gap_row = p.clamp(0.0, 10_000.0); } }
         "flex-grow" => { if let Some(g) = parse_factor(&lv) { s.flex_grow = g.min(1000.0); } }
+        "flex-shrink" => { if let Some(g) = parse_factor(&lv) { s.flex_shrink = g.min(1000.0); } }
         "flex-basis" => { if let Some(b) = parse_basis(v, fs) { s.flex_basis = b; } }
         "flex" => {
-            if let Some((grow, basis)) = parse_flex(v, fs) {
-                (s.flex_grow, s.flex_basis) = (grow.min(1000.0), basis);
+            if let Some((grow, shrink, basis)) = parse_flex(v, fs) {
+                (s.flex_grow, s.flex_shrink, s.flex_basis) = (grow.min(1000.0), shrink.min(1000.0), basis);
             }
         }
         "color" => { if let Some(Some(c)) = css::color_value(v) { s.color = c; } }
@@ -780,6 +780,10 @@ mod tests {
         assert_eq!(item("flex: 200px"), (0.0, Some(200.0)), "a lone length is a basis");
         assert_eq!(item("flex: 1 2"), (1.0, Some(0.0)), "two numbers are grow and shrink");
         assert_eq!(item("flex: 1 50px"), (1.0, Some(50.0)), "grow and basis");
+        let shrink = |decl: &str| style_of(&format!("<p style='{decl}'>x</p>"), "p").flex_shrink;
+        assert_eq!((shrink(""), shrink("flex: 1"), shrink("flex: none"), shrink("flex: auto")), (1.0, 1.0, 0.0, 1.0));
+        assert_eq!((shrink("flex: 1 0 auto"), shrink("flex: 2 3"), shrink("flex-shrink: 0")), (0.0, 3.0, 0.0));
+        assert_eq!((shrink("flex-shrink: -1"), shrink("flex: 1 -1")), (1.0, 1.0), "nonsense is ignored");
         assert_eq!(item("flex-grow: 2.5"), (2.5, None));
         assert_eq!(item("flex-basis: 40px"), (0.0, Some(40.0)));
         assert_eq!(item("flex-grow: 2; flex-basis: auto"), (2.0, None));

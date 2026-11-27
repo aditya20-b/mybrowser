@@ -525,21 +525,19 @@ impl App {
     }
 
     fn go_back(&mut self) {
-        let before = self.tab().page.url.clone();
-        self.tab_mut().go_back();
-        self.after_history_move(before);
+        let swapped = self.tab_mut().go_back();
+        self.after_history_move(swapped);
     }
 
     fn go_forward(&mut self) {
-        let before = self.tab().page.url.clone();
-        self.tab_mut().go_forward();
-        self.after_history_move(before);
+        let swapped = self.tab_mut().go_forward();
+        self.after_history_move(swapped);
     }
 
     /// A Back or Forward may have swapped in a remembered page on the spot (no load to wait
     /// for), so a find in progress was searching the page that just went away.
-    fn after_history_move(&mut self, before: Url) {
-        if self.tab().page.url != before {
+    fn after_history_move(&mut self, swapped: bool) {
+        if swapped {
             self.find = None;
             self.update_hover();
         }

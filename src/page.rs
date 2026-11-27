@@ -49,6 +49,9 @@ pub struct Page {
     /// Set when the response was a file we can't display: this page is just a note about it,
     /// and the tab decides (it knows who asked for the load) whether to save the file.
     pub download: Option<PendingDownload>,
+    /// This is the page we built to say a load failed (it is never kept for Back: going back
+    /// should try again).
+    pub is_error: bool,
 }
 
 fn esc(s: &str) -> String {
@@ -247,14 +250,21 @@ impl Page {
     }
 
     pub fn error(url: &Url, message: &str) -> Page {
-        Page::from_source(
+        let mut page = Page::from_source(
             url,
             &format!(
                 "<title>Error</title><h1>Could not open page</h1><p><code>{}</code></p><p>{}</p>",
                 esc(&truncate_chars(url.as_str(), 300)),
                 esc(&truncate_chars(message, 500))
             ),
-        )
+        );
+        page.is_error = true;
+        page
+    }
+
+    /// Memory held by the decoded images (what a page kept for Back would cost).
+    pub fn image_bytes(&self) -> u64 {
+        self.images.values().map(|i| i.bytes()).sum()
     }
 
     fn from_fetched(f: Fetched) -> Page {
@@ -410,7 +420,7 @@ impl Page {
         }
 
         let layout = Layout { items: vec![], links: vec![], controls: vec![], anchors: vec![], height: 0.0, canvas_bg: None };
-        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None }
+        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout, download: None, is_error: false }
     }
 
     /// Re-run layout for a new viewport width (logical pixels), or after the

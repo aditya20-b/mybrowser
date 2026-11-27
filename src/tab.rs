@@ -412,14 +412,43 @@ impl Tab {
 
     pub fn go_back(&mut self) {
         if let Some(prev) = self.history.back_target().cloned() {
+            if self.same_document_move(&prev, true) {
+                return;
+            }
             self.begin_load(prev, Hist::Back, None);
         }
     }
 
     pub fn go_forward(&mut self) {
         if let Some(next) = self.history.forward_target().cloned() {
+            if self.same_document_move(&next, false) {
+                return;
+            }
             self.begin_load(next, Hist::Forward, None);
         }
+    }
+
+    /// Back / forward between two `#fragment`s of the page on screen needs no load: just
+    /// move along the history and scroll. Returns whether it did (not while a load is in flight).
+    fn same_document_move(&mut self, target: &Url, back: bool) -> bool {
+        if self.nav.pending().is_some() || strip_fragment(target) != strip_fragment(&self.page.url) {
+            return false;
+        }
+        let here = std::mem::replace(&mut self.page.url, target.clone());
+        if back {
+            self.history.back.pop();
+            self.history.forward.push(here);
+        } else {
+            self.history.forward.pop();
+            self.history.back.push(here);
+        }
+        match target.fragment() {
+            Some(f) => {
+                self.scroll_to_fragment(f);
+            }
+            None => self.scroll = 0.0,
+        }
+        true
     }
 
     /// What a link with this `href` on the current page means (relative links resolve
@@ -434,6 +463,17 @@ impl Tab {
         match self.classify(href) {
             Link::Nothing => false,
             Link::Fragment(f) => {
+                // the address gains the fragment, with a history entry of its own
+                // (not while a load is in flight: that would be a lie about the page)
+                if self.nav.pending().is_none() {
+                    let mut url = strip_fragment(&self.page.url);
+                    url.set_fragment(Some(&f));
+                    if url != self.page.url {
+                        let here = std::mem::replace(&mut self.page.url, url);
+                        self.history.back.push(here);
+                        self.history.forward.clear();
+                    }
+                }
                 self.scroll_to_fragment(&f);
                 false
             }
@@ -991,7 +1031,8 @@ mod tests {
         let two = tab.page.layout.anchor_y("two").expect("the heading is a target");
         assert!(two > 400.0, "far down the page: {two}");
         assert!(!tab.follow("#two"), "no navigation starts");
-        assert!(!tab.is_loading() && tab.history.back.is_empty());
+        assert!(!tab.is_loading() && tab.history.back.len() == 1, "the fragment is a history entry");
+        assert_eq!(tab.page.url.fragment(), Some("two"));
         assert_eq!(tab.scroll, two);
         // a missing target leaves the page where it is, `#` and `#top` go home
         assert!(!tab.follow("#nope"));
@@ -1006,6 +1047,34 @@ mod tests {
         tab.follow("long.html#two");
         assert_eq!(tab.scroll, two);
         assert!(!tab.is_loading());
+    }
+
+    #[test]
+    fn fragment_links_add_history_entries_that_back_and_forward_walk_without_loading() {
+        let mut tab = tall_tab();
+        let base = tab.page.url.clone();
+        let two = tab.page.layout.anchor_y("two").unwrap();
+        tab.follow("#two");
+        tab.follow("#two"); // the same place again adds nothing
+        assert_eq!(tab.history.back, vec![base.clone()]);
+        tab.follow("#");
+        assert_eq!(tab.history.back.len(), 2);
+        assert_eq!(tab.address(), format!("{base}#"));
+        tab.go_back();
+        assert!(!tab.is_loading(), "same document: no load");
+        assert_eq!((tab.page.url.fragment(), tab.scroll), (Some("two"), two));
+        tab.go_back();
+        assert_eq!((tab.page.url.clone(), tab.scroll), (base.clone(), 0.0));
+        assert!(!tab.is_loading() && tab.history.back.is_empty() && tab.history.forward.len() == 2);
+        tab.go_forward();
+        assert_eq!((tab.page.url.fragment(), tab.scroll), (Some("two"), two));
+        // a new fragment visit drops the forward entries
+        tab.follow("#sp%20ace");
+        assert!(tab.history.forward.is_empty());
+        // reloading keeps the place
+        tab.scroll = 123.0;
+        tab.reload();
+        assert_eq!(tab.scroll, 123.0, "reload keeps scroll (applied on landing)");
     }
 
     #[test]

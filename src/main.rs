@@ -760,6 +760,7 @@ impl App {
                         // a link to a `#section` of this page scrolls (and the find highlight stays valid)
                         self.clamp_scroll();
                         self.update_hover();
+                        self.sync_chrome(); // the address now names the fragment
                     }
                 }
             }

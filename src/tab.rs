@@ -37,20 +37,25 @@ pub fn is_loopback_host(host: &str) -> bool {
     h.eq_ignore_ascii_case("localhost") || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-pub fn resolve_link(base: &Url, href: &str) -> Link {
+/// What `href` means on a page at `doc` whose relative URLs resolve against `base`
+/// (they differ when the page has a `<base href>`). A link that lands on the page
+/// itself, with or without a fragment, doesn't reload it.
+pub fn resolve_link_in(doc: &Url, base: &Url, href: &str) -> Link {
     let href = href.trim();
     if href.is_empty() {
         return Link::Nothing;
     }
-    if let Some(frag) = href.strip_prefix('#') {
-        return Link::Fragment(frag.to_string());
+    if base == doc {
+        if let Some(frag) = href.strip_prefix('#') {
+            return Link::Fragment(frag.to_string());
+        }
     }
     let Ok(target) = base.join(href) else { return Link::Nothing };
     match target.scheme() {
         // web pages must not be able to send you to local files
-        "file" if matches!(base.scheme(), "http" | "https") => Link::External(target.to_string()),
+        "file" if matches!(doc.scheme(), "http" | "https") => Link::External(target.to_string()),
         "http" | "https" | "file" => {
-            if strip_fragment(&target) == strip_fragment(base) {
+            if strip_fragment(&target) == strip_fragment(doc) {
                 // same document, maybe a different fragment: no reload
                 match target.fragment() {
                     Some(f) => Link::Fragment(f.to_string()),
@@ -62,6 +67,11 @@ pub fn resolve_link(base: &Url, href: &str) -> Link {
         }
         _ => Link::External(target.to_string()),
     }
+}
+
+/// `resolve_link_in` for a page without a `<base href>`.
+pub fn resolve_link(base: &Url, href: &str) -> Link {
+    resolve_link_in(base, base, href)
 }
 
 /// May a form on `from` send its data to `target`? Data isn't sent from an https
@@ -412,10 +422,16 @@ impl Tab {
         }
     }
 
+    /// What a link with this `href` on the current page means (relative links resolve
+    /// against the page's `<base href>`, if it has one).
+    fn classify(&self, href: &str) -> Link {
+        resolve_link_in(&self.page.url, &self.page.base, href)
+    }
+
     /// Follow a link on this page. Returns whether a navigation started (a link to
     /// a `#fragment` of this page just scrolls, and returns false).
     pub fn follow(&mut self, href: &str) -> bool {
-        match resolve_link(&self.page.url, href) {
+        match self.classify(href) {
             Link::Nothing => false,
             Link::Fragment(f) => {
                 self.scroll_to_fragment(&f);
@@ -435,7 +451,7 @@ impl Tab {
 
     /// Where a link clicked on this page would lead, if it leads somewhere we can open.
     pub fn link_target(&self, href: &str) -> Option<Url> {
-        match resolve_link(&self.page.url, href) {
+        match self.classify(href) {
             Link::Navigate(url) => Some(url),
             _ => None,
         }
@@ -559,6 +575,36 @@ mod tests {
         let local = u("file:///site/pages/index.html");
         assert_eq!(resolve_link(&local, "a%20b.html?x=1#top"), Link::Navigate(u("file:///site/pages/a%20b.html?x=1#top")));
         assert_eq!(resolve_link(&local, "file:///other.html"), Link::Navigate(u("file:///other.html")));
+    }
+
+    #[test]
+    fn links_resolve_against_the_base_href_not_the_page_address() {
+        let doc = u("https://example.com/a/page.html");
+        let base = u("https://cdn.example.com/other/dir/");
+        assert_eq!(resolve_link_in(&doc, &base, "rel.html"), Link::Navigate(u("https://cdn.example.com/other/dir/rel.html")));
+        assert_eq!(resolve_link_in(&doc, &base, "/abs"), Link::Navigate(u("https://cdn.example.com/abs")));
+        // with a base elsewhere, `#x` is a link to the BASE's document, which is another page
+        assert_eq!(resolve_link_in(&doc, &base, "#x"), Link::Navigate(u("https://cdn.example.com/other/dir/#x")));
+        // a link spelled out in full to this very page still only scrolls
+        assert_eq!(resolve_link_in(&doc, &base, "https://example.com/a/page.html#sec"), Link::Fragment("sec".into()));
+        // a base that points at a local file doesn't let a web page open it
+        let sneaky = u("file:///etc/");
+        assert!(matches!(resolve_link_in(&doc, &sneaky, "passwd"), Link::External(_)));
+        // without a base href the two forms agree
+        assert_eq!(resolve_link_in(&doc, &doc, "x.html"), resolve_link(&doc, "x.html"));
+    }
+
+    #[test]
+    fn a_tab_follows_links_relative_to_the_base_href() {
+        let (notify, _rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        tab.page = Page::from_source(&u("file:///tmp/dir/p.html"), "<base href='file:///elsewhere/'><a href=x.html>x</a>");
+        assert_eq!(tab.link_target("x.html"), Some(u("file:///elsewhere/x.html")));
+        assert_eq!(tab.link_target("#top"), Some(u("file:///elsewhere/#top")));
+        let mut plain = Tab::blank(2, queue().0);
+        plain.page = Page::from_source(&u("file:///tmp/dir/p.html"), "<a href=x.html>x</a>");
+        assert_eq!(plain.link_target("x.html"), Some(u("file:///tmp/dir/x.html")));
+        assert_eq!(plain.link_target("#top"), None, "a fragment of the page itself is not a navigation");
     }
 
     #[test]

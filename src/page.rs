@@ -33,6 +33,9 @@ const MAX_TITLE_CHARS: usize = 120;
 
 pub struct Page {
     pub url: Url,
+    /// What relative URLs in the document (links, images, stylesheets) resolve against:
+    /// the document's own address, or a `<base href>` if it has one.
+    pub base: Url,
     /// HTTP status of the document, if it came from the network.
     pub status: Option<u16>,
     pub title: String,
@@ -331,7 +334,7 @@ impl Page {
         }
 
         let layout = Layout { items: vec![], links: vec![], controls: vec![], anchors: vec![], height: 0.0, canvas_bg: None };
-        Page { url: url.clone(), status: None, title, dom, styles, images, form: FormState::default(), layout }
+        Page { url: url.clone(), base, status: None, title, dom, styles, images, form: FormState::default(), layout }
     }
 
     /// Re-run layout for a new viewport width (logical pixels), or after the
@@ -354,9 +357,12 @@ impl Page {
     }
 
     /// Where a `#fragment` points, as a y in the laid-out page: the element whose `id`
-    /// (or `<a name>`) is the percent-decoded fragment; an empty one or `top` means the
-    /// very top. `None` if nothing matches (the page then stays where it is).
+    /// (or `<a name>`) is the fragment, as written or percent-decoded; an empty one or
+    /// `top` means the very top. `None` if nothing matches (the page then stays where it is).
     pub fn fragment_y(&self, fragment: &str) -> Option<f32> {
+        if let Some(y) = self.layout.anchor_y(fragment) {
+            return Some(y);
+        }
         let name = String::from_utf8_lossy(&net::percent_decode_bytes(fragment)).into_owned();
         if let Some(y) = self.layout.anchor_y(&name) {
             return Some(y);
@@ -511,6 +517,24 @@ mod tests {
         // garbage percent escapes don't panic
         assert_eq!(p.fragment_y("%ZZ%"), None);
         assert_eq!(p.fragment_y("%"), None);
+    }
+
+    #[test]
+    fn an_id_that_literally_contains_percent_escapes_is_found_as_written() {
+        let p = render("<style>body{margin:0}p{margin:0;height:40px}</style><p>a</p><div id='a%20b'>x</div><div id='c d'>y</div>", 400.0);
+        assert_eq!(p.fragment_y("a%20b"), Some(40.0), "the raw spelling is tried before decoding");
+        assert!(p.fragment_y("c%20d").is_some(), "and the decoded one still works");
+    }
+
+    #[test]
+    fn base_href_decides_what_relative_urls_mean() {
+        let p = Page::from_source(&Url::parse("https://example.org/a/b.html").unwrap(), "<base href='/other/dir/'><p>x</p>");
+        assert_eq!(p.base.as_str(), "https://example.org/other/dir/");
+        let p = Page::from_source(&Url::parse("https://example.org/a/b.html").unwrap(), "<p>x</p>");
+        assert_eq!(p.base, p.url);
+        // an unparseable base is ignored
+        let p = Page::from_source(&Url::parse("https://example.org/a/b.html").unwrap(), "<base href='http://[bad'><p>x</p>");
+        assert_eq!(p.base, p.url);
     }
 
     // ---------- images ----------

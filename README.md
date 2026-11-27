@@ -27,7 +27,8 @@ The window has a tab strip, a toolbar with back, forward and reload buttons, and
 
 | Key | Action |
 |---|---|
-| `Cmd+T`, `Cmd+W` | New tab, close tab (the last tab is replaced by an empty one) |
+| `Cmd+T`, `Cmd+W` | New tab, close tab (the last tab is replaced by an empty one). A middle click on a tab closes it too |
+| `Cmd+Shift+T` | Reopen the most recently closed tab (the last 25 are remembered; empty tabs aren't) |
 | `Ctrl+Tab`, `Ctrl+Shift+Tab`, `Cmd+1`…`Cmd+9` | Next / previous tab, jump to a tab (`Cmd+9` is the last one) |
 | `Cmd+click` a link | Open it in a new tab |
 | `Cmd+F` | Find in page: type to search, `Enter` / `Shift+Enter` (or `Cmd+G` / `Cmd+Shift+G`) for the next / previous match, `Esc` to close |
@@ -127,7 +128,7 @@ The honest list, roughly by how much it matters for a real browser:
 - **Layout.** No flexbox, grid, floats or positioning, no inline padding or margins, and no `vh`/`vw`/`calc()`. A lot of the modern web depends on these.
 - **CSS.** No `@media`, pseudo-elements (`::before`), `:hover`/`:focus`/`:target` states, `:is()`/`:where()`, or `:checked`/`:disabled`.
 - **Forms.** No `multipart/form-data` (so no file uploads; a form asking for it is sent urlencoded), no `<select multiple>`, and `<label>` clicks don't focus their control. Reloading or going back to a page a `POST` produced fetches its URL with a `GET`. No caret movement or selection inside fields (typing appends, backspace deletes), no file, date or colour inputs, radio buttons draw as squares, and selects cycle on click instead of opening a menu. Controls hidden with CSS (`display:none`) can still be tabbed to. A page whose markup checks several radios of one group draws them all checked (only the last is submitted).
-- **Tabs.** No dragging to reorder or restoring closed tabs. With many tabs open they shrink until only the close button shows (at most 20 can be open).
+- **Tabs.** No dragging to reorder. A reopened tab starts fresh (no back history, scroll position or typed form data). With many tabs open they shrink until only the close button shows (at most 20 can be open).
 - **Cookies.** Nothing persists between runs, and there's no UI to see or clear them.
 - **Browser features.** No caching, bookmarks or downloads. Clicking a `#fragment` link doesn't add a history entry, so Back skips over it. A `<base>` tag inside a `<template>` is honoured, and a bad `href` on the first `<base>` doesn't stop the search for the next one.
 - **Find and anchors.** Placeholder text in empty fields (and the dots of a password field) is found by search; browsers skip them. An empty `<a name=x></a>` in the middle of a paragraph points at the top of that paragraph rather than its own line.

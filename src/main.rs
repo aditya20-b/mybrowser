@@ -41,6 +41,9 @@ const USAGE: &str = "usage: mybrowser [URL or file]\n       mybrowser --screensh
 /// The most text one paste into a page field may insert.
 const MAX_PASTE_CHARS: usize = 100_000;
 
+/// How many closed tabs Cmd+Shift+T can bring back.
+const MAX_CLOSED_TABS: usize = 25;
+
 fn die(msg: &str) -> ! {
     eprintln!("mybrowser: {msg}\n{USAGE}");
     std::process::exit(2)
@@ -83,6 +86,18 @@ fn paste_text_for(kind: Option<ControlKind>, clipboard: &str) -> String {
             c => Some(c),
         })
         .collect()
+}
+
+/// Remember a closed tab's address so Cmd+Shift+T can reopen it. Blank tabs aren't worth
+/// reopening, and only the most recent `MAX_CLOSED_TABS` are kept.
+fn remember_closed(closed: &mut Vec<Url>, url: &Url) {
+    if url.scheme() == "about" {
+        return;
+    }
+    closed.push(url.clone());
+    if closed.len() > MAX_CLOSED_TABS {
+        closed.remove(0);
+    }
 }
 
 /// Turn whatever the user typed (or passed on the command line) into a URL:
@@ -196,6 +211,8 @@ struct App {
     bar: AddressBar,
     /// Find-in-page, while its box is open (it belongs to the active tab's page).
     find: Option<Find>,
+    /// Addresses of tabs that were closed, most recent last.
+    closed: Vec<Url>,
     cwd: std::path::PathBuf,
     notify: Notify,
     cursor: (f32, f32), // physical pixels
@@ -216,7 +233,7 @@ impl App {
         let first = Tab::new(0, start, None, notify.clone());
         let bar = AddressBar::new(&first.address());
         App {
-            fonts, painter: Painter::default(), tabs: vec![first], active: 0, next_tab_id: 1, bar, find: None, cwd, notify,
+            fonts, painter: Painter::default(), tabs: vec![first], active: 0, next_tab_id: 1, bar, find: None, closed: vec![], cwd, notify,
             cursor: (0.0, 0.0), hover: None, modifiers: ModifiersState::empty(), window: None, surface: None,
         }
     }
@@ -436,11 +453,25 @@ impl App {
         self.update_hover();
     }
 
+    /// Cmd+Shift+T: bring back the most recently closed tab.
+    fn reopen_closed_tab(&mut self) {
+        if self.tabs.len() >= tabbar::MAX_TABS {
+            self.bar.error = Some(format!("too many tabs open (the limit is {})", tabbar::MAX_TABS));
+            return;
+        }
+        if let Some(url) = self.closed.pop() {
+            self.new_tab(Some(url), None);
+        }
+    }
+
     /// Close tab `index`. The last tab is replaced by an empty one, not removed.
     fn close_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
+        // what the user was looking at (or heading for, if the tab never got there)
+        let address = self.tabs[index].nav.pending().map_or_else(|| self.tabs[index].page.url.clone(), |p| p.url.clone());
+        remember_closed(&mut self.closed, &address);
         let shown_before = self.active;
         if self.tabs.len() == 1 {
             let id = self.next_tab_id;
@@ -660,6 +691,18 @@ impl App {
         }
     }
 
+    /// Middle button released: on a tab it closes that tab.
+    fn middle_click(&mut self) {
+        let s = self.scale();
+        let (cx, cy) = (self.cursor.0 / s, self.cursor.1 / s);
+        if cy < tabbar::HEIGHT {
+            if let Some(TabHit::Select(i) | TabHit::Close(i)) = tabbar::hit_test(cx, cy, self.tabs.len(), self.window_size().0) {
+                self.close_tab(i);
+            }
+        }
+        self.request_redraw();
+    }
+
     /// Left click released at the current cursor position.
     fn click(&mut self) {
         let s = self.scale();
@@ -778,6 +821,10 @@ impl App {
             }
             Key::Character(c) if cmd => match c.as_str().to_ascii_lowercase().as_str() {
                 "t" | "w" if event.repeat => true, // holding the key must not open or close dozens of tabs
+                "t" if self.modifiers.shift_key() => {
+                    self.reopen_closed_tab();
+                    true
+                }
                 "t" => {
                     self.new_tab(None, None);
                     true
@@ -959,6 +1006,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.update_hover();
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => self.click(),
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Middle, .. } => self.middle_click(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => self.on_key(&event),
             _ => {}
         }
@@ -975,6 +1023,25 @@ mod tests {
 
     fn u(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn closed_tabs_are_remembered_most_recent_last_and_blank_ones_are_not() {
+        let mut closed = vec![];
+        remember_closed(&mut closed, &u("about:blank"));
+        assert!(closed.is_empty(), "an empty tab isn't worth reopening");
+        remember_closed(&mut closed, &u("https://a.test/"));
+        remember_closed(&mut closed, &u("https://b.test/x?y=1#z"));
+        assert_eq!(closed.pop(), Some(u("https://b.test/x?y=1#z")), "the newest comes back first");
+        assert_eq!(closed.pop(), Some(u("https://a.test/")));
+        assert_eq!(closed.pop(), None);
+        // the list can't grow without bound: the oldest are forgotten
+        for i in 0..MAX_CLOSED_TABS + 10 {
+            remember_closed(&mut closed, &u(&format!("https://site{i}.test/")));
+        }
+        assert_eq!(closed.len(), MAX_CLOSED_TABS);
+        assert_eq!(closed.last(), Some(&u(&format!("https://site{}.test/", MAX_CLOSED_TABS + 9))));
+        assert_eq!(closed.first(), Some(&u("https://site10.test/")));
     }
 
     #[test]

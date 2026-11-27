@@ -2,6 +2,7 @@ mod chrome;
 mod cookies;
 mod css;
 mod dom;
+mod download;
 mod find;
 mod fonts;
 mod forms;

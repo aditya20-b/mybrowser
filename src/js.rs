@@ -294,6 +294,8 @@ pub struct Interp {
     retained: isize,
     /// Network requests the page's scripts have made.
     requests: u32,
+    /// Time spent waiting for those requests.
+    net_time: std::time::Duration,
     /// Arrays being joined right now (a cycle joins as an empty string).
     joining: Vec<ObjRef>,
     /// What the script wrote with `console.log` and friends.
@@ -609,6 +611,7 @@ impl Interp {
             mem_limit: crate::memcount::live_bytes() + MAX_SCRIPT_MEMORY,
             retained: 0,
             requests: 0,
+            net_time: std::time::Duration::ZERO,
             joining: vec![],
             console: vec![],
             console_bytes: 0,
@@ -3318,6 +3321,21 @@ mod tests {
         assert_eq!(lines[5], "true");
         assert_eq!(lines[6], "needs two");
         assert_eq!(lines[7], "true");
+    }
+
+    #[test]
+    fn a_page_that_has_waited_long_enough_for_the_network_is_refused() {
+        let dom = crate::html::parse("<body></body>");
+        let src = vec![("var x = new XMLHttpRequest(); x.open('GET', '/a'); x.onerror = function () { console.log(x.statusText) }; x.send()".to_string(), "s".to_string())];
+        let mut done = run_page_scripts(dom, "http://127.0.0.1:9/", src).expect("ran");
+        done.host.interp().net_time = std::time::Duration::from_secs(41);
+        let mut dom = done.dom;
+        // a click handler asks again
+        let more = "var y = new XMLHttpRequest(); y.open('GET', '/b'); y.onerror = function () { console.log(y.statusText) }; y.send()";
+        done.host.interp().run(&format!("document.addEventListener('click', function () {{ {more} }})")).unwrap();
+        done.host.dispatch(&mut dom, dom_bindings::DOCUMENT, "click");
+        let lines = done.host.take_console();
+        assert!(lines.iter().any(|l| l.contains("too much time spent waiting")), "{lines:?}");
     }
 
     #[test]

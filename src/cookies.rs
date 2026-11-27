@@ -47,6 +47,10 @@ pub enum Ctx {
 }
 
 pub struct Jar {
+    /// The cookie file exists but could not be read: it is left alone (never overwritten).
+    no_save: bool,
+    /// Cookies are being read back from the file: the limits are applied once, at the end.
+    loading: bool,
     /// A persistent cookie was set or deleted since the jar was last written to disk.
     dirty: bool,
     store: CookieStore,
@@ -123,7 +127,7 @@ fn key_of(c: &Cookie<'_>) -> Key {
 
 impl Jar {
     pub fn new() -> Jar {
-        Jar { dirty: false, store: CookieStore::new(), seq: HashMap::new(), counter: 0 }
+        Jar { no_save: false, loading: false, dirty: false, store: CookieStore::new(), seq: HashMap::new(), counter: 0 }
     }
 
     /// The cookies that outlive the session, one per line, as tab-separated fields:
@@ -132,6 +136,10 @@ impl Jar {
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         for c in self.store.iter_unexpired() {
+            // (never more than can be read back, or the whole file would be refused next time)
+            if out.len() as u64 > MAX_FILE_BYTES / 2 {
+                break;
+            }
             let cookie_store::CookieExpiration::AtUtc(at) = &c.expires else { continue };
             let Some(domain) = c.domain.as_cow().map(|d| d.into_owned()) else { continue };
             let (name, value) = c.name_value();
@@ -163,6 +171,7 @@ impl Jar {
     /// file can't smuggle in anything the rules would refuse.
     pub fn load_text(&mut self, text: &str) {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        self.loading = true;
         for line in text.lines().take(MAX_TOTAL) {
             let f: Vec<&str> = line.split('\t').collect();
             if f.len() != 10 || !matches!(f[0], "http" | "https") {
@@ -170,7 +179,11 @@ impl Jar {
             }
             let (host_only, domain, path, name, value) = (f[1] == "1", f[2], f[3], f[4], f[5]);
             let Ok(expires) = f[6].parse::<i64>() else { continue };
-            if expires <= now || domain.is_empty() || domain.contains([':', '/', '@', ' ']) || !path.starts_with('/') {
+            if expires <= now || domain.is_empty() || domain.contains([':', '/', '@', ' ', ';']) || !path.starts_with('/') {
+                continue;
+            }
+            // (a value that holds `;` would add attributes to the cookie it is spliced into)
+            if [name, value, path].iter().any(|s| s.contains(';') || s.chars().any(|c| c.is_control())) {
                 continue;
             }
             let Ok(url) = Url::parse(&format!("{}://{}/", f[0], domain.trim_start_matches('.'))) else { continue };
@@ -189,6 +202,8 @@ impl Jar {
             }
             self.accept(&url, &header);
         }
+        self.loading = false;
+        self.prune();
         self.dirty = false;
     }
 
@@ -237,18 +252,21 @@ impl Jar {
         }
         let expired = cookie.is_expired();
         let persistent = cookie.is_persistent();
+        let replaces_persistent = self.store.get(&key.0, &key.1, &key.2).is_some_and(|c| c.is_persistent());
         if self.store.insert(cookie.into_owned(), url).is_err() {
             return false;
         }
         // (a session cookie replacing a persistent one, or a deletion, changes the file as well)
-        self.dirty |= persistent || expired || self.store.get(&key.0, &key.1, &key.2).is_none();
+        self.dirty |= persistent || expired || replaces_persistent;
         if expired {
             self.seq.remove(&key); // it was a deletion
         } else {
             self.counter += 1;
             self.seq.insert(key, self.counter);
         }
-        self.prune();
+        if !self.loading {
+            self.prune();
+        }
         true
     }
 
@@ -326,6 +344,8 @@ impl Jar {
         }
         for i in doomed {
             let (d, p, n) = &all[i].0;
+            // (an evicted persistent cookie must leave the file too)
+            self.dirty |= self.store.get(d, p, n).is_some_and(|c| c.is_persistent());
             self.store.remove(d, p, n);
             self.seq.remove(&all[i].0);
         }
@@ -344,11 +364,15 @@ pub fn global() -> MutexGuard<'static, Jar> {
     JAR.get_or_init(|| {
         let mut jar = Jar::new();
         if let Some(file) = cookie_file() {
-            // (a missing or oversized file just means starting empty)
-            if std::fs::metadata(&file).is_ok_and(|m| m.len() <= MAX_FILE_BYTES) {
-                if let Ok(text) = std::fs::read_to_string(&file) {
-                    jar.load_text(&text);
-                }
+            // A missing file just means starting empty. One that is there but can't be read (too
+            // big, not text, no permission) is left exactly as it is: never written over.
+            match std::fs::metadata(&file) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(m) if m.len() <= MAX_FILE_BYTES => match std::fs::read_to_string(&file) {
+                    Ok(text) => jar.load_text(&text),
+                    Err(_) => jar.no_save = true,
+                },
+                _ => jar.no_save = true,
             }
         }
         Mutex::new(jar)
@@ -370,21 +394,30 @@ fn cookie_file() -> Option<std::path::PathBuf> {
 /// response's cookies have been taken in.
 pub fn save_if_changed() {
     let Some(file) = cookie_file() else { return };
+    // one writer at a time, from taking the snapshot to the rename: an older snapshot can't land
+    // after a newer one, and two threads never share the temporary file
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let text = {
         let mut jar = global();
-        if !jar.dirty {
+        if !jar.dirty || jar.no_save {
             return;
         }
         jar.dirty = false;
         jar.to_text()
     };
-    let Some(dir) = file.parent() else { return };
-    if crate::bookmarks::create_private_dir(dir).is_err() {
-        return;
-    }
-    let tmp = dir.join(format!("cookies.tsv.{}.tmp", std::process::id()));
-    if crate::bookmarks::write_private_file(&tmp, text.as_bytes()).is_err() || std::fs::rename(&tmp, &file).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    let written = (|| {
+        let dir = file.parent()?;
+        crate::bookmarks::create_private_dir(dir).ok()?;
+        let tmp = dir.join(format!("cookies.tsv.{}.tmp", std::process::id()));
+        let done = crate::bookmarks::write_private_file(&tmp, text.as_bytes()).is_ok() && std::fs::rename(&tmp, &file).is_ok();
+        if !done {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        done.then_some(())
+    })();
+    if written.is_none() {
+        global().dirty = true; // (try again after the next change)
     }
 }
 
@@ -420,6 +453,49 @@ mod tests {
         // Secure and SameSite survive
         assert_eq!(header(&fresh, "http://shop.example.com/cart/"), "wide=2");
         assert_eq!(header_in(&fresh, "https://shop.example.com/cart/", Ctx::CrossSiteGet), "wide=2");
+    }
+
+    #[test]
+    fn changes_that_must_reach_the_file_mark_the_jar_dirty() {
+        let mut jar = Jar::new();
+        let site = u("https://a.example.com/");
+        jar.accept(&site, "a=1; Max-Age=3600; Path=/");
+        assert!(jar.dirty);
+        jar.dirty = false;
+        jar.accept(&site, "b=1; Path=/"); // a session cookie alone changes nothing on disk
+        assert!(!jar.dirty);
+        jar.accept(&site, "a=2; Path=/"); // ...but one that replaces a persistent cookie does
+        assert!(jar.dirty && jar.to_text().is_empty());
+        jar.dirty = false;
+        jar.accept(&site, "a=1; Max-Age=3600; Path=/");
+        jar.dirty = false;
+        jar.accept(&site, "a=; Max-Age=0; Path=/"); // a deletion
+        assert!(jar.dirty && jar.to_text().is_empty());
+    }
+
+    #[test]
+    fn what_is_written_can_always_be_read_back_and_loading_is_fast() {
+        let mut jar = Jar::new();
+        // far more than the file may hold: 30 hosts of 50 cookies of 3.5 KB
+        for h in 0..30 {
+            let site = u(&format!("https://h{h}.example{h}.com/"));
+            for n in 0..50 {
+                jar.accept(&site, &format!("c{n}={}; Max-Age=3600; Path=/", "v".repeat(3500)));
+            }
+        }
+        let text = jar.to_text();
+        assert!((text.len() as u64) <= MAX_FILE_BYTES, "{} bytes", text.len());
+        let started = std::time::Instant::now();
+        let mut fresh = Jar::new();
+        fresh.load_text(&text);
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "loading took {:?}", started.elapsed());
+        assert!(fresh.len() > 100);
+        // a value with `;` in a hand-edited file can't add attributes
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600;
+        let mut edited = Jar::new();
+        edited.load_text(&format!("https\t1\tsub.example.com\t/\ta\t1; Domain=example.com\t{now}\t0\t0\t\n"));
+        assert_eq!(header(&edited, "https://www.example.com/"), "");
+        assert_eq!(edited.len(), 0);
     }
 
     #[test]

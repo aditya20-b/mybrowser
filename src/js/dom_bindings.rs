@@ -1251,6 +1251,8 @@ fn clear_timer(i: &mut Interp, _: &Value, a: &[Value]) -> Res {
 
 /// Requests one page's scripts may make.
 const MAX_REQUESTS: u32 = 30;
+/// Time a page's scripts may spend waiting on requests, in all.
+const MAX_NET_TIME: std::time::Duration = std::time::Duration::from_secs(40);
 /// Longest response text given to a script.
 const MAX_RESPONSE: usize = 2 * 1024 * 1024;
 
@@ -1317,9 +1319,15 @@ fn xhr_send(i: &mut Interp, this: &Value, a: &[Value]) -> Res {
     };
     let result = if i.requests >= MAX_REQUESTS {
         Err("too many requests".to_string())
+    } else if i.net_time > MAX_NET_TIME {
+        // the page has already spent its share of waiting: the window is held up while a request runs
+        Err("too much time spent waiting for the network".to_string())
     } else {
         i.requests += 1;
-        xhr_fetch(&i.page_url, &method, &url, body.as_deref())
+        let started = std::time::Instant::now();
+        let r = xhr_fetch(&i.page_url, &method, &url, body.as_deref());
+        i.net_time += started.elapsed();
+        r
     };
     match result {
         Ok(f) => {

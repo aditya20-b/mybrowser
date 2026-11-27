@@ -1,5 +1,8 @@
-//! Image decoding (PNG only for now, via the `png` crate).
+//! Image decoding: PNG (`png` crate), JPEG (`jpeg-decoder`) and GIF (`gif`, the
+//! first frame). The format is sniffed from the bytes, never from a file name or
+//! Content-Type, and every decoder checks the claimed size before allocating.
 use std::io::Cursor;
+use std::num::NonZeroU64;
 
 pub struct Image {
     pub w: u32,
@@ -21,13 +24,22 @@ pub const MAX_PIXELS: u64 = 16 * 1024 * 1024;
 
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
-/// Decode an image from its bytes, sniffing the format from the content
-/// rather than trusting a file name or Content-Type. Only PNG so far.
+/// Is a `w` x `h` image acceptable to decode?
+fn size_ok(w: u32, h: u32) -> bool {
+    w != 0 && h != 0 && (w as u64) * (h as u64) <= MAX_PIXELS
+}
+
+/// Decode an image from its bytes, sniffing the format from the content.
 pub fn decode(bytes: &[u8]) -> Option<Image> {
     if bytes.starts_with(PNG_SIGNATURE) {
-        return decode_png(bytes);
+        decode_png(bytes)
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        decode_jpeg(bytes)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        decode_gif(bytes)
+    } else {
+        None
     }
-    None
 }
 
 fn decode_png(bytes: &[u8]) -> Option<Image> {
@@ -36,7 +48,7 @@ fn decode_png(bytes: &[u8]) -> Option<Image> {
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().ok()?;
     let (w, h) = (reader.info().width, reader.info().height);
-    if w == 0 || h == 0 || (w as u64) * (h as u64) > MAX_PIXELS {
+    if !size_ok(w, h) {
         return None;
     }
     let mut buf = vec![0u8; reader.output_buffer_size()?];
@@ -63,6 +75,76 @@ fn decode_png(bytes: &[u8]) -> Option<Image> {
             }
         }
         png::ColorType::Indexed => return None, // normalize_to_color8 expands these
+    }
+    Some(Image { w, h, rgba })
+}
+
+fn decode_jpeg(bytes: &[u8]) -> Option<Image> {
+    let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(bytes));
+    decoder.read_info().ok()?; // reads the header only
+    let info = decoder.info()?;
+    let (w, h) = (info.width as u32, info.height as u32);
+    if !size_ok(w, h) {
+        return None;
+    }
+    let data = decoder.decode().ok()?;
+    let n = (w * h) as usize;
+    let mut rgba = Vec::with_capacity(n * 4);
+    match info.pixel_format {
+        jpeg_decoder::PixelFormat::L8 => {
+            for &g in data.get(..n)? {
+                rgba.extend_from_slice(&[g, g, g, 255]);
+            }
+        }
+        jpeg_decoder::PixelFormat::L16 => {
+            // 16-bit samples, big endian: keep the high byte
+            for px in data.get(..n * 2)?.chunks_exact(2) {
+                rgba.extend_from_slice(&[px[0], px[0], px[0], 255]);
+            }
+        }
+        jpeg_decoder::PixelFormat::RGB24 => {
+            for px in data.get(..n * 3)?.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+        }
+        jpeg_decoder::PixelFormat::CMYK32 => {
+            // the decoder hands back "amount of light" (255 = no ink), so multiply by K
+            for px in data.get(..n * 4)?.chunks_exact(4) {
+                let k = px[3] as u32;
+                let mix = |c: u8| (c as u32 * k / 255) as u8;
+                rgba.extend_from_slice(&[mix(px[0]), mix(px[1]), mix(px[2]), 255]);
+            }
+        }
+    }
+    Some(Image { w, h, rgba })
+}
+
+/// The first frame of a GIF, composited onto a transparent canvas the size of its
+/// logical screen (a frame may cover only part of it). Animation isn't played.
+fn decode_gif(bytes: &[u8]) -> Option<Image> {
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::RGBA);
+    // a frame bigger than the whole-image limit is refused before its buffer is allocated
+    options.set_memory_limit(gif::MemoryLimit::Bytes(NonZeroU64::new(MAX_PIXELS * 4)?));
+    let mut decoder = options.read_info(Cursor::new(bytes)).ok()?;
+    let (w, h) = (decoder.width() as u32, decoder.height() as u32);
+    if !size_ok(w, h) {
+        return None;
+    }
+    let frame = decoder.read_next_frame().ok()??;
+    let (left, top) = (frame.left as usize, frame.top as usize);
+    let (fw, fh) = (frame.width as usize, frame.height as usize);
+    let pixels = frame.buffer.get(..fw * fh * 4)?;
+    let (cw, ch) = (w as usize, h as usize);
+    let mut rgba = vec![0u8; cw * ch * 4];
+    for row in 0..fh {
+        let y = top + row;
+        if y >= ch {
+            break;
+        }
+        let copy = fw.min(cw.saturating_sub(left));
+        let src = &pixels[row * fw * 4..row * fw * 4 + copy * 4];
+        rgba[(y * cw + left) * 4..(y * cw + left + copy) * 4].copy_from_slice(src);
     }
     Some(Image { w, h, rgba })
 }
@@ -103,6 +185,31 @@ mod tests {
         out
     }
 
+    fn jpeg(w: u16, h: u16, color: jpeg_encoder::ColorType, data: &[u8]) -> Vec<u8> {
+        let mut out = vec![];
+        jpeg_encoder::Encoder::new(&mut out, 95).encode(data, w, h, color).unwrap();
+        out
+    }
+
+    /// A GIF with a 4x3 logical screen, a 2-colour palette and one frame at (`left`, `top`).
+    fn gif_bytes(frame: (u16, u16, u16, u16), indices: &[u8]) -> Vec<u8> {
+        let mut out = vec![];
+        {
+            let palette = [255, 0, 0, 0, 0, 255]; // index 0 red, 1 blue
+            let mut enc = gif::Encoder::new(&mut out, 4, 3, &palette).unwrap();
+            let mut f = gif::Frame::default();
+            (f.left, f.top, f.width, f.height) = frame;
+            f.buffer = std::borrow::Cow::Borrowed(indices);
+            enc.write_frame(&f).unwrap();
+        }
+        out
+    }
+
+    fn pixel(img: &Image, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * img.w + x) * 4) as usize;
+        [img.rgba[i], img.rgba[i + 1], img.rgba[i + 2], img.rgba[i + 3]]
+    }
+
     #[test]
     fn decodes_each_color_type_to_rgba() {
         let rgba = decode(&encode(1, 1, png::ColorType::Rgba, &[1, 2, 3, 4])).unwrap();
@@ -116,12 +223,55 @@ mod tests {
     }
 
     #[test]
-    fn rejects_garbage_truncated_and_non_png() {
+    fn decodes_jpeg_colour_and_grayscale() {
+        // JPEG is lossy: check the colour is close, not exact
+        let close = |got: [u8; 4], want: [u8; 3]| got[3] == 255 && (0..3).all(|k| (got[k] as i32 - want[k] as i32).abs() <= 12);
+        let red = jpeg(16, 8, jpeg_encoder::ColorType::Rgb, &[200, 30, 30].repeat(16 * 8));
+        let img = decode(&red).expect("a JPEG decodes");
+        assert_eq!((img.w, img.h), (16, 8));
+        assert!(close(pixel(&img, 8, 4), [200, 30, 30]), "{:?}", pixel(&img, 8, 4));
+        let gray = jpeg(8, 8, jpeg_encoder::ColorType::Luma, &[120u8; 64]);
+        let img = decode(&gray).expect("a grayscale JPEG decodes");
+        let p = pixel(&img, 3, 3);
+        assert!(close(p, [120, 120, 120]), "{p:?}");
+    }
+
+    #[test]
+    fn decodes_the_first_frame_of_a_gif_onto_its_logical_screen() {
+        // a full-screen frame: row 0 red, rows 1-2 blue
+        let full = gif_bytes((0, 0, 4, 3), &[0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1]);
+        let img = decode(&full).expect("a GIF decodes");
+        assert_eq!((img.w, img.h), (4, 3));
+        assert_eq!(pixel(&img, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(pixel(&img, 3, 2), [0, 0, 255, 255]);
+        // a frame covering part of the screen leaves the rest transparent
+        let part = gif_bytes((1, 1, 2, 1), &[1, 1]);
+        let img = decode(&part).unwrap();
+        assert_eq!(pixel(&img, 0, 0), [0, 0, 0, 0], "outside the frame");
+        assert_eq!(pixel(&img, 1, 1), [0, 0, 255, 255]);
+        assert_eq!(pixel(&img, 2, 1), [0, 0, 255, 255]);
+        assert_eq!(pixel(&img, 3, 1), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rejects_garbage_truncated_and_unknown_formats() {
         assert!(decode(b"").is_none());
-        assert!(decode(b"GIF89a....").is_none());
+        assert!(decode(b"RIFF....WEBPVP8 ").is_none(), "formats we can't decode");
         assert!(decode(b"\x89PNG\r\n\x1a\nnot really").is_none());
+        assert!(decode(b"\xFF\xD8\xFFnot really").is_none());
+        assert!(decode(b"GIF89a not really").is_none());
         let good = encode(4, 4, png::ColorType::Rgb, &[0; 48]);
         assert!(decode(&good[..good.len() / 2]).is_none());
+        // truncated JPEGs and GIFs must never panic (what they decode to is up to the decoder)
+        let j = jpeg(16, 16, jpeg_encoder::ColorType::Rgb, &[90u8; 16 * 16 * 3]);
+        for cut in [4, 20, j.len() / 2, j.len() - 1] {
+            let _ = decode(&j[..cut]);
+        }
+        let g = gif_bytes((0, 0, 4, 3), &[0; 12]);
+        for cut in [6, 10, g.len() - 8, g.len() - 1] {
+            let _ = decode(&g[..cut]);
+        }
+        assert!(decode(&g[..10]).is_none());
     }
 
     #[test]
@@ -132,5 +282,22 @@ mod tests {
         assert!(decode(&big).is_none());
         let ok = encode(100, 100, png::ColorType::Grayscale, &vec![0u8; 100 * 100]);
         assert_eq!(decode(&ok).unwrap().bytes(), 100 * 100 * 4);
+        // the same for JPEG (a 5000 x 4000 flat grey JPEG is a few hundred KB) and GIF (a 65535 x 65535 screen)
+        let big_jpeg = jpeg(5000, 4000, jpeg_encoder::ColorType::Luma, &vec![128u8; 5000 * 4000]);
+        assert!(big_jpeg.len() < 2_000_000, "{} bytes", big_jpeg.len());
+        assert!(decode(&big_jpeg).is_none());
+        let mut huge_gif = gif_bytes((0, 0, 4, 3), &[0; 12]);
+        huge_gif[6..10].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // logical screen width and height
+        assert!(decode(&huge_gif).is_none());
+    }
+
+    #[test]
+    fn bilinear_sampling_stays_inside_the_image() {
+        let img = decode(&encode(2, 1, png::ColorType::Grayscale, &[0, 200])).unwrap();
+        for (x, y) in [(-5.0, -5.0), (0.0, 0.0), (1.0, 0.5), (2.0, 1.0), (50.0, 50.0), (f32::MAX, f32::MAX)] {
+            let [r, _, _, a] = img.sample(x, y);
+            assert!((0.0..=200.0).contains(&r) && a == 255.0, "{x},{y} -> {r}");
+        }
+        assert!((img.sample(1.0, 0.5)[0] - 100.0).abs() < 1.0, "halfway between the two pixels");
     }
 }

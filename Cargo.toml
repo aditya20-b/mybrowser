@@ -8,9 +8,14 @@ description = "A browser written from scratch in Rust: networking, HTML/CSS engi
 cookie = { version = "0.18", default-features = false }
 cookie_store = { version = "0.22", default-features = false }
 fontdue = "0.9.5"
+gif = "0.13"
+jpeg-decoder = "0.3"
 png = "0.18.1"
 psl = "2"
 softbuffer = "0.4.8"
 ureq = "3.5.2"
 url = "2.5.9"
 winit = "0.30.13"
+
+[dev-dependencies]
+jpeg-encoder = "0.6"

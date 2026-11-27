@@ -211,7 +211,10 @@ impl Page {
                     preloaded.insert(without_fragment(&f.url).to_string(), Rc::new(img));
                     Page::build(&f.url, &src, preloaded)
                 }
-                None => Page::error(&f.url, &format!("Cannot decode this {} image (only PNG is supported so far)", f.content_type)),
+                None => Page::error(
+                    &f.url,
+                    &format!("Cannot decode this {} image (it may be damaged, or a format we can't show yet: PNG, JPEG and GIF work)", f.content_type),
+                ),
             },
             other => Page::error(&f.url, &format!("Cannot display content of type '{other}' (downloads aren't supported yet)")),
         };
@@ -481,6 +484,25 @@ mod tests {
         out
     }
 
+    fn jpeg_bytes(w: u16, h: u16) -> Vec<u8> {
+        let mut out = vec![];
+        let px: Vec<u8> = (0..w as usize * h as usize).flat_map(|_| [30u8, 160, 60]).collect();
+        jpeg_encoder::Encoder::new(&mut out, 95).encode(&px, w, h, jpeg_encoder::ColorType::Rgb).unwrap();
+        out
+    }
+
+    fn gif_bytes(w: u16, h: u16) -> Vec<u8> {
+        let mut out = vec![];
+        {
+            let mut enc = gif::Encoder::new(&mut out, w, h, &[0, 0, 255]).unwrap();
+            let mut f = gif::Frame::default();
+            (f.width, f.height) = (w, h);
+            f.buffer = std::borrow::Cow::Owned(vec![0u8; w as usize * h as usize]);
+            enc.write_frame(&f).unwrap();
+        }
+        out
+    }
+
     /// A fresh temp dir containing `a.png` (solid red, w x h).
     fn temp_dir_with_png(name: &str, w: u32, h: u32) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mybrowser-test-{}-{name}", std::process::id()));
@@ -530,6 +552,30 @@ mod tests {
         // CSS beats attributes
         let p = render_in(&dir, "<img src=a.png width=80 style='width:10px;height:10px'>", 400.0);
         assert_eq!((images_of(&p)[0].2, images_of(&p)[0].3), (10.0, 10.0));
+    }
+
+    #[test]
+    fn jpeg_and_gif_images_render_inline() {
+        let dir = temp_dir_with_png("formats", 4, 4);
+        std::fs::write(dir.join("photo.jpg"), jpeg_bytes(24, 12)).unwrap();
+        std::fs::write(dir.join("anim.gif"), gif_bytes(10, 6)).unwrap();
+        // the file name says nothing about the format: it is sniffed from the bytes
+        std::fs::write(dir.join("really-a-jpeg.png"), jpeg_bytes(8, 8)).unwrap();
+        let p = render_in(&dir, "<img src=photo.jpg><img src=anim.gif><img src=really-a-jpeg.png>", 400.0);
+        let sizes: Vec<(f32, f32)> = images_of(&p).iter().map(|i| (i.2, i.3)).collect();
+        assert_eq!(sizes, [(24.0, 12.0), (10.0, 6.0), (8.0, 8.0)]);
+        // and an image document shows them too, with the size in the title
+        let page = Page::load(&url_of(&dir.join("photo.jpg")));
+        assert_eq!(page.title, "photo.jpg (24×12)");
+        assert_eq!(page.images.len(), 1);
+        // a corrupt one still falls back to its alt text, and the error says what works
+        std::fs::write(dir.join("broken.jpg"), b"\xFF\xD8\xFFthis is not a jpeg").unwrap();
+        let p = render_in(&dir, "<img src=broken.jpg alt='oops'>", 400.0);
+        assert!(images_of(&p).is_empty());
+        assert!(p.layout.items.iter().any(|i| matches!(i, Item::Text { text, .. } if text == "[oops]")));
+        let doc = Page::load(&url_of(&dir.join("broken.jpg")));
+        assert_eq!(doc.title, "Error");
+        assert!(doc.dom.text_content(0).contains("PNG, JPEG and GIF"), "{}", doc.dom.text_content(0));
     }
 
     #[test]
@@ -723,14 +769,15 @@ mod tests {
 
     #[test]
     fn a_page_over_http_loads_its_stylesheet_and_image_from_the_network() {
-        let html = "<!doctype html><title>Net page</title><link rel=stylesheet href=/s.css><body style='margin:0'><div id=a></div><img src='/pic.png'>";
+        let html = "<!doctype html><title>Net page</title><link rel=stylesheet href=/s.css><body style='margin:0'><div id=a></div><img src='/pic.png'><img src='/photo.jpg'>";
         let (port, server) = serve_routes(
             vec![
                 ("/index.html", "text/html; charset=utf-8", html.as_bytes().to_vec()),
                 ("/s.css", "text/css", b"#a { height: 11px; background: red }".to_vec()),
                 ("/pic.png", "image/png", png_bytes(20, 10)),
+                ("/photo.jpg", "image/jpeg", jpeg_bytes(16, 16)),
             ],
-            3,
+            4,
         );
         let fonts = Fonts::load();
         let mut p = Page::load(&Url::parse(&format!("http://127.0.0.1:{port}/index.html")).unwrap());
@@ -738,7 +785,8 @@ mod tests {
         p.relayout(&fonts, 300.0);
         assert_eq!((p.title.as_str(), p.status), ("Net page", Some(200)));
         assert_eq!(rects(&p)[0].3, 11.0, "stylesheet from the network applied");
-        assert_eq!(images_of(&p)[0].2, 20.0, "image from the network decoded");
+        assert_eq!(images_of(&p)[0].2, 20.0, "PNG from the network decoded");
+        assert_eq!(images_of(&p)[1].2, 16.0, "JPEG from the network decoded");
     }
 
     #[test]

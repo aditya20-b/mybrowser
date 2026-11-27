@@ -440,6 +440,7 @@ impl FormState {
             (None, false) => all.len() - 1,
         };
         self.focus = Some(all[next]);
+        self.move_caret(dom, all[next], CaretMove::End); // arriving in a field puts the caret at its end
     }
 
     /// Build the request for submitting `form`. `submitter` is the button that was
@@ -549,6 +550,17 @@ mod tests {
 
     fn find(dom: &Dom, tag: &str, nth: usize) -> NodeId {
         (0..dom.nodes.len()).filter(|&i| dom.tag(i) == Some(tag)).nth(nth).unwrap_or_else(|| panic!("no {tag} #{nth}"))
+    }
+
+    #[test]
+    fn tabbing_into_a_field_puts_the_caret_at_its_end() {
+        let dom = html::parse("<input name=a value=hello><input name=b>");
+        let a = by_name(&dom, "a");
+        let mut st = FormState::default();
+        st.move_caret(&dom, a, CaretMove::Home);
+        st.focus = None;
+        st.focus_next(&dom, true);
+        assert_eq!((st.focus, st.caret(&dom, a)), (Some(a), 5));
     }
 
     #[test]

@@ -559,7 +559,13 @@ impl Tab {
         {
             let Page { dom, form, .. } = &mut self.page;
             match kind {
-                Some(ControlKind::Text | ControlKind::Password | ControlKind::Textarea | ControlKind::Button) => form.focus = Some(id),
+                Some(ControlKind::Text | ControlKind::Password | ControlKind::Textarea | ControlKind::Button) => {
+                    // clicking into a field already being edited leaves its caret alone; arriving puts it at the end
+                    if form.focus != Some(id) {
+                        form.move_caret(dom, id, forms::CaretMove::End);
+                    }
+                    form.focus = Some(id);
+                }
                 Some(ControlKind::Checkbox | ControlKind::Radio) => {
                     form.focus = Some(id);
                     form.toggle(dom, id);

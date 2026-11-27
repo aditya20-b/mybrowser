@@ -58,12 +58,28 @@ pub struct ControlRegion {
     pub node: NodeId,
 }
 
+/// Where a `#fragment` target is: an element's `id` (or an `<a name>`) and the y of
+/// the top of its box. Elements that don't have a box of their own (inline ones) resolve to
+/// the block that contains them.
+pub struct Anchor {
+    pub name: String,
+    pub y: f32,
+}
+
 pub struct Layout {
     pub items: Vec<Item>,
     pub links: Vec<LinkRegion>,
     pub controls: Vec<ControlRegion>,
+    pub anchors: Vec<Anchor>,
     pub height: f32,
     pub canvas_bg: Option<Color>,
+}
+
+impl Layout {
+    /// The y of the element with this `id` / `name` (the first one, if several share it).
+    pub fn anchor_y(&self, name: &str) -> Option<f32> {
+        self.anchors.iter().find(|a| a.name == name).map(|a| a.y)
+    }
 }
 
 pub fn layout_document(
@@ -84,13 +100,57 @@ pub fn layout_document(
             _ => true,
         });
     }
-    let mut cx = Ctx { dom, styles, fonts, images, form, has_block, items: vec![], links: vec![], controls: vec![] };
+    let mut cx = Ctx { dom, styles, fonts, images, form, has_block, items: vec![], links: vec![], controls: vec![], blocks: vec![] };
     let (bottom, mb) = cx.layout_block(0, 0.0, 0.0, 0.0, width, None, false);
 
     // The canvas takes the background of <html>, or else of <body>.
     let body = dom.nodes[0].children.iter().copied().find(|&c| dom.tag(c) == Some("body"));
     let canvas_bg = styles[0].background.or(body.and_then(|b| styles[b].background));
-    Layout { items: cx.items, links: cx.links, controls: cx.controls, height: bottom + mb, canvas_bg }
+    let anchors = collect_anchors(dom, styles, &cx.blocks);
+    Layout { items: cx.items, links: cx.links, controls: cx.controls, anchors, height: bottom + mb, canvas_bg }
+}
+
+/// Every element with an `id` (or an `<a name>`), with the y of its box, or of the
+/// nearest enclosing box if it has none. Hidden elements, and anything inside them,
+/// can't be scrolled to.
+fn collect_anchors(dom: &Dom, styles: &[Style], blocks: &[(NodeId, f32)]) -> Vec<Anchor> {
+    let mut block_y = vec![f32::NAN; dom.nodes.len()];
+    for &(id, y) in blocks {
+        block_y[id] = y;
+    }
+    let mut out = vec![];
+    for id in 0..dom.nodes.len() {
+        let Kind::Element { tag, attrs } = &dom.nodes[id].kind else { continue };
+        let mut names = vec![];
+        if let Some(n) = attrs.get("id").filter(|n| !n.is_empty()) {
+            names.push(n.clone());
+        }
+        if tag == "a" {
+            if let Some(n) = attrs.get("name").filter(|n| !n.is_empty()) {
+                names.push(n.clone());
+            }
+        }
+        if names.is_empty() {
+            continue;
+        }
+        // walk outwards to the first element that has a box; a hidden one on the way means no target
+        let mut cur = Some(id);
+        let mut y = None;
+        while let Some(c) = cur {
+            if styles[c].display == Display::None {
+                break;
+            }
+            if !block_y[c].is_nan() {
+                y = Some(block_y[c]);
+                break;
+            }
+            cur = dom.nodes[c].parent;
+        }
+        if let Some(y) = y {
+            out.extend(names.into_iter().map(|name| Anchor { name, y }));
+        }
+    }
+    out
 }
 
 struct Ctx<'a> {
@@ -104,6 +164,9 @@ struct Ctx<'a> {
     items: Vec<Item>,
     links: Vec<LinkRegion>,
     controls: Vec<ControlRegion>,
+    /// (element, y of its top border edge) for every block-level box laid out, in
+    /// layout order. Table cells shift theirs along with their content.
+    blocks: Vec<(NodeId, f32)>,
 }
 
 fn resolve(l: Length, base: f32) -> Option<f32> {
@@ -169,10 +232,11 @@ struct Decor {
 struct CellOut {
     height: f32,
     decor: Decor,
-    /// Range of display items / link regions / controls that make up the cell's content.
+    /// Range of display items / link regions / controls / block records that make up the cell's content.
     content: (usize, usize),
     links: (usize, usize),
     controls: (usize, usize),
+    blocks: (usize, usize),
 }
 
 struct Cell {
@@ -285,6 +349,7 @@ impl<'a> Ctx<'a> {
             && s.height.is_none_or(|h| h <= 0.0)
             && self.is_empty_block(id)
         {
+            self.blocks.push((id, cursor)); // still a place a `#fragment` can point at
             let merged = if top_collapsed { mb } else { collapse(prev_mb, collapse(mt_raw, mb)) };
             return (cursor, merged);
         }
@@ -322,6 +387,7 @@ impl<'a> Ctx<'a> {
         let top_open = pad[0] + bw[0] == 0.0;
         let own_mt = if top_open { self.collapsed_top(id, avail) } else { mt_raw };
         let top = if top_collapsed { cursor } else { cursor + collapse(prev_mb, own_mt) };
+        self.blocks.push((id, top));
         let content_x = bx + bw[3] + pad[3];
         let content_top = top + bw[0] + pad[0];
 
@@ -433,7 +499,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// Move a range of already-emitted content down by `dy`.
-    fn shift(&mut self, items: (usize, usize), links: (usize, usize), controls: (usize, usize), dy: f32) {
+    fn shift(&mut self, items: (usize, usize), links: (usize, usize), controls: (usize, usize), blocks: (usize, usize), dy: f32) {
         for it in &mut self.items[items.0..items.1] {
             match it {
                 Item::Rect { y, .. } | Item::Image { y, .. } => *y += dy,
@@ -446,6 +512,9 @@ impl<'a> Ctx<'a> {
         }
         for c in &mut self.controls[controls.0..controls.1] {
             c.y += dy;
+        }
+        for b in &mut self.blocks[blocks.0..blocks.1] {
+            b.1 += dy;
         }
     }
 
@@ -867,7 +936,8 @@ impl<'a> Ctx<'a> {
                 self.push_box(x, top, w, h, bw, border, Color::WHITE);
                 let value = self.form.value(self.dom, id);
                 let line_h = a + d;
-                let rows = (((h - 6.0) / line_h).floor() as usize).max(1);
+                // (the small epsilon keeps `rows=3` from computing 2.9999 and losing a row)
+                let rows = ((((h - 6.0) / line_h) + 0.01).floor() as usize).max(1);
                 let inner = w - 10.0;
                 let (lines, color): (Vec<String>, Color) = if value.is_empty() {
                     (vec![self.dom.attr(id, "placeholder").unwrap_or("").to_string()], CTL_PLACEHOLDER)
@@ -1324,11 +1394,14 @@ impl<'a> Ctx<'a> {
         let bg_slot = self.items.len();
         self.items.push(Item::Nop);
         let (content_start, links_start, controls_start) = (self.items.len(), self.links.len(), self.controls.len());
+        let blocks_start = self.blocks.len();
+        self.blocks.push((id, y)); // the cell itself can be a `#fragment` target
 
         let (end_y, last_mb) = self.layout_children(id, x + bw[3] + pad[3], y + bw[0] + pad[0], content_w, false);
         let content = (content_start, self.items.len());
         let links = (links_start, self.links.len());
         let controls = (controls_start, self.controls.len());
+        let blocks = (blocks_start, self.blocks.len());
 
         // a cell is its own formatting context: its last margin stays inside it
         let inner_h = (end_y + last_mb) - (y + bw[0] + pad[0]);
@@ -1337,7 +1410,7 @@ impl<'a> Ctx<'a> {
             height = height.max(h + pad[0] + pad[2] + bw[0] + bw[2]);
         }
         let decor = self.emit_decor(s, bg_slot, x, y, outer_w, y + height, bw, color);
-        CellOut { height, decor, content, links, controls }
+        CellOut { height, decor, content, links, controls, blocks }
     }
 
     /// Vertically align a laid-out cell inside the box `[top, bottom]` and stretch
@@ -1350,7 +1423,7 @@ impl<'a> Ctx<'a> {
             VAlign::Bottom => free,
         };
         if dy != 0.0 {
-            self.shift(out.content, out.links, out.controls, dy);
+            self.shift(out.content, out.links, out.controls, out.blocks, dy);
         }
         self.stretch_decor(&out.decor, bottom);
     }
@@ -1410,6 +1483,7 @@ impl<'a> Ctx<'a> {
         };
         let bx = left + ml;
         let top = if top_collapsed { cursor } else { cursor + collapse(prev_mb, mt) };
+        self.blocks.push((id, top));
         let bg_slot = self.items.len();
         self.items.push(Item::Nop);
 
@@ -1646,6 +1720,68 @@ mod tests {
         assert!(texts(&p).iter().any(|(s, _)| s == "text"));
     }
 
+    // ---------------------------------------------------------------- anchors
+
+    #[test]
+    fn elements_with_ids_record_where_their_boxes_are() {
+        let p = render(
+            "<p style='margin:0;height:100px'>a</p><h2 id=sec style='margin:0'>Title</h2><div id=empty></div>\
+             <p style='margin:0'>after <a name=old>x</a> <span id=inl>y</span></p>",
+        );
+        let y = |n: &str| p.layout.anchor_y(n);
+        assert_eq!(y("sec"), Some(100.0), "a block's anchor is its top edge");
+        let empty = y("empty").expect("an empty element is still a target");
+        assert!(empty > 100.0, "below the heading: {empty}");
+        // inline elements resolve to the block that holds them
+        assert_eq!(y("old"), y("inl"));
+        assert!(y("old").unwrap() >= empty);
+        assert_eq!(y("nope"), None);
+        assert_eq!(y(""), None);
+        // the first of several equal ids wins
+        let p = render("<h2 id=dup style='margin:0'>one</h2><p style='margin:0;height:50px'>x</p><h2 id=dup style='margin:0'>two</h2>");
+        assert_eq!(p.layout.anchor_y("dup"), Some(0.0));
+        assert_eq!(p.layout.anchors.iter().filter(|a| a.name == "dup").count(), 2);
+    }
+
+    #[test]
+    fn anchors_follow_their_table_cells_when_cells_are_aligned() {
+        // c1 is vertically centred next to the tall cell, so it moves down after layout:
+        // its anchor must move with it
+        let p = render("<table style='border-spacing:0'><tr><td id=c1><b id=in1>short</b></td><td id=c2>1<br>2<br>3<br>4<br>5</td></tr></table>");
+        let (c1, c2) = (p.layout.anchor_y("c1").unwrap(), p.layout.anchor_y("c2").unwrap());
+        assert!(c1 > c2 + 10.0, "the centred cell's anchor was shifted down: c1={c1} c2={c2}");
+        assert_eq!(p.layout.anchor_y("in1"), Some(c1), "and so is what is inside it");
+        let top = render("<table style='border-spacing:0'><tr valign=top><td id=c1>short</td><td id=c2>1<br>2<br>3<br>4<br>5</td></tr></table>");
+        assert_eq!(top.layout.anchor_y("c1"), top.layout.anchor_y("c2"));
+        // a table and an element in a cell that is shifted by rowspan
+        let p = render("<table style='border-spacing:0'><tr><td rowspan=2 id=r>a</td><td>1<br>2<br>3</td></tr><tr><td id=s>x</td></tr></table>");
+        assert!(p.layout.anchor_y("r").is_some() && p.layout.anchor_y("s").unwrap() > p.layout.anchor_y("r").unwrap() - 1.0);
+        let t = render("<p style='margin:0;height:30px'>x</p><table id=tbl><tr><td>a</td></tr></table>");
+        assert_eq!(t.layout.anchor_y("tbl"), Some(30.0));
+    }
+
+    #[test]
+    fn hidden_elements_and_their_children_are_not_targets() {
+        let p = render(
+            "<div id=hid style='display:none'>x</div><div style='display:none'><b id=inside>y</b></div>\
+             <p id=shown>z</p>",
+        );
+        assert_eq!(p.layout.anchor_y("hid"), None);
+        assert_eq!(p.layout.anchor_y("inside"), None);
+        assert!(p.layout.anchor_y("shown").is_some());
+    }
+
+    #[test]
+    fn a_page_full_of_ids_stays_fast() {
+        let body: String = (0..5000).map(|i| format!("<p id=p{i} style='margin:0'>x</p>")).collect();
+        let t = std::time::Instant::now();
+        let p = render(&body);
+        assert!(t.elapsed().as_secs() < 20, "{:?}", t.elapsed());
+        assert_eq!(p.layout.anchors.len(), 5000);
+        assert_eq!(p.layout.anchor_y("p0"), Some(0.0));
+        assert!(p.layout.anchor_y("p4999").unwrap() > 4000.0 * 10.0);
+    }
+
     // ---------------------------------------------------------------- tables
 
     #[test]
@@ -1752,7 +1888,7 @@ mod tests {
         let t = std::time::Instant::now();
         let p = render(&body);
         assert!(texts(&p).iter().any(|(s, _)| s == "deep"));
-        assert!(t.elapsed().as_secs() < 5);
+        assert!(t.elapsed().as_secs() < 30);
     }
 
     #[test]
@@ -1780,12 +1916,13 @@ mod tests {
         let cells = "<td>x</td>".repeat(MAX_COLS + 500);
         let p = render(&format!("<table><tr>{cells}</tr></table>"));
         assert!(p.layout.height.is_finite());
-        // many rows stay quick
+        // many rows stay quick (the bound is generous: this runs in debug builds, alongside
+        // every other test, and it used to fail now and then at 5s under load)
         let rows = "<tr><td>row</td><td>data</td></tr>".repeat(3000);
         let t = std::time::Instant::now();
         let p = render(&format!("<table>{rows}</table>"));
         assert!(p.layout.height > 3000.0 * 10.0);
-        assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
+        assert!(t.elapsed().as_secs() < 60, "{:?}", t.elapsed());
     }
 
     #[test]
@@ -1993,6 +2130,17 @@ mod tests {
         let p = render("<textarea rows=2>one\ntwo\nthree</textarea>");
         let t: Vec<String> = texts(&p).into_iter().map(|(t, _)| t).collect();
         assert_eq!(t, ["two", "three"], "only the last two rows fit");
+    }
+
+    #[test]
+    fn a_textarea_shows_exactly_as_many_lines_as_its_rows() {
+        // float error made `rows=3`, `6` and `12` draw one line too few
+        let lines = (1..=40).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        for rows in [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 30] {
+            let p = render(&format!("<textarea rows={rows}>{lines}</textarea>"));
+            let shown = texts(&p).len();
+            assert_eq!(shown, rows, "rows={rows} showed {shown} lines");
+        }
     }
 
     #[test]

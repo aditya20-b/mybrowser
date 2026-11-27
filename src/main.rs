@@ -298,13 +298,18 @@ impl App {
 
     // ---------- find in page ----------
 
-    /// Open the find box (Cmd+F), taking keyboard focus from the address bar.
+    /// Open the find box (Cmd+F), taking keyboard focus from the address bar
+    /// and from any page field (typing would otherwise land in the query).
     fn open_find(&mut self) {
         if self.find.is_none() {
             self.find = Some(Find::new());
         }
         let address = self.tab().address();
         self.bar.show(&address); // leave address editing
+        let tab = self.tab_mut();
+        if tab.page.form.focus.take().is_some() {
+            tab.form_changed();
+        }
         self.request_redraw();
     }
 
@@ -370,7 +375,8 @@ impl App {
                 true
             }
             _ if !cmd => match &event.text {
-                Some(text) if !text.is_empty() => {
+                // (Tab and Delete may come with control characters as their text: not typing)
+                Some(text) if !text.is_empty() && !text.chars().any(|c| c.is_control()) => {
                     if let Some(f) = self.find.as_mut() {
                         f.type_text(text.as_str());
                     }
@@ -413,6 +419,7 @@ impl App {
         if index >= self.tabs.len() {
             return;
         }
+        let shown_before = self.active;
         if self.tabs.len() == 1 {
             let id = self.next_tab_id;
             self.next_tab_id += 1;
@@ -422,7 +429,10 @@ impl App {
             self.tabs.remove(index);
             self.active = tabbar::active_after_close(self.active, index, self.tabs.len());
         }
-        self.find = None;
+        // closing a background tab leaves the page you are searching alone
+        if index == shown_before {
+            self.find = None;
+        }
         self.sync_chrome();
         self.update_hover();
     }
@@ -630,6 +640,8 @@ impl App {
             }
             let (px, py) = (cx, cy - TOP + self.tab().scroll);
             if let Some(id) = self.tab().page.control_at(px, py) {
+                // clicking a page field takes the keyboard from the find box
+                self.close_find();
                 self.activate_control(id);
             } else {
                 // clicking anywhere else leaves the control that had focus
@@ -647,6 +659,10 @@ impl App {
                         }
                     } else if self.tab_mut().follow(&href) {
                         self.sync_chrome();
+                    } else {
+                        // a link to a `#section` of this page scrolls (and the find highlight stays valid)
+                        self.clamp_scroll();
+                        self.update_hover();
                     }
                 }
             }
@@ -805,6 +821,8 @@ impl App {
             if needed {
                 tab.page.relayout(&self.fonts, logical_w);
                 tab.laid_out_width = logical_w;
+                // a page opened at `page.html#section` scrolls to it once there is a layout
+                tab.settle_fragment();
             }
             needed
         };

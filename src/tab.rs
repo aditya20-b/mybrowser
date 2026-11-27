@@ -11,12 +11,15 @@ use url::Url;
 /// What a clicked `href` means.
 #[derive(Debug, PartialEq)]
 pub enum Link {
-    /// Nothing to do: empty href, an in-page `#anchor`, or an unparseable URL.
+    /// Nothing to do: empty href, or an unparseable URL.
     Nothing,
     /// A scheme we don't handle (`mailto:`, `javascript:`, `tel:`, ...) or
     /// something a page isn't allowed to open (a web page linking to `file:`).
     External(String),
     Navigate(Url),
+    /// A link to a `#fragment` of the page that is already open: scroll, don't load.
+    /// (The fragment is still percent-encoded; empty for a bare `#`.)
+    Fragment(String),
 }
 
 fn strip_fragment(u: &Url) -> Url {
@@ -36,8 +39,11 @@ pub fn is_loopback_host(host: &str) -> bool {
 
 pub fn resolve_link(base: &Url, href: &str) -> Link {
     let href = href.trim();
-    if href.is_empty() || href.starts_with('#') {
+    if href.is_empty() {
         return Link::Nothing;
+    }
+    if let Some(frag) = href.strip_prefix('#') {
+        return Link::Fragment(frag.to_string());
     }
     let Ok(target) = base.join(href) else { return Link::Nothing };
     match target.scheme() {
@@ -45,7 +51,11 @@ pub fn resolve_link(base: &Url, href: &str) -> Link {
         "file" if matches!(base.scheme(), "http" | "https") => Link::External(target.to_string()),
         "http" | "https" | "file" => {
             if strip_fragment(&target) == strip_fragment(base) {
-                Link::Nothing // same document, different fragment: no reload
+                // same document, maybe a different fragment: no reload
+                match target.fragment() {
+                    Some(f) => Link::Fragment(f.to_string()),
+                    None => Link::Nothing,
+                }
             } else {
                 Link::Navigate(target)
             }
@@ -217,6 +227,8 @@ pub struct Tab {
     /// `page` is just the "Loading…" stand-in of a tab opened straight onto a URL,
     /// not something that was ever loaded.
     placeholder: bool,
+    /// A `#fragment` of a freshly loaded page to scroll to once it has been laid out.
+    pending_fragment: Option<String>,
     /// Form data for the next `begin_load` to POST (set by `submit_form`).
     next_post: Option<String>,
     /// Form data of the navigation in flight, so restarting it (reload while
@@ -250,6 +262,7 @@ impl Tab {
             scroll: 0.0,
             laid_out_width: -1.0,
             placeholder: false,
+            pending_fragment: None,
             next_post: None,
             inflight_post: None,
             next_initiator: None,
@@ -315,11 +328,40 @@ impl Tab {
         self.inflight_post = None;
         self.inflight_initiator = None;
         self.history.apply(pending.hist, pending.from, &page.url);
+        // `page.html#section`: jump there once the page has been laid out (a reload
+        // that remembers where you were stays put instead)
+        self.pending_fragment = match pending.keep_scroll {
+            None => page.url.fragment().map(String::from),
+            Some(_) => None,
+        };
         self.page = page;
         self.placeholder = false;
         self.laid_out_width = -1.0; // force relayout on the next redraw
         self.scroll = pending.keep_scroll.unwrap_or(0.0); // clamped on the next redraw
         true
+    }
+
+    /// Scroll to the target of `fragment` in the current layout. Returns whether
+    /// anything matched (otherwise the page stays where it is).
+    pub fn scroll_to_fragment(&mut self, fragment: &str) -> bool {
+        match self.page.fragment_y(fragment) {
+            Some(y) => {
+                self.scroll = y.max(0.0); // clamped to the page on the next redraw
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Call after the page has been laid out: applies the fragment of a page that
+    /// was just loaded (once; a stale layout, `laid_out_width < 0`, waits).
+    pub fn settle_fragment(&mut self) {
+        if self.laid_out_width < 0.0 {
+            return;
+        }
+        if let Some(f) = self.pending_fragment.take() {
+            self.scroll_to_fragment(&f);
+        }
     }
 
     /// Give up on the load in flight. Returns whether there was one. A tab that was
@@ -369,10 +411,15 @@ impl Tab {
         }
     }
 
-    /// Follow a link on this page. Returns whether a navigation started.
+    /// Follow a link on this page. Returns whether a navigation started (a link to
+    /// a `#fragment` of this page just scrolls, and returns false).
     pub fn follow(&mut self, href: &str) -> bool {
         match resolve_link(&self.page.url, href) {
-            Link::Nothing => false, // in-page anchors aren't scrolled to yet
+            Link::Nothing => false,
+            Link::Fragment(f) => {
+                self.scroll_to_fragment(&f);
+                false
+            }
             Link::External(url) => {
                 eprintln!("not supported (yet): {url}");
                 false
@@ -449,7 +496,7 @@ impl Tab {
         let from = self.page.url.clone();
         let target = match resolve_link(&from, sub.url.as_str()) {
             Link::Navigate(url) => url,
-            Link::Nothing => from.clone(), // submitting to the page you're already on
+            Link::Nothing | Link::Fragment(_) => from.clone(), // submitting to the page you're already on
             Link::External(url) => {
                 eprintln!("not supported (yet): {url}");
                 return Ok(());
@@ -491,9 +538,15 @@ mod tests {
         assert_eq!(resolve_link(&page, "?q=2"), Link::Navigate(u("https://example.com/dir/page.html?q=2")));
         assert_eq!(resolve_link(&page, "http://other.test/"), Link::Navigate(u("http://other.test/")));
         // same document
-        for nothing in ["", "  ", "#section", "page.html?q=1#other"] {
+        for nothing in ["", "  "] {
             assert_eq!(resolve_link(&page, nothing), Link::Nothing, "{nothing:?}");
         }
+        assert_eq!(resolve_link(&page, "#section"), Link::Fragment("section".into()));
+        assert_eq!(resolve_link(&page, "#"), Link::Fragment(String::new()));
+        assert_eq!(resolve_link(&page, "page.html?q=1#other"), Link::Fragment("other".into()));
+        assert_eq!(resolve_link(&page, "https://example.com/dir/page.html?q=1#x%20y"), Link::Fragment("x%20y".into()));
+        // a different query is a different document, fragment or not
+        assert_eq!(resolve_link(&page, "page.html?q=2#other"), Link::Navigate(u("https://example.com/dir/page.html?q=2#other")));
         // schemes we don't handle, and web -> local file are refused
         for external in ["mailto:a@b.c", "javascript:void(0)", "tel:123", "data:text/html,hi", "file:///etc/passwd", "ftp://x.test/y"] {
             assert!(matches!(resolve_link(&page, external), Link::External(_)), "{external}");
@@ -833,6 +886,85 @@ mod tests {
         let err = secure.submit_form(pw, None).unwrap_err();
         assert!(err.contains("plain http"), "{err}");
         assert!(!secure.is_loading(), "nothing was sent");
+    }
+
+    // ---------- in-page anchors ----------
+
+    /// A tab showing a tall page with sections, laid out at 400px.
+    fn tall_tab() -> Tab {
+        let (notify, _rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        let src = "<style>body{margin:0}p{margin:0;height:500px}</style>\
+                   <a id=l1 href='#two'>to two</a><a id=l2 href='#nope'>nope</a><a id=l3 href='#'>top</a>\
+                   <p>one</p><h2 id=two style='margin:0'>Two</h2><p>x</p><div id='sp ace'></div><p>y</p>";
+        tab.page = Page::from_source(&u("file:///tmp/long.html"), src);
+        tab.page.relayout(&crate::fonts::Fonts::load(), 400.0);
+        tab.laid_out_width = 400.0;
+        tab
+    }
+
+    #[test]
+    fn clicking_a_fragment_link_scrolls_to_its_target_without_navigating() {
+        let mut tab = tall_tab();
+        let two = tab.page.layout.anchor_y("two").expect("the heading is a target");
+        assert!(two > 400.0, "far down the page: {two}");
+        assert!(!tab.follow("#two"), "no navigation starts");
+        assert!(!tab.is_loading() && tab.history.back.is_empty());
+        assert_eq!(tab.scroll, two);
+        // a missing target leaves the page where it is, `#` and `#top` go home
+        assert!(!tab.follow("#nope"));
+        assert_eq!(tab.scroll, two);
+        assert!(!tab.follow("#top") && tab.scroll == 0.0);
+        tab.scroll = 99.0;
+        tab.follow("#");
+        assert_eq!(tab.scroll, 0.0);
+        // percent-encoded fragments find ids with spaces, and a full URL to this page works too
+        assert!(!tab.follow("#sp%20ace"));
+        assert!(tab.scroll > two);
+        tab.follow("long.html#two");
+        assert_eq!(tab.scroll, two);
+        assert!(!tab.is_loading());
+    }
+
+    #[test]
+    fn a_page_loaded_with_a_fragment_scrolls_there_once_it_is_laid_out() {
+        let (dir, _a, _b) = site("fragment");
+        std::fs::write(dir.join("long.html"), "<style>body{margin:0}p{margin:0;height:500px}</style><p>one</p><h2 id=sec style='margin:0'>S</h2><p>two</p>").unwrap();
+        let (notify, rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        let target = Url::from_file_path(dir.join("long.html")).unwrap();
+        let mut with_fragment = target.clone();
+        with_fragment.set_fragment(Some("sec"));
+        tab.open(with_fragment);
+        assert!(deliver(&mut tab, &rx));
+        // before layout there is nothing to scroll to, and nothing is lost
+        tab.settle_fragment();
+        assert_eq!(tab.scroll, 0.0);
+        tab.page.relayout(&crate::fonts::Fonts::load(), 400.0);
+        tab.laid_out_width = 400.0;
+        tab.settle_fragment();
+        assert_eq!(tab.scroll, 500.0);
+        // it only happens once: the user's own scrolling is not overridden by a later relayout
+        tab.scroll = 10.0;
+        tab.settle_fragment();
+        assert_eq!(tab.scroll, 10.0);
+        // a fragment that matches nothing is ignored
+        let mut missing = target.clone();
+        missing.set_fragment(Some("zzz"));
+        tab.open(missing);
+        assert!(deliver(&mut tab, &rx));
+        tab.page.relayout(&crate::fonts::Fonts::load(), 400.0);
+        tab.laid_out_width = 400.0;
+        tab.settle_fragment();
+        assert_eq!(tab.scroll, 0.0);
+        // a reload remembers where you were rather than jumping back to the fragment
+        tab.scroll = 123.0;
+        tab.reload();
+        assert!(deliver(&mut tab, &rx));
+        tab.page.relayout(&crate::fonts::Fonts::load(), 400.0);
+        tab.laid_out_width = 400.0;
+        tab.settle_fragment();
+        assert_eq!(tab.scroll, 123.0);
     }
 
     #[test]

@@ -330,7 +330,7 @@ impl Page {
             }
         }
 
-        let layout = Layout { items: vec![], links: vec![], controls: vec![], height: 0.0, canvas_bg: None };
+        let layout = Layout { items: vec![], links: vec![], controls: vec![], anchors: vec![], height: 0.0, canvas_bg: None };
         Page { url: url.clone(), status: None, title, dom, styles, images, form: FormState::default(), layout }
     }
 
@@ -351,6 +351,20 @@ impl Page {
             .find(|c| x >= c.x && x <= c.x + c.w && y >= c.y && y <= c.y + c.h)
             .map(|c| c.node)
             .filter(|&id| !forms::is_disabled(&self.dom, id))
+    }
+
+    /// Where a `#fragment` points, as a y in the laid-out page: the element whose `id`
+    /// (or `<a name>`) is the percent-decoded fragment; an empty one or `top` means the
+    /// very top. `None` if nothing matches (the page then stays where it is).
+    pub fn fragment_y(&self, fragment: &str) -> Option<f32> {
+        let name = String::from_utf8_lossy(&net::percent_decode_bytes(fragment)).into_owned();
+        if let Some(y) = self.layout.anchor_y(&name) {
+            return Some(y);
+        }
+        if name.is_empty() || name.eq_ignore_ascii_case("top") {
+            return Some(0.0);
+        }
+        None
     }
 
     /// Type text into control `id` (the page's DOM and its form state live in
@@ -471,6 +485,32 @@ mod tests {
         let p = render("<style>body{margin:0}pre{margin:0}</style><pre>a\n  b\n\nc</pre>", 400.0);
         let n = p.layout.items.iter().filter(|i| matches!(i, Item::Text { .. })).count();
         assert_eq!(n, 3); // "a", "  b", "c"; the blank line is just vertical space
+    }
+
+    // ---------- fragments ----------
+
+    #[test]
+    fn fragments_find_their_targets_by_id_and_name() {
+        let p = render(
+            "<style>body{margin:0}p{margin:0;height:40px}</style><p>a</p><h2 id=sec style='margin:0'>S</h2>\
+             <p><a name=old>o</a></p><div id='caf%C3%A9'></div><div id='é'></div>",
+            400.0,
+        );
+        assert_eq!(p.fragment_y("sec"), Some(40.0));
+        assert!(p.fragment_y("old").unwrap() > 40.0);
+        // the fragment is percent-decoded before it is compared with ids
+        assert!(p.fragment_y("%C3%A9").is_some());
+        assert_eq!(p.fragment_y("SEC"), None, "ids are case-sensitive");
+        assert_eq!(p.fragment_y("missing"), None);
+        // `#` and `#top` go to the top even with no such element
+        assert_eq!(p.fragment_y(""), Some(0.0));
+        assert_eq!(p.fragment_y("top"), Some(0.0));
+        // a real element called "top" wins over the special case
+        let q = render("<style>body{margin:0}</style><p style='margin:0;height:30px'>x</p><div id=top></div>", 400.0);
+        assert_eq!(q.fragment_y("top"), Some(30.0));
+        // garbage percent escapes don't panic
+        assert_eq!(p.fragment_y("%ZZ%"), None);
+        assert_eq!(p.fragment_y("%"), None);
     }
 
     // ---------- images ----------

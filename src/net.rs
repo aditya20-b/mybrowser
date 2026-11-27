@@ -211,6 +211,8 @@ fn fetch_http(start: &Url, top: Option<&Url>, post: Option<&str>) -> Result<Fetc
                 for s in &sets {
                     jar.accept(&url, s);
                 }
+                drop(jar);
+                cookies::save_if_changed(); // (persistent cookies survive a restart)
             }
         }
         let status = resp.status();

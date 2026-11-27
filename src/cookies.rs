@@ -1,6 +1,6 @@
 //! The browser's cookie jar and the rules for what may go into it.
 //!
-//! One jar lives for the life of the process (nothing is written to disk). On top
+//! One jar lives for the life of the process (cookies with an expiry are also saved to disk and read back at start). On top
 //! of the standard storage rules (`cookie_store`: host/path matching, expiry,
 //! `Max-Age`) this applies the protections a browser needs:
 //!
@@ -47,6 +47,8 @@ pub enum Ctx {
 }
 
 pub struct Jar {
+    /// A persistent cookie was set or deleted since the jar was last written to disk.
+    dirty: bool,
     store: CookieStore,
     /// When each cookie was last set, so the oldest of an over-limit site go first.
     seq: HashMap<Key, u64>,
@@ -121,7 +123,73 @@ fn key_of(c: &Cookie<'_>) -> Key {
 
 impl Jar {
     pub fn new() -> Jar {
-        Jar { store: CookieStore::new(), seq: HashMap::new(), counter: 0 }
+        Jar { dirty: false, store: CookieStore::new(), seq: HashMap::new(), counter: 0 }
+    }
+
+    /// The cookies that outlive the session, one per line, as tab-separated fields:
+    /// `scheme host-only domain path name value expires secure http-only same-site`.
+    /// (Session cookies are never written down.)
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        for c in self.store.iter_unexpired() {
+            let cookie_store::CookieExpiration::AtUtc(at) = &c.expires else { continue };
+            let Some(domain) = c.domain.as_cow().map(|d| d.into_owned()) else { continue };
+            let (name, value) = c.name_value();
+            let path = String::from(&c.path);
+            let fields = [domain.as_str(), path.as_str(), name, value];
+            if fields.iter().any(|f| f.chars().any(|ch| ch.is_control())) {
+                continue;
+            }
+            let secure = c.secure() == Some(true);
+            let same_site = match c.same_site() {
+                Some(SameSite::Strict) => "Strict",
+                Some(SameSite::None) => "None",
+                Some(SameSite::Lax) => "Lax",
+                None => "",
+            };
+            out.push_str(&format!(
+                "{}\t{}\t{domain}\t{path}\t{name}\t{value}\t{}\t{}\t{}\t{same_site}\n",
+                if secure { "https" } else { "http" },
+                u8::from(matches!(c.domain, CookieDomain::HostOnly(_))),
+                at.unix_timestamp(),
+                u8::from(secure),
+                u8::from(c.http_only() == Some(true)),
+            ));
+        }
+        out
+    }
+
+    /// Take cookies back from `to_text`. Each goes through `accept`, so a hand-edited or damaged
+    /// file can't smuggle in anything the rules would refuse.
+    pub fn load_text(&mut self, text: &str) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        for line in text.lines().take(MAX_TOTAL) {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() != 10 || !matches!(f[0], "http" | "https") {
+                continue;
+            }
+            let (host_only, domain, path, name, value) = (f[1] == "1", f[2], f[3], f[4], f[5]);
+            let Ok(expires) = f[6].parse::<i64>() else { continue };
+            if expires <= now || domain.is_empty() || domain.contains([':', '/', '@', ' ']) || !path.starts_with('/') {
+                continue;
+            }
+            let Ok(url) = Url::parse(&format!("{}://{}/", f[0], domain.trim_start_matches('.'))) else { continue };
+            let mut header = format!("{name}={value}; Path={path}; Max-Age={}", expires - now);
+            if !host_only {
+                header.push_str(&format!("; Domain={domain}"));
+            }
+            if f[7] == "1" {
+                header.push_str("; Secure");
+            }
+            if f[8] == "1" {
+                header.push_str("; HttpOnly");
+            }
+            if matches!(f[9], "Lax" | "Strict" | "None") {
+                header.push_str(&format!("; SameSite={}", f[9]));
+            }
+            self.accept(&url, &header);
+        }
+        self.dirty = false;
     }
 
     /// Process one `Set-Cookie` header received from `url`. Returns whether the cookie was kept.
@@ -168,9 +236,12 @@ impl Jar {
             }
         }
         let expired = cookie.is_expired();
+        let persistent = cookie.is_persistent();
         if self.store.insert(cookie.into_owned(), url).is_err() {
             return false;
         }
+        // (a session cookie replacing a persistent one, or a deletion, changes the file as well)
+        self.dirty |= persistent || expired || self.store.get(&key.0, &key.1, &key.2).is_none();
         if expired {
             self.seq.remove(&key); // it was a deletion
         } else {
@@ -270,7 +341,51 @@ impl Default for Jar {
 /// The process-wide jar shared by every request and every loader thread.
 pub fn global() -> MutexGuard<'static, Jar> {
     static JAR: OnceLock<Mutex<Jar>> = OnceLock::new();
-    JAR.get_or_init(|| Mutex::new(Jar::new())).lock().unwrap_or_else(|e| e.into_inner())
+    JAR.get_or_init(|| {
+        let mut jar = Jar::new();
+        if let Some(file) = cookie_file() {
+            // (a missing or oversized file just means starting empty)
+            if std::fs::metadata(&file).is_ok_and(|m| m.len() <= MAX_FILE_BYTES) {
+                if let Ok(text) = std::fs::read_to_string(&file) {
+                    jar.load_text(&text);
+                }
+            }
+        }
+        Mutex::new(jar)
+    })
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Biggest cookie file read back.
+const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Where persistent cookies live: next to the bookmarks (and, like them, never in a test run
+/// unless the test names a folder).
+fn cookie_file() -> Option<std::path::PathBuf> {
+    crate::bookmarks::data_dir().map(|d| d.join("cookies.tsv"))
+}
+
+/// Write the jar to disk if a persistent cookie changed since the last write. Called after a
+/// response's cookies have been taken in.
+pub fn save_if_changed() {
+    let Some(file) = cookie_file() else { return };
+    let text = {
+        let mut jar = global();
+        if !jar.dirty {
+            return;
+        }
+        jar.dirty = false;
+        jar.to_text()
+    };
+    let Some(dir) = file.parent() else { return };
+    if crate::bookmarks::create_private_dir(dir).is_err() {
+        return;
+    }
+    let tmp = dir.join(format!("cookies.tsv.{}.tmp", std::process::id()));
+    if crate::bookmarks::write_private_file(&tmp, text.as_bytes()).is_err() || std::fs::rename(&tmp, &file).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 #[cfg(test)]
@@ -283,6 +398,49 @@ mod tests {
 
     fn header(jar: &Jar, url: &str) -> String {
         jar.header_for(&u(url), Ctx::SameSite).unwrap_or_default()
+    }
+
+    #[test]
+    fn persistent_cookies_survive_a_restart_and_session_cookies_do_not() {
+        let mut jar = Jar::new();
+        let site = u("https://shop.example.com/cart/");
+        jar.accept(&site, "keep=1; Max-Age=3600; Path=/; Secure; HttpOnly; SameSite=Strict");
+        jar.accept(&site, "wide=2; Max-Age=3600; Domain=example.com; Path=/cart");
+        jar.accept(&site, "session=3; Path=/");
+        let text = jar.to_text();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(!text.contains("session"));
+        let mut fresh = Jar::new();
+        fresh.load_text(&text);
+        let h = header(&fresh, "https://shop.example.com/cart/");
+        assert!(h.contains("keep=1") && h.contains("wide=2") && !h.contains("session"), "{h}");
+        // the host-only cookie stays host-only; the Domain one reaches sibling hosts
+        let other = header(&fresh, "https://www.example.com/cart/");
+        assert!(other.contains("wide=2") && !other.contains("keep"), "{other}");
+        // Secure and SameSite survive
+        assert_eq!(header(&fresh, "http://shop.example.com/cart/"), "wide=2");
+        assert_eq!(header_in(&fresh, "https://shop.example.com/cart/", Ctx::CrossSiteGet), "wide=2");
+    }
+
+    #[test]
+    fn a_damaged_or_edited_cookie_file_is_checked_like_any_response() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let later = now + 3600;
+        let text = format!(
+            "https\t0\tco.uk\t/\tsuper\t1\t{later}\t0\t0\t\n\
+             http\t1\texample.com\t/\told\t1\t{}\t0\t0\t\n\
+             http\t1\texample.com\t/\tinsecure\t1\t{later}\t1\t0\t\n\
+             http\t1\texample.com\t/\tgood\t1\t{later}\t0\t0\tLax\n\
+             http\t1\texample.com\t/\ttoo\tfew\n\
+             ftp\t1\texample.com\t/\tweird\t1\t{later}\t0\t0\t\n\
+             http\t1\tevil.com/x@\t/\thost\t1\t{later}\t0\t0\t\n\
+             garbage\n",
+            now.saturating_sub(10)
+        );
+        let mut jar = Jar::new();
+        jar.load_text(&text);
+        assert_eq!(header(&jar, "http://example.com/"), "good=1");
+        assert_eq!(header(&jar, "http://foo.co.uk/"), "");
     }
 
     fn header_in(jar: &Jar, url: &str, ctx: Ctx) -> String {

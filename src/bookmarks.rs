@@ -119,7 +119,7 @@ pub fn save(dir: &Path, list: &[Bookmark]) -> std::io::Result<()> {
     })
 }
 
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -131,7 +131,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);

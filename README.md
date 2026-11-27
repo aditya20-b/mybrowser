@@ -58,11 +58,11 @@ One heads-up: fonts are loaded from the macOS system font folder (see `src/fonts
 
 **HTML.** Entities, void tags, messy markup (unclosed `<p>` and `<li>`, misnested tags, stray end tags, implied table rows and cells), and a synthesized `<head>` and `<body>` when a page leaves them out. The parser runs in linear time, even on hostile input.
 
-**CSS.** `<style>` blocks, linked stylesheets and inline styles. Tag, class, ID, `*`, descendant and child selectors. Specificity, source order, `!important`, origin (author rules beat the built-in stylesheet), inheritance, and `inherit`/`initial`/`unset`. Most of the box model: width, max-width, height, padding, borders, auto margins, `box-sizing`, and margin collapsing including the awkward cases. Colors in hex, `rgb()`, `hsl()` and by name; the `font` and `border` shorthands.
+**CSS.** `<style>` blocks, linked stylesheets and inline styles. Selectors: tag, class, ID, `*`, attribute selectors (`[href]`, `[type=text]`, `^=`, `$=`, `*=`, `~=`, `|=`, and the `i` flag), `:first-child`, `:last-child`, `:only-child`, `:nth-child()` and its `last`/`of-type` relatives, `:link`, `:root` and `:not()`, with descendant, `>`, `+` and `~` combinators. Selectors that need state the browser doesn't keep (`:hover`, `:focus`, `:visited`) or pseudo-elements (`::before`) are dropped rather than misapplied. Specificity, source order, `!important`, origin (author rules beat the built-in stylesheet), inheritance, and `inherit`/`initial`/`unset`. Most of the box model: width, max-width, height, padding, borders, auto margins, `box-sizing`, and margin collapsing including the awkward cases. Colors in hex, `rgb()`, `hsl()` and by name; the `font` and `border` shorthands.
 
 **Layout.** Block and inline flow, lists, `<pre>`, and **tables**: column widths from min and max content, percentage and fixed widths, `colspan` and `rowspan`, captions, row and cell backgrounds that stretch to the row, vertical alignment, nested tables, and the legacy attributes older pages rely on (`border`, `cellpadding`, `cellspacing`, `bgcolor`, `align`, `valign`, `<font>`).
 
-**Text and images.** Text wraps using real glyph widths with alignment, bold, italic, monospace, underlines, highlights and clickable links. Characters missing from the main fonts (arrows, CJK) fall back to a wide-coverage font. PNG, JPEG and GIF images flow inline with the text, scaled with bilinear filtering, with alt text as the fallback. The format is recognised from the bytes (a JPEG named `.png` still works), a GIF shows its first frame, and every decoder checks the size a file claims before allocating, so a tiny file can't demand gigabytes.
+**Text and images.** Text wraps using real glyph widths with alignment, bold, italic, monospace, underlines, highlights and clickable links. Characters missing from the main fonts (arrows, CJK) fall back to a wide-coverage font. PNG, JPEG (including CMYK) and GIF images flow inline with the text, scaled with bilinear filtering, with alt text as the fallback. The format is recognised from the bytes (a JPEG named `.png` still works), a GIF shows its first frame, and every decoder checks the size a file claims before allocating, so a tiny file can't demand gigabytes.
 
 ## How it works
 
@@ -88,7 +88,7 @@ URL -> fetch -> HTML -> DOM --\
 A few choices worth explaining:
 
 - Layout produces drawing commands instead of a tree of boxes. Painting is then just "run through the list in order", and scrolling only repaints with an offset. Layout reruns when the window width changes or a form control changes (it's cheap).
-- Selectors I don't support (`a:hover`, `[href]`, `+`) get dropped rather than approximated. Ignoring a rule is better than applying `a:hover` styles to every link.
+- Selectors I don't support (`a:hover`, `::before`) get dropped rather than approximated. Ignoring a rule is better than applying `a:hover` styles to every link. The same goes for the `:visited` state: the browser keeps no visited-link record, so every link is `:link`.
 - Invalid CSS values are ignored instead of resetting the property, so the common "fallback, then modern value" pattern works.
 - Table cells are laid out once and then stretched: a row's height isn't known until every cell is done, so backgrounds and borders are patched afterwards instead of laying each cell out twice (which would be exponential for nested tables).
 - Form controls are drawn by the engine from plain rects and text, so they need no new paint code, and a control's size never depends on what's typed in it, so typing doesn't reflow the page.
@@ -123,16 +123,16 @@ The honest list, roughly by how much it matters for a real browser:
 
 - **JavaScript.** None. Pages that build their content with scripts will be blank or broken.
 - **Layout.** No flexbox, grid, floats or positioning, no inline padding or margins, and no `vh`/`vw`/`calc()`. A lot of the modern web depends on these.
-- **Selectors.** No pseudo-classes (even `:link` and `:first-child`), attribute selectors or `@media`, so many stylesheets lose rules.
+- **CSS.** No `@media`, pseudo-elements (`::before`), `:hover`/`:focus` states, `:is()`/`:where()`, or `:checked`/`:disabled`.
 - **Forms.** No `multipart/form-data` (so no file uploads; a form asking for it is sent urlencoded), no `<select multiple>`, and `<label>` clicks don't focus their control. Reloading or going back to a page a `POST` produced fetches its URL with a `GET`. No caret movement or selection inside fields (typing appends, backspace deletes), no file, date or colour inputs, radio buttons draw as squares, and selects cycle on click instead of opening a menu. Controls hidden with CSS (`display:none`) can still be tabbed to.
 - **Tabs.** No dragging to reorder or restoring closed tabs. With many tabs open they shrink until only the close button shows (at most 20 can be open).
 - **Cookies.** Nothing persists between runs, and there's no UI to see or clear them.
-- **Browser features.** No caching, bookmarks, find-in-page or downloads.
+- **Browser features.** No caching, bookmarks, find-in-page or downloads, and links to `#fragments` don't scroll to the anchor yet.
 - **Media.** Animated GIFs show their first frame only; no WebP or SVG. No fonts from the web (`@font-face`).
 - **Text.** No shaping, so no kerning, ligatures or complex scripts, and no right-to-left text.
 - **Platform.** macOS fonts only, for now.
 
-The order I'm tackling things in: the CSS gaps above (pseudo-classes, inline boxes, viewport units), a flexbox subset, and eventually a JavaScript engine. Until then it's best at documents, blogs, articles and older table-based sites.
+The order I'm tackling things in: in-page anchors and the remaining CSS gaps (inline boxes, viewport units), a flexbox subset, and eventually a JavaScript engine. Until then it's best at documents, blogs, articles and older table-based sites.
 
 ## Where to learn more
 

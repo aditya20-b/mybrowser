@@ -22,6 +22,11 @@ impl Image {
 /// guard: 16M pixels = 64 MB of RGBA; a tiny file can claim far more).
 pub const MAX_PIXELS: u64 = 16 * 1024 * 1024;
 
+/// The JPEG decoder keeps coefficient and plane buffers on top of the output
+/// (a large progressive CMYK file needs several times the RGBA size), so its own
+/// working memory is capped separately.
+const MAX_JPEG_WORKING_BYTES: usize = 192 * 1024 * 1024;
+
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 /// Is a `w` x `h` image acceptable to decode?
@@ -81,6 +86,7 @@ fn decode_png(bytes: &[u8]) -> Option<Image> {
 
 fn decode_jpeg(bytes: &[u8]) -> Option<Image> {
     let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(bytes));
+    decoder.set_max_decoding_buffer_size(MAX_JPEG_WORKING_BYTES);
     decoder.read_info().ok()?; // reads the header only
     let info = decoder.info()?;
     let (w, h) = (info.width as u32, info.height as u32);
@@ -97,9 +103,10 @@ fn decode_jpeg(bytes: &[u8]) -> Option<Image> {
             }
         }
         jpeg_decoder::PixelFormat::L16 => {
-            // 16-bit samples, big endian: keep the high byte
+            // the decoder writes 16-bit samples in the machine's byte order: keep the high byte
             for px in data.get(..n * 2)?.chunks_exact(2) {
-                rgba.extend_from_slice(&[px[0], px[0], px[0], 255]);
+                let high = (u16::from_ne_bytes([px[0], px[1]]) >> 8) as u8;
+                rgba.extend_from_slice(&[high, high, high, 255]);
             }
         }
         jpeg_decoder::PixelFormat::RGB24 => {
@@ -108,10 +115,11 @@ fn decode_jpeg(bytes: &[u8]) -> Option<Image> {
             }
         }
         jpeg_decoder::PixelFormat::CMYK32 => {
-            // the decoder hands back "amount of light" (255 = no ink), so multiply by K
+            // The decoder hands back the amount of ink (0 = none, the Adobe convention
+            // after it undoes their inversion), so light = (1 - c) * (1 - k).
             for px in data.get(..n * 4)?.chunks_exact(4) {
-                let k = px[3] as u32;
-                let mix = |c: u8| (c as u32 * k / 255) as u8;
+                let light_left = 255 - px[3] as u32;
+                let mix = |c: u8| ((255 - c as u32) * light_left / 255) as u8;
                 rgba.extend_from_slice(&[mix(px[0]), mix(px[1]), mix(px[2]), 255]);
             }
         }
@@ -120,7 +128,8 @@ fn decode_jpeg(bytes: &[u8]) -> Option<Image> {
 }
 
 /// The first frame of a GIF, composited onto a transparent canvas the size of its
-/// logical screen (a frame may cover only part of it). Animation isn't played.
+/// logical screen (a frame may cover only part of it, or even lie partly or wholly
+/// outside it). Animation isn't played.
 fn decode_gif(bytes: &[u8]) -> Option<Image> {
     let mut options = gif::DecodeOptions::new();
     options.set_color_output(gif::ColorOutput::RGBA);
@@ -137,14 +146,17 @@ fn decode_gif(bytes: &[u8]) -> Option<Image> {
     let pixels = frame.buffer.get(..fw * fh * 4)?;
     let (cw, ch) = (w as usize, h as usize);
     let mut rgba = vec![0u8; cw * ch * 4];
-    for row in 0..fh {
-        let y = top + row;
-        if y >= ch {
-            break;
+    // the part of each frame row that lands on the canvas (none if it starts past the right edge)
+    let copy = fw.min(cw.saturating_sub(left));
+    if copy > 0 {
+        for row in 0..fh {
+            let y = top + row;
+            if y >= ch {
+                break;
+            }
+            let src = &pixels[row * fw * 4..row * fw * 4 + copy * 4];
+            rgba[(y * cw + left) * 4..(y * cw + left + copy) * 4].copy_from_slice(src);
         }
-        let copy = fw.min(cw.saturating_sub(left));
-        let src = &pixels[row * fw * 4..row * fw * 4 + copy * 4];
-        rgba[(y * cw + left) * 4..(y * cw + left + copy) * 4].copy_from_slice(src);
     }
     Some(Image { w, h, rgba })
 }
@@ -210,6 +222,11 @@ mod tests {
         [img.rgba[i], img.rgba[i + 1], img.rgba[i + 2], img.rgba[i + 3]]
     }
 
+    /// JPEG is lossy: is `got` within a few levels of `want` (and opaque)?
+    fn close(got: [u8; 4], want: [u8; 3]) -> bool {
+        got[3] == 255 && (0..3).all(|k| (got[k] as i32 - want[k] as i32).abs() <= 12)
+    }
+
     #[test]
     fn decodes_each_color_type_to_rgba() {
         let rgba = decode(&encode(1, 1, png::ColorType::Rgba, &[1, 2, 3, 4])).unwrap();
@@ -224,8 +241,6 @@ mod tests {
 
     #[test]
     fn decodes_jpeg_colour_and_grayscale() {
-        // JPEG is lossy: check the colour is close, not exact
-        let close = |got: [u8; 4], want: [u8; 3]| got[3] == 255 && (0..3).all(|k| (got[k] as i32 - want[k] as i32).abs() <= 12);
         let red = jpeg(16, 8, jpeg_encoder::ColorType::Rgb, &[200, 30, 30].repeat(16 * 8));
         let img = decode(&red).expect("a JPEG decodes");
         assert_eq!((img.w, img.h), (16, 8));
@@ -234,6 +249,22 @@ mod tests {
         let img = decode(&gray).expect("a grayscale JPEG decodes");
         let p = pixel(&img, 3, 3);
         assert!(close(p, [120, 120, 120]), "{p:?}");
+    }
+
+    #[test]
+    fn cmyk_jpegs_are_not_black() {
+        // every CMYK JPEG used to decode (near) black: the amounts of ink were multiplied
+        // instead of subtracted from white
+        for color in [jpeg_encoder::ColorType::Cmyk, jpeg_encoder::ColorType::CmykAsYcck] {
+            let paper = decode(&jpeg(8, 8, color, &[0, 0, 0, 0].repeat(64))).expect("CMYK decodes");
+            assert!(close(pixel(&paper, 4, 4), [255, 255, 255]), "no ink is white paper: {:?}", pixel(&paper, 4, 4));
+            let cyan = decode(&jpeg(8, 8, color, &[255, 0, 0, 0].repeat(64))).unwrap();
+            assert!(close(pixel(&cyan, 4, 4), [0, 255, 255]), "full cyan: {:?}", pixel(&cyan, 4, 4));
+            let black = decode(&jpeg(8, 8, color, &[0, 0, 0, 255].repeat(64))).unwrap();
+            assert!(close(pixel(&black, 4, 4), [0, 0, 0]), "full key: {:?}", pixel(&black, 4, 4));
+            let half = decode(&jpeg(8, 8, color, &[0, 0, 0, 128].repeat(64))).unwrap();
+            assert!(close(pixel(&half, 4, 4), [127, 127, 127]), "half key: {:?}", pixel(&half, 4, 4));
+        }
     }
 
     #[test]
@@ -251,6 +282,28 @@ mod tests {
         assert_eq!(pixel(&img, 1, 1), [0, 0, 255, 255]);
         assert_eq!(pixel(&img, 2, 1), [0, 0, 255, 255]);
         assert_eq!(pixel(&img, 3, 1), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_gif_frame_outside_its_screen_is_clipped_not_a_panic() {
+        // a frame starting past the right edge panicked on the last rows (an empty slice
+        // still has to start inside the buffer), and took the whole page down with it
+        let blank = |img: &Image| img.rgba.iter().all(|&b| b == 0);
+        let right = decode(&gif_bytes((10, 2, 1, 1), &[0])).expect("decodes to an empty canvas");
+        assert_eq!((right.w, right.h), (4, 3));
+        assert!(blank(&right), "nothing of the frame is on screen");
+        let below = decode(&gif_bytes((0, 7, 2, 2), &[0; 4])).unwrap();
+        assert!(blank(&below), "a frame below the screen");
+        // partly outside: the visible part is kept
+        let edge = decode(&gif_bytes((3, 2, 3, 3), &[1; 9])).unwrap();
+        assert_eq!(pixel(&edge, 3, 2), [0, 0, 255, 255]);
+        assert_eq!(pixel(&edge, 2, 2), [0, 0, 0, 0]);
+        // every offset around and beyond the edges
+        for left in [0u16, 1, 3, 4, 5, 100, 65535] {
+            for top in [0u16, 1, 2, 3, 4, 100, 65535] {
+                let _ = decode(&gif_bytes((left, top, 2, 2), &[0; 4]));
+            }
+        }
     }
 
     #[test]

@@ -1237,16 +1237,32 @@ impl<'a> Ctx<'a> {
                 let value = self.form.value(self.dom, id);
                 let shown = if kind == ControlKind::Password { "•".repeat(value.chars().count()) } else { value };
                 let inner = w - 10.0;
+                // while editing, show the stretch of text that keeps the caret in view
+                let caret = if focused { self.form.caret(self.dom, id) } else { 0 };
+                let mut caret_off = 0.0f32;
                 let (text, color) = if shown.is_empty() {
                     (self.clip(self.dom.attr(id, "placeholder").unwrap_or(""), inner, false), CTL_PLACEHOLDER)
+                } else if focused {
+                    let chars: Vec<char> = shown.chars().collect();
+                    let caret = caret.min(chars.len());
+                    let (mut start, mut used) = (caret, 0.0f32);
+                    while start > 0 {
+                        let cw = self.fonts.measure(ctl_face(), CTL_FONT, chars[start - 1].encode_utf8(&mut [0; 4]));
+                        if used + cw > inner {
+                            break;
+                        }
+                        used += cw;
+                        start -= 1;
+                    }
+                    caret_off = used;
+                    (self.clip(&chars[start..].iter().collect::<String>(), inner, false), ink)
                 } else {
-                    (self.clip(&shown, inner, focused), ink)
+                    (self.clip(&shown, inner, false), ink)
                 };
-                let tw = self.fonts.measure(ctl_face(), CTL_FONT, &text);
                 self.push_text(x + 5.0, baseline, text, CTL_FONT, color);
                 if focused {
-                    // the caret sits after the typed text, not after placeholder text
-                    let caret_x = x + 5.0 + if shown.is_empty() { 0.0 } else { tw };
+                    // the caret sits at the editing position, not after placeholder text
+                    let caret_x = x + 5.0 + caret_off;
                     self.items.push(Item::Rect { x: caret_x, y: top + 3.0, w: 1.0, h: a + d, color: CTL_TEXT });
                 }
             }
@@ -2853,6 +2869,40 @@ mod tests {
         assert!(texts(&p).iter().any(|(t, _)| t == "typed"));
         // the region doesn't move or resize while typing
         assert_eq!(p.layout.controls.len(), 1);
+    }
+
+    #[test]
+    fn the_caret_is_drawn_where_editing_happens() {
+        let fonts = Fonts::load();
+        let mut p = render("<input size=10 value='abcdef'>");
+        let id = p.layout.controls[0].node;
+        let c = (p.layout.controls[0].x, p.layout.controls[0].w);
+        p.form.focus = Some(id);
+        let caret_x = |p: &Page| rects(p).into_iter().find(|r| r.2 == 1.0 && r.4 == CTL_TEXT).map(|r| r.0).expect("a caret");
+        p.relayout(&fonts, 400.0);
+        let at_end = caret_x(&p);
+        let (dom, form) = (&p.dom, &mut p.form);
+        form.move_caret(dom, id, crate::forms::CaretMove::Home);
+        p.relayout(&fonts, 400.0);
+        assert!((caret_x(&p) - (c.0 + 5.0)).abs() < 0.5, "at the start of the text");
+        let (dom, form) = (&p.dom, &mut p.form);
+        form.move_caret(dom, id, crate::forms::CaretMove::Right);
+        form.move_caret(dom, id, crate::forms::CaretMove::Right);
+        p.relayout(&fonts, 400.0);
+        let mid = caret_x(&p);
+        assert!(mid > c.0 + 5.0 && mid < at_end, "between the letters: {mid} vs end {at_end}");
+        // a long value scrolls to keep the caret in sight at either end
+        let mut q = render(&format!("<input size=6 value='{}'>", "w".repeat(80)));
+        let qid = q.layout.controls[0].node;
+        let (qx, qw) = (q.layout.controls[0].x, q.layout.controls[0].w);
+        q.form.focus = Some(qid);
+        for how in [crate::forms::CaretMove::Home, crate::forms::CaretMove::End] {
+            let (dom, form) = (&q.dom, &mut q.form);
+            form.move_caret(dom, qid, how);
+            q.relayout(&fonts, 400.0);
+            let x = caret_x(&q);
+            assert!(x >= qx && x <= qx + qw, "{how:?}: caret {x} inside the box {qx}..{}", qx + qw);
+        }
     }
 
     #[test]

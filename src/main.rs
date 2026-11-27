@@ -645,6 +645,19 @@ impl App {
                 self.tab_mut().form_changed();
                 true
             }
+            Key::Named(key @ (NamedKey::ArrowLeft | NamedKey::ArrowRight | NamedKey::Home | NamedKey::End | NamedKey::Delete)) if text_like => {
+                let tab = self.tab_mut();
+                let Page { dom, form, .. } = &mut tab.page;
+                match key {
+                    NamedKey::ArrowLeft => form.move_caret(dom, id, forms::CaretMove::Left),
+                    NamedKey::ArrowRight => form.move_caret(dom, id, forms::CaretMove::Right),
+                    NamedKey::Home => form.move_caret(dom, id, forms::CaretMove::Home),
+                    NamedKey::End => form.move_caret(dom, id, forms::CaretMove::End),
+                    _ => form.delete_forward(dom, id),
+                }
+                tab.form_changed();
+                true
+            }
             Key::Named(NamedKey::Backspace) if text_like => {
                 let tab = self.tab_mut();
                 let Page { dom, form, .. } = &mut tab.page;

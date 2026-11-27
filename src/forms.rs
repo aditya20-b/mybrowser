@@ -24,6 +24,15 @@ pub enum ControlKind {
     Hidden,
 }
 
+/// A caret movement in a text field.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum CaretMove {
+    Left,
+    Right,
+    Home,
+    End,
+}
+
 /// What kind of form control `id` is, if it is one.
 pub fn kind_of(dom: &Dom, id: NodeId) -> Option<ControlKind> {
     let ty = || dom.attr(id, "type").unwrap_or("").trim().to_ascii_lowercase();
@@ -198,6 +207,8 @@ pub struct FormState {
     values: HashMap<NodeId, String>,
     checked: HashMap<NodeId, bool>,
     selected: HashMap<NodeId, usize>,
+    /// Caret positions (character indexes) of text controls that have had one set.
+    carets: HashMap<NodeId, usize>,
     /// The control with keyboard focus.
     pub focus: Option<NodeId>,
 }
@@ -262,25 +273,72 @@ impl FormState {
             return;
         }
         let limit = max_chars(dom, id);
-        let mut value = self.value(dom, id);
-        let mut count = value.chars().count();
-        for c in text.chars() {
-            let ok = !c.is_control() || (c == '\n' && kind == ControlKind::Textarea);
-            if ok && count < limit {
-                value.push(c);
-                count += 1;
-            }
-        }
-        self.values.insert(id, value);
+        let mut chars: Vec<char> = self.value(dom, id).chars().collect();
+        let at = self.caret(dom, id);
+        let room = limit.saturating_sub(chars.len());
+        let ins: Vec<char> = text
+            .chars()
+            .filter(|c| !c.is_control() || (*c == '\n' && kind == ControlKind::Textarea))
+            .take(room)
+            .collect();
+        let end = at + ins.len();
+        chars.splice(at..at, ins);
+        self.values.insert(id, chars.into_iter().collect());
+        self.carets.insert(id, end);
     }
 
+    /// Where the text caret is in a text control, as a character index. It sits at the end
+    /// until moved; a textarea always edits at its end (its caret can't be moved yet).
+    pub fn caret(&self, dom: &Dom, id: NodeId) -> usize {
+        let len = self.value(dom, id).chars().count();
+        if kind_of(dom, id) == Some(ControlKind::Textarea) {
+            return len;
+        }
+        self.carets.get(&id).map_or(len, |&c| c.min(len))
+    }
+
+    /// Delete the character before the caret.
     pub fn backspace(&mut self, dom: &Dom, id: NodeId) {
         if !Self::is_editable(dom, id) {
             return;
         }
-        let mut value = self.value(dom, id);
-        value.pop();
-        self.values.insert(id, value);
+        let at = self.caret(dom, id);
+        if at == 0 {
+            return;
+        }
+        let mut chars: Vec<char> = self.value(dom, id).chars().collect();
+        chars.remove(at - 1);
+        self.values.insert(id, chars.into_iter().collect());
+        self.carets.insert(id, at - 1);
+    }
+
+    /// Delete the character after the caret.
+    pub fn delete_forward(&mut self, dom: &Dom, id: NodeId) {
+        if !Self::is_editable(dom, id) {
+            return;
+        }
+        let at = self.caret(dom, id);
+        let mut chars: Vec<char> = self.value(dom, id).chars().collect();
+        if at < chars.len() {
+            chars.remove(at);
+            self.values.insert(id, chars.into_iter().collect());
+            self.carets.insert(id, at);
+        }
+    }
+
+    /// Move the caret: one character left or right, or to the start or end of the text.
+    pub fn move_caret(&mut self, dom: &Dom, id: NodeId, how: CaretMove) {
+        if !kind_of(dom, id).is_some_and(is_text_like) || kind_of(dom, id) == Some(ControlKind::Textarea) {
+            return;
+        }
+        let (at, len) = (self.caret(dom, id), self.value(dom, id).chars().count());
+        let to = match how {
+            CaretMove::Left => at.saturating_sub(1),
+            CaretMove::Right => (at + 1).min(len),
+            CaretMove::Home => 0,
+            CaretMove::End => len,
+        };
+        self.carets.insert(id, to);
     }
 
     /// Click a checkbox or radio button. Checking a radio unchecks the others
@@ -448,6 +506,43 @@ mod tests {
 
     fn find(dom: &Dom, tag: &str, nth: usize) -> NodeId {
         (0..dom.nodes.len()).filter(|&i| dom.tag(i) == Some(tag)).nth(nth).unwrap_or_else(|| panic!("no {tag} #{nth}"))
+    }
+
+    #[test]
+    fn the_caret_moves_and_edits_happen_at_it() {
+        let dom = html::parse("<input name=a value='héllo'><input name=m maxlength=5 value=ab><input name=r readonly value=xy><textarea name=t>one</textarea>");
+        let (a, m, r, t) = (by_name(&dom, "a"), by_name(&dom, "m"), by_name(&dom, "r"), by_name(&dom, "t"));
+        let mut st = FormState::default();
+        assert_eq!(st.caret(&dom, a), 5, "starts at the end");
+        st.move_caret(&dom, a, CaretMove::Left);
+        st.move_caret(&dom, a, CaretMove::Left);
+        st.type_text(&dom, a, "XY");
+        assert_eq!((st.value(&dom, a).as_str(), st.caret(&dom, a)), ("hélXYlo", 5));
+        st.backspace(&dom, a);
+        assert_eq!(st.value(&dom, a), "hélXlo");
+        st.delete_forward(&dom, a);
+        assert_eq!((st.value(&dom, a).as_str(), st.caret(&dom, a)), ("hélXo", 4));
+        st.move_caret(&dom, a, CaretMove::Home);
+        st.backspace(&dom, a);
+        st.delete_forward(&dom, a);
+        assert_eq!(st.value(&dom, a), "élXo", "nothing before the start; the delete took the first character");
+        st.move_caret(&dom, a, CaretMove::End);
+        assert_eq!(st.caret(&dom, a), 4);
+        st.move_caret(&dom, a, CaretMove::Right);
+        assert_eq!(st.caret(&dom, a), 4, "can't go past the end");
+        st.delete_forward(&dom, a);
+        assert_eq!(st.value(&dom, a), "élXo");
+        // maxlength counts against the whole value, wherever the text goes in
+        st.move_caret(&dom, m, CaretMove::Home);
+        st.type_text(&dom, m, "123456");
+        assert_eq!(st.value(&dom, m), "123ab");
+        // read-only fields don't change, and a textarea always edits at its end
+        st.type_text(&dom, r, "z");
+        st.backspace(&dom, r);
+        assert_eq!(st.value(&dom, r), "xy");
+        st.move_caret(&dom, t, CaretMove::Home);
+        st.type_text(&dom, t, "!");
+        assert_eq!(st.value(&dom, t), "one!");
     }
 
     #[test]

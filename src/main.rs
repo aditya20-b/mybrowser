@@ -530,7 +530,18 @@ impl App {
 
     /// Cmd+D: bookmark the page on screen, or remove its bookmark if it has one.
     fn toggle_bookmark(&mut self) {
-        let (url, title) = (self.tab().page.url.clone(), self.tab().page.display_title());
+        // not while a load is in flight (the address bar already shows the next page, the one
+        // on screen is about to go), and not a page that failed to load
+        if self.tab().is_loading() {
+            self.bar.error = Some("wait for the page to finish loading before bookmarking it".into());
+            return;
+        }
+        if self.tab().page.is_error || self.tab().page.status.is_some_and(|s| s >= 400) {
+            self.bar.error = Some("a page that failed to load can't be bookmarked".into());
+            return;
+        }
+        let url = self.tab().page.url.clone();
+        let title = download::display_safe(&self.tab().page.display_title(), 120);
         self.bar.error = Some(match bookmarks::data_dir() {
             None => "no folder to keep bookmarks in".to_string(),
             Some(dir) => match bookmarks::toggle(&dir, &url, &title) {

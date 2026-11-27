@@ -36,15 +36,29 @@ pub fn summary_owner(dom: &Dom, summary: NodeId) -> Option<NodeId> {
     (first == summary).then_some(details)
 }
 
-/// Every node that a collapsed `<details>` hides: all of its children except its heading summary.
+/// Is `node` equal to, or inside, `ancestor`?
+fn is_within(dom: &Dom, node: NodeId, ancestor: NodeId) -> bool {
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if n == ancestor {
+            return true;
+        }
+        cur = dom.nodes[n].parent;
+    }
+    false
+}
+
+/// Every node that a collapsed `<details>` hides: all of its children except its heading
+/// summary. A details with no summary has no heading to click, so it is never collapsed
+/// (it could never be opened again).
 pub fn hidden_by_details(dom: &Dom, state: &FormState) -> Vec<NodeId> {
     let mut out = vec![];
     for d in 0..dom.nodes.len() {
         if dom.tag(d) != Some("details") || state.details_open(dom, d) {
             continue;
         }
-        let heading = dom.nodes[d].children.iter().copied().find(|&c| dom.tag(c) == Some("summary"));
-        out.extend(dom.nodes[d].children.iter().copied().filter(|&c| Some(c) != heading));
+        let Some(heading) = dom.nodes[d].children.iter().copied().find(|&c| dom.tag(c) == Some("summary")) else { continue };
+        out.extend(dom.nodes[d].children.iter().copied().filter(|&c| c != heading));
     }
     out
 }
@@ -448,7 +462,39 @@ impl FormState {
         let Some(details) = summary_owner(dom, summary) else { return false };
         let open = self.details_open(dom, details);
         self.details.insert(details, !open);
+        // a control that was just hidden can't keep the keyboard
+        if open && self.focus.is_some_and(|f| is_within(dom, f, details)) {
+            self.focus = None;
+        }
         true
+    }
+
+    /// Is `node` hidden because a `<details>` around it is closed (and it is not that
+    /// details' own heading)?
+    pub fn in_closed_details(&self, dom: &Dom, node: NodeId) -> bool {
+        let mut child = node;
+        while let Some(p) = dom.nodes[child].parent {
+            if dom.tag(p) == Some("details") && !self.details_open(dom, p) && summary_owner(dom, child) != Some(p) {
+                return true;
+            }
+            child = p;
+        }
+        false
+    }
+
+    /// Open every closed `<details>` that hides `node` (a `#fragment` link into one reveals
+    /// its target, as in browsers). Returns whether anything was opened.
+    pub fn reveal(&mut self, dom: &Dom, node: NodeId) -> bool {
+        let mut opened = false;
+        let mut child = node;
+        while let Some(p) = dom.nodes[child].parent {
+            if dom.tag(p) == Some("details") && !self.details_open(dom, p) && summary_owner(dom, child) != Some(p) {
+                self.details.insert(p, true);
+                opened = true;
+            }
+            child = p;
+        }
+        opened
     }
 
     /// A reset button was pressed: every control of the form goes back to what the markup says.
@@ -491,7 +537,7 @@ impl FormState {
     /// Move focus to the next (or previous) focusable control, wrapping around.
     /// With nothing focused, Tab goes to the first and Shift+Tab to the last.
     pub fn focus_next(&mut self, dom: &Dom, forward: bool) {
-        let all: Vec<NodeId> = (0..dom.nodes.len()).filter(|&i| is_focusable(dom, i)).collect();
+        let all: Vec<NodeId> = (0..dom.nodes.len()).filter(|&i| is_focusable(dom, i) && !self.in_closed_details(dom, i)).collect();
         if all.is_empty() {
             self.focus = None;
             return;
@@ -614,6 +660,31 @@ mod tests {
 
     fn find(dom: &Dom, tag: &str, nth: usize) -> NodeId {
         (0..dom.nodes.len()).filter(|&i| dom.tag(i) == Some(tag)).nth(nth).unwrap_or_else(|| panic!("no {tag} #{nth}"))
+    }
+
+    #[test]
+    fn controls_in_a_closed_details_cannot_be_tabbed_to_and_closing_drops_their_focus() {
+        let dom = html::parse("<details id=d><summary>H</summary><input name=a></details><input name=b><details open><summary>O</summary><input name=c></details>");
+        let (a, b, c) = (by_name(&dom, "a"), by_name(&dom, "b"), by_name(&dom, "c"));
+        let mut st = FormState::default();
+        let mut seen = vec![];
+        for _ in 0..3 {
+            st.focus_next(&dom, true);
+            seen.push(st.focus.unwrap());
+        }
+        assert_eq!(seen, [b, c, b], "the hidden field is skipped");
+        assert!(st.in_closed_details(&dom, a) && !st.in_closed_details(&dom, b) && !st.in_closed_details(&dom, c));
+        // the heading itself is not hidden
+        let summary = find(&dom, "summary", 0);
+        assert!(!st.in_closed_details(&dom, summary));
+        // opening makes it reachable; closing again takes the keyboard away from a field inside
+        assert!(st.toggle_details(&dom, summary));
+        st.focus = Some(a);
+        assert!(st.toggle_details(&dom, summary));
+        assert_eq!(st.focus, None);
+        // reveal opens whatever hides a node, once
+        assert!(st.reveal(&dom, a) && !st.reveal(&dom, a));
+        assert!(!st.in_closed_details(&dom, a));
     }
 
     #[test]

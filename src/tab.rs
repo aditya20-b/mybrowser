@@ -500,6 +500,13 @@ impl Tab {
                 self.scroll = y.max(0.0); // clamped to the page on the next redraw
                 true
             }
+            None if self.page.reveal_fragment(fragment) => {
+                // the target was inside a closed <details>: it is open now, so lay out again and
+                // scroll once that has happened
+                self.pending_fragment = Some(fragment.to_string());
+                self.laid_out_width = -1.0;
+                true
+            }
             None => false,
         }
     }
@@ -654,7 +661,7 @@ impl Tab {
     /// A click landed on control `id`. An `Err` is a message for the address bar
     /// (a submission that was refused).
     pub fn activate_control(&mut self, id: NodeId) -> Result<(), String> {
-        if forms::is_disabled(&self.page.dom, id) {
+        if forms::is_disabled(&self.page.dom, id) && self.page.dom.tag(id) != Some("summary") {
             return Ok(());
         }
         // a click on a <details> heading opens or closes it
@@ -1499,6 +1506,29 @@ mod tests {
         tab.open(file("hop.html"));
         assert!(deliver(&mut tab, &rx));
         assert!(tab.is_loading());
+    }
+
+    #[test]
+    fn a_fragment_link_into_a_closed_details_opens_it_and_scrolls_there() {
+        let (notify, _rx) = queue();
+        let mut tab = Tab::blank(1, notify);
+        tab.page = Page::from_source(
+            &Url::parse("file:///tmp/frag.html").unwrap(),
+            "<style>body{margin:0}p{margin:0;height:600px}</style><p>top</p><details><summary>More</summary><p>one</p><h2 id=deep style='margin:0'>deep</h2></details>",
+        );
+        let fonts = crate::fonts::Fonts::load();
+        tab.page.relayout(&fonts, 400.0);
+        tab.laid_out_width = 400.0;
+        assert_eq!(tab.page.layout.anchor_y("deep"), None);
+        tab.follow("#deep");
+        assert_eq!(tab.laid_out_width, -1.0, "the page must be laid out again");
+        tab.page.relayout(&fonts, 400.0);
+        tab.laid_out_width = 400.0;
+        tab.settle_fragment();
+        assert!(tab.scroll > 1000.0, "scrolled to the revealed heading: {}", tab.scroll);
+        assert_eq!(tab.page.url.fragment(), Some("deep"));
+        // a target that doesn't exist still does nothing
+        assert!(!tab.page.reveal_fragment("nope"));
     }
 
     #[test]

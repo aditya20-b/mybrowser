@@ -423,13 +423,36 @@ impl Page {
     /// controls win over earlier ones where they overlap. Disabled controls can't
     /// be clicked, focused or hovered.
     pub fn control_at(&self, x: f32, y: f32) -> Option<NodeId> {
-        self.layout
+        let found = self
+            .layout
             .controls
             .iter()
             .rev()
             .find(|c| x >= c.x && x <= c.x + c.w && y >= c.y && y <= c.y + c.h)
-            .map(|c| c.node)
-            .filter(|&id| !forms::is_disabled(&self.dom, id))
+            .map(|c| c.node);
+        // a link inside a <details> heading is a link first: it must not toggle the details
+        let on_link = || self.layout.links.iter().any(|l| x >= l.x && x <= l.x + l.w && y >= l.y && y <= l.y + l.h);
+        found
+            .filter(|&id| self.dom.tag(id) != Some("summary") || !on_link())
+            // (a <details> heading still works inside a disabled fieldset: it is not a form control)
+            .filter(|&id| self.dom.tag(id) == Some("summary") || !forms::is_disabled(&self.dom, id))
+    }
+
+    /// Open the closed `<details>` that hide the element with this `id` (a `#fragment` link
+    /// into one reveals its target). Returns whether anything changed, so the page needs a relayout.
+    pub fn reveal_fragment(&mut self, fragment: &str) -> bool {
+        let decoded = String::from_utf8_lossy(&net::percent_decode_bytes(fragment)).into_owned();
+        let target = (0..self.dom.nodes.len()).find(|&n| {
+            matches!(self.dom.attr(n, "id"), Some(id) if id == fragment || id == decoded)
+                || (self.dom.tag(n) == Some("a") && matches!(self.dom.attr(n, "name"), Some(name) if name == fragment || name == decoded))
+        });
+        match target {
+            Some(n) => {
+                let Page { dom, form, .. } = self;
+                form.reveal(dom, n)
+            }
+            None => false,
+        }
     }
 
     /// Where a `#fragment` points, as a y in the laid-out page: the element whose `id`

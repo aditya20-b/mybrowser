@@ -367,7 +367,7 @@ fn flex_line_sizes(items: &[&FlexItem], width: f32, gap: f32, justify: Justify) 
                 break;
             }
             for i in violators {
-                widths[i] = items[i].min.min(items[i].basis);
+                widths[i] = items[i].min; // (an item is never squeezed below its min-content width)
                 frozen[i] = true;
             }
         }
@@ -511,6 +511,13 @@ impl<'a> Ctx<'a> {
         let content_x = bx + bw[3] + pad[3];
         let content_top = top + bw[0] + pad[0];
 
+        // a <details> heading is clickable over its whole box (not just its words); the region is
+        // pushed before the content so controls inside the heading are found first
+        let summary_region = forms::summary_owner(self.dom, id).map(|_| {
+            self.controls.push(ControlRegion { x: bx, y: top, w: border_w, h: 0.0, node: id });
+            self.controls.len() - 1
+        });
+
         let bg_slot = self.items.len();
         self.items.push(Item::Nop);
 
@@ -533,6 +540,14 @@ impl<'a> Ctx<'a> {
             self.layout_flex(id, content_x, content_top, content_w)
         } else {
             self.layout_children(id, content_x, content_top, content_w, top_open)
+        };
+
+        // an empty <details> heading still takes one line, so there is something to click
+        let end_y = if summary_region.is_some() && end_y <= content_top {
+            let (a, d) = self.fonts.vmetrics(s.face(), s.font_size);
+            content_top + a + d
+        } else {
+            end_y
         };
 
         // A list marker sits on the baseline of the item's first line, whatever
@@ -561,6 +576,9 @@ impl<'a> Ctx<'a> {
             content_bottom = content_top + h;
         }
         let bottom = content_bottom + pad[2] + bw[2];
+        if let Some(i) = summary_region {
+            self.controls[i].h = bottom - top;
+        }
         self.emit_decor(s, bg_slot, bx, top, border_w, bottom, bw, None);
         (bottom, eff_mb)
     }
@@ -2464,6 +2482,39 @@ mod tests {
         let nested = render("<details open><summary>outer</summary><details><summary>inner</summary><p id=deep>deep</p></details></details>");
         assert!(has(&nested, "inner") && !has(&nested, "deep"));
         assert_eq!(nested.layout.anchor_y("deep"), None);
+    }
+
+    #[test]
+    fn a_details_heading_is_clickable_everywhere_and_never_stuck_shut() {
+        let has = |p: &Page, w: &str| texts(p).iter().any(|(t, _)| t == w);
+        let p = render("<details><summary>Heading</summary>secret</details>");
+        let (x, b) = at(&p, "Heading");
+        let summary = p.control_at(x + 2.0, b - 4.0).unwrap();
+        assert_eq!(p.control_at(390.0, b - 4.0), Some(summary), "blank space to the right of the heading toggles too");
+        let (mx, mb) = at(&p, "▶");
+        assert_eq!(p.control_at(mx + 1.0, mb - 4.0), Some(summary), "so does the triangle");
+        // an empty heading still has somewhere to click
+        let empty = render("<details><summary></summary>secret</details>");
+        assert!(!empty.layout.controls.is_empty() && !has(&empty, "secret"));
+        let c = &empty.layout.controls[0];
+        assert!(empty.control_at(c.x + 1.0, c.y + 1.0).is_some());
+        // a details without a heading can't be opened, so it is never collapsed
+        assert!(has(&render("<details>just text</details>"), "just"));
+        // a heading works inside a disabled fieldset (it isn't a control)
+        let fs = render("<fieldset disabled><details><summary>Head</summary>x</details></fieldset>");
+        let (fx, fb) = at(&fs, "Head");
+        assert!(fs.control_at(fx + 2.0, fb - 4.0).is_some());
+        // controls inside a heading keep their own clicks
+        let inner = render("<details><summary>Label <input name=q></summary>x</details>");
+        let ctl = inner.layout.controls.iter().find(|c| inner.dom.tag(c.node) == Some("input")).unwrap();
+        assert_eq!(inner.control_at(ctl.x + 2.0, ctl.y + 2.0), Some(ctl.node));
+    }
+
+    #[test]
+    fn shrinking_never_goes_below_min_content() {
+        let p = flex("", "<div style='flex:0 1 10px'>unbreakableword</div><div style='width:400px'>b</div>");
+        let word = Fonts::load().measure(ctl_face(), 16.0, "unbreakableword");
+        assert!(at(&p, "b").0 >= word - 0.5, "the second item starts after the word: {:?} vs {word}", at(&p, "b"));
     }
 
     #[test]
